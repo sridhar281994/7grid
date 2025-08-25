@@ -1,8 +1,18 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from database import Base, engine
-from models import *  # ensure models are imported so metadata knows them
+from routers import auth, users, wallet, game
 
-app = FastAPI()
+app = FastAPI(title="Spin Dice API", version="1.0.0")
+
+# CORS (tighten origins in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 def health():
@@ -10,5 +20,10 @@ def health():
 
 @app.on_event("startup")
 def on_startup():
-    # Safe to run on startup; avoids failing at module import time
     Base.metadata.create_all(bind=engine)
+
+# Routers
+app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(wallet.router)
+app.include_router(game.router)

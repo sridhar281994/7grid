@@ -1,20 +1,44 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.engine.url import make_url
-from dotenv import load_dotenv
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required")
-# Ensure SQLAlchemy uses psycopg (v3) even if env var is plain "postgresql://"
-url = make_url(DATABASE_URL)
-if url.drivername == "postgresql":          # e.g. postgresql://user:pass@host/db
-    url = url.set(drivername="postgresql+psycopg")
-ECHO = os.getenv("DEV_ECHO_SQL", "false").lower() == "true"
-engine = create_engine(url, pool_pre_ping=True, echo=ECHO)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+def _normalize_url(url: str) -> str:
+    # Render sometimes gives postgres:// — SQLAlchemy expects postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    # Force psycopg2 driver (you installed psycopg2-binary)
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+    # Ensure SSL
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    return url
+
+# Use env var on Render; fallback to your provided DSN
+RAW_DB_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://spin_db_user:gha2FPMzzfwVFaPC88yzihY9MjBtkPgT@dpg-d1v8s9emcj7s73f6bemg-a.virginia-postgres.render.com/spin_db"
+)
+
+DATABASE_URL = _normalize_url(RAW_DB_URL)
+ECHO = os.getenv("SQL_ECHO", "0") == "1"
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=5,
+    echo=ECHO,
+    # connect_args optional with psycopg2 when sslmode in URL,
+    # but harmless if present:
+    connect_args={}
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# Dependency for routes
 def get_db():
     db = SessionLocal()
     try:

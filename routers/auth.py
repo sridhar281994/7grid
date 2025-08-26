@@ -46,33 +46,38 @@ def send_otp(payload: PhoneIn, db: Session = Depends(get_db)):
     phone = payload.phone.strip()
     if not (phone.isdigit() and len(phone) == 10):
         raise HTTPException(400, "Invalid phone")
-
-    # Call 2Factor AUTOGEN with your template name
-    url = f"{BASE_URL}/{API_KEY}/SMS/{phone}/AUTOGEN/{TEMPLATE}"
+    # ---- 2FACTOR SMS + TEMPLATE (forces SMS, not voice) ----
+    # prepend +91 and pass your approved template & sender id
+    sender_id = os.getenv("TWOFACTOR_SENDER_ID", "gridST")  # from your template
+    msisdn = f"+91{phone}"
+    url = f"{BASE_URL}/{API_KEY}/SMS/{msisdn}/AUTOGEN/{TEMPLATE}?sender={sender_id}"
     try:
         r = requests.get(url, timeout=10)
     except Exception as e:
         raise HTTPException(502, f"2Factor error: {e}")
-
     if r.status_code != 200:
         raise HTTPException(502, f"2Factor status {r.status_code}: {r.text}")
-
-    data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
-    if str(data.get("Status", "")).lower() != "success":
-        # sometimes returns plain text error
+    # many accounts return JSON; keep a safe parse
+    data = {}
+    ctype = r.headers.get("Content-Type", "")
+    if "json" in ctype.lower():
+        try:
+            data = r.json()
+        except Exception:
+            pass
+    status = str(data.get("Status", "")).lower()
+    if status != "success":
+        # if for some reason it returns text, surface it
         raise HTTPException(502, f"2Factor failure: {data or r.text}")
-
     session_id = data.get("Details")
     if not session_id:
         raise HTTPException(502, "2Factor did not return session id")
-
-    # Store OTP row with session_id (no code)
+    # store only the session; code is delivered by SMS
     expires = _now() + timedelta(minutes=OTP_EXP_MIN)
-    db_obj = OTP(phone=phone, code=None, session_id=session_id, used=False, expires_at=expires)
-    db.add(db_obj)
+    db.add(OTP(phone=phone, code=None, session_id=session_id, used=False, expires_at=expires))
     db.commit()
-
     return {"ok": True, "session_id": session_id}
+
 
 @router.post("/verify-otp")
 def verify_otp(payload: VerifyIn, db: Session = Depends(get_db)):

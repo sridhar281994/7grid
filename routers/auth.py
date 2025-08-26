@@ -48,7 +48,7 @@ def send_otp(payload: PhoneIn, db: Session = Depends(get_db)):
         raise HTTPException(400, "Invalid phone")
     # ---- 2FACTOR SMS + TEMPLATE (forces SMS, not voice) ----
     # prepend +91 and pass your approved template & sender id
-    sender_id = os.getenv("TWOFACTOR_SENDER_ID", "gridST")  # from your template
+    sender_id = os.getenv("TWOFACTOR_SENDER_ID", "gridsT")  # from your template
     msisdn = f"+91{phone}"
     url = f"{BASE_URL}/{API_KEY}/SMS/{msisdn}/AUTOGEN/{TEMPLATE}?sender={sender_id}"
     try:

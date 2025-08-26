@@ -1,129 +1,127 @@
-import os
-import requests
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException, Depends
+import os
+from typing import Optional
+
+import requests
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
 from database import get_db
 from models import OTP, User
-from utils.security import create_access_token  # your existing JWT helper
+from jose import jwt
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-TWOFACTOR_API_KEY = os.getenv("TWOFACTOR_API_KEY", "").strip()
-TWOFACTOR_BASE = "https://2factor.in/API/V1"
-OTP_TTL_MINUTES = 5
-REQUEST_TIMEOUT = 8  # seconds
+API_KEY = os.getenv("TWOFACTOR_API_KEY", "")
+TEMPLATE = os.getenv("TWOFACTOR_TEMPLATE", "7grids")  # from your screenshot
+OTP_EXP_MIN = int(os.getenv("OTP_EXP_MINUTES", "5"))
 
-class SendOtpBody(BaseModel):
-    phone: str  # "9360xxxxxx"
+JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
+JWT_EXP_MIN = 60 * 24 * 30  # 30 days
 
-class VerifyOtpBody(BaseModel):
+BASE_URL = "https://2factor.in/API/V1"
+
+class PhoneIn(BaseModel):
+    phone: str
+
+class VerifyIn(BaseModel):
     phone: str
     otp: str
 
-def _normalize_phone(phone: str) -> str:
-    p = phone.strip()
-    # 2factor expects Indian numbers with country code; prepend 91 if 10 digits
-    if p.isdigit() and len(p) == 10:
-        return "91" + p
-    return p
+def _now():
+    return datetime.now(timezone.utc)
+
+def _jwt_for_user(user_id: int) -> str:
+    payload = {
+        "sub": str(user_id),
+        "exp": int((_now() + timedelta(minutes=JWT_EXP_MIN)).timestamp()),
+        "iat": int(_now().timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 @router.post("/send-otp")
-def send_otp(body: SendOtpBody, db: Session = Depends(get_db)):
-    phone_raw = body.phone.strip()
-    if not (phone_raw.isdigit() and len(phone_raw) == 10):
-        raise HTTPException(status_code=400, detail="Enter valid 10-digit phone")
+def send_otp(payload: PhoneIn, db: Session = Depends(get_db)):
+    phone = payload.phone.strip()
+    if not (phone.isdigit() and len(phone) == 10):
+        raise HTTPException(400, "Invalid phone")
 
-    phone_api = _normalize_phone(phone_raw)
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_TTL_MINUTES)
-
-    # If no 2factor key configured, dev fallback: create row but do not send SMS
-    if not TWOFACTOR_API_KEY:
-        otp_row = OTP(phone=phone_raw, code="999999", session_id=None, expires_at=expires_at, used=False)
-        db.add(otp_row)
-        db.commit()
-        return {"ok": True, "dev": True, "message": "OTP mocked (no SMS)", "otp": "999999"}
-
-    # Call 2factor AUTOGEN to send SMS
-    url = f"{TWOFACTOR_BASE}/{TWOFACTOR_API_KEY}/SMS/{phone_api}/AUTOGEN"
+    # Call 2Factor AUTOGEN with your template name
+    url = f"{BASE_URL}/{API_KEY}/SMS/{phone}/AUTOGEN/{TEMPLATE}"
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        r = requests.get(url, timeout=10)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"SMS provider error: {e}")
+        raise HTTPException(502, f"2Factor error: {e}")
 
-    try:
-        data = resp.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail=f"Bad response from SMS provider: {resp.text[:200]}")
+    if r.status_code != 200:
+        raise HTTPException(502, f"2Factor status {r.status_code}: {r.text}")
 
-    status = (data.get("Status") or "").lower()
-    if status != "success":
-        # Example failure: { "Status":"Error", "Details":"Invalid API Key" }
-        raise HTTPException(status_code=502, detail=f"SMS provider failed: {data}")
+    data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
+    if str(data.get("Status", "")).lower() != "success":
+        # sometimes returns plain text error
+        raise HTTPException(502, f"2Factor failure: {data or r.text}")
 
     session_id = data.get("Details")
     if not session_id:
-        raise HTTPException(status_code=502, detail=f"Missing session id from provider: {data}")
+        raise HTTPException(502, "2Factor did not return session id")
 
-    # Store session id so we can verify later
-    otp_row = OTP(phone=phone_raw, code=None, session_id=session_id, expires_at=expires_at, used=False)
-    db.add(otp_row)
+    # Store OTP row with session_id (no code)
+    expires = _now() + timedelta(minutes=OTP_EXP_MIN)
+    db_obj = OTP(phone=phone, code=None, session_id=session_id, used=False, expires_at=expires)
+    db.add(db_obj)
     db.commit()
 
-    return {"ok": True, "message": "OTP sent", "ttl_minutes": OTP_TTL_MINUTES}
+    return {"ok": True, "session_id": session_id}
 
 @router.post("/verify-otp")
-def verify_otp(body: VerifyOtpBody, db: Session = Depends(get_db)):
-    phone_raw = body.phone.strip()
-    otp_code = body.otp.strip()
-    if not (phone_raw.isdigit() and len(phone_raw) == 10):
-        raise HTTPException(status_code=400, detail="Enter valid 10-digit phone")
-    if not otp_code:
-        raise HTTPException(status_code=400, detail="Enter the OTP")
+def verify_otp(payload: VerifyIn, db: Session = Depends(get_db)):
+    phone = payload.phone.strip()
+    otp_in = payload.otp.strip()
 
-    # Get latest OTP row for this phone within TTL and not used
-    otp_row = (
+    if not (phone.isdigit() and len(phone) == 10):
+        raise HTTPException(400, "Invalid phone")
+    if not otp_in:
+        raise HTTPException(400, "OTP required")
+
+    # Find latest un-used OTP row for this phone
+    db_obj: Optional[OTP] = (
         db.query(OTP)
-        .filter(OTP.phone == phone_raw, OTP.used == False, OTP.expires_at > datetime.now(timezone.utc))
+        .filter(OTP.phone == phone, OTP.used == False)  # noqa
         .order_by(OTP.id.desc())
         .first()
     )
-    if not otp_row:
-        raise HTTPException(status_code=400, detail="No active OTP. Please request a new one.")
+    if not db_obj or not db_obj.session_id:
+        raise HTTPException(400, "No OTP session. Please resend OTP.")
 
-    # Dev fallback: no 2factor key → accept the mocked code
-    if not TWOFACTOR_API_KEY:
-        if otp_row.code != otp_code:
-            raise HTTPException(status_code=400, detail="Invalid OTP (dev mode).")
-    else:
-        # Verify with 2factor using stored session id
-        if not otp_row.session_id:
-            raise HTTPException(status_code=400, detail="OTP session missing. Please request a new OTP.")
-        url = f"{TWOFACTOR_BASE}/{TWOFACTOR_API_KEY}/SMS/VERIFY/{otp_row.session_id}/{otp_code}"
-        try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-            data = resp.json()
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"SMS verify error: {e}")
+    if db_obj.expires_at <= _now():
+        raise HTTPException(400, "OTP expired. Please resend.")
 
-        status = (data.get("Status") or "").lower()
-        if status != "success":
-            # Example failure: {"Status":"Error","Details":"OTP Mismatch"}
-            raise HTTPException(status_code=400, detail=f"Verify failed: {data.get('Details','Unknown')}")
+    # Verify with 2Factor
+    url = f"{BASE_URL}/{API_KEY}/SMS/VERIFY/{db_obj.session_id}/{otp_in}"
+    try:
+        r = requests.get(url, timeout=10)
+    except Exception as e:
+        raise HTTPException(502, f"2Factor error: {e}")
 
-    # Mark OTP used
-    otp_row.used = True
+    if r.status_code != 200:
+        raise HTTPException(502, f"2Factor status {r.status_code}: {r.text}")
+
+    data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
+    if str(data.get("Status", "")).lower() != "success":
+        raise HTTPException(400, "Invalid OTP")
+
+    # Mark used
+    db_obj.used = True
     db.commit()
 
-    # Upsert user by phone
-    user = db.query(User).filter(User.phone == phone_raw).first()
+    # Upsert user
+    user = db.query(User).filter(User.phone == phone).first()
     if not user:
-        user = User(phone=phone_raw)
+        user = User(phone=phone, name=None, upi_id=None)
         db.add(user)
         db.commit()
         db.refresh(user)
 
-    token = create_access_token({"sub": str(user.id)})
-
+    token = _jwt_for_user(user.id)
     return {"ok": True, "user_id": user.id, "access_token": token, "token_type": "bearer"}

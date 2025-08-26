@@ -7,10 +7,8 @@ class OTP(Base):
     __tablename__ = "otps"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String(20), index=True, nullable=False)
-    # optional – if you ever do in-house OTPs again
-    code = Column(String(10), nullable=True)
-    # store 2factor session id here for AUTOGEN/VERIFY flow
-    session_id = Column(String(64), nullable=True, index=True)
+    code = Column(String(10), nullable=True)                 # not used with 2Factor AUTOGEN
+    session_id = Column(String(64), nullable=True, index=True)  # << store 2Factor SessionId
     used = Column(Boolean, default=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

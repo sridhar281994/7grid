@@ -8,7 +8,7 @@ from jose import jwt
 
 from database import get_db
 from models import OTP, User
-from utils.mailer import send_email_otp
+from utils.email_utils import send_email_otp
 import random
 
 router = APIRouter(prefix="/auth", tags=["auth"])

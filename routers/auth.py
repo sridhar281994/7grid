@@ -18,6 +18,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 API_KEY = os.getenv("TWOFACTOR_API_KEY", "")
 TEMPLATE = os.getenv("TWOFACTOR_TEMPLATE", "7grids")  # from your screenshot
 OTP_EXP_MIN = int(os.getenv("OTP_EXP_MINUTES", "5"))
+SENDER_ID = os.getenv("TWOFACTOR_SENDER_ID", "gridsT")  # your Sender ID
+BASE_URL = "https://2factor.in/API/V1"
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")

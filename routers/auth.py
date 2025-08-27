@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import OTP, User
 from jose import jwt
+from urllib.parse import urlencode
+
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -45,34 +47,26 @@ def _jwt_for_user(user_id: int) -> str:
 def send_otp(payload: PhoneIn, db: Session = Depends(get_db)):
     phone = payload.phone.strip()
     if not (phone.isdigit() and len(phone) == 10):
-        raise HTTPException(400, "Invalid phone")
-    # ---- 2FACTOR SMS + TEMPLATE (forces SMS, not voice) ----
-    # prepend +91 and pass your approved template & sender id
-    sender_id = os.getenv("TWOFACTOR_SENDER_ID", "gridsT")  # from your template
-    msisdn = f"+91{phone}"
-    url = f"{BASE_URL}/{API_KEY}/SMS/{msisdn}/AUTOGEN/{TEMPLATE}?sender={sender_id}"
+        raise HTTPException(400, "Invalid phone number")
+    # Force SMS + Sender ID + Template
+    q = {
+        "From": SENDER_ID,       # DLT Header (gridsT)
+        "OtpChannel": "sms",     # ensures SMS, not call
+    }
+    url = f"{BASE_URL}/{API_KEY}/SMS/{phone}/AUTOGEN/{TEMPLATE}?{urlencode(q)}"
     try:
         r = requests.get(url, timeout=10)
     except Exception as e:
         raise HTTPException(502, f"2Factor error: {e}")
     if r.status_code != 200:
         raise HTTPException(502, f"2Factor status {r.status_code}: {r.text}")
-    # many accounts return JSON; keep a safe parse
-    data = {}
-    ctype = r.headers.get("Content-Type", "")
-    if "json" in ctype.lower():
-        try:
-            data = r.json()
-        except Exception:
-            pass
-    status = str(data.get("Status", "")).lower()
-    if status != "success":
-        # if for some reason it returns text, surface it
+    data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
+    if str(data.get("Status", "")).lower() != "success":
         raise HTTPException(502, f"2Factor failure: {data or r.text}")
     session_id = data.get("Details")
     if not session_id:
         raise HTTPException(502, "2Factor did not return session id")
-    # store only the session; code is delivered by SMS
+    # Save OTP session (code stays None for AUTOGEN)
     expires = _now() + timedelta(minutes=OTP_EXP_MIN)
     db.add(OTP(phone=phone, code=None, session_id=session_id, used=False, expires_at=expires))
     db.commit()

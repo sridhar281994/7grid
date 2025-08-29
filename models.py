@@ -1,35 +1,46 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum, func
+from sqlalchemy import (
+    Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum, func
+)
 from sqlalchemy.orm import relationship
 from database import Base
 import enum
+
 
 class OTP(Base):
     __tablename__ = "otps"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String(20), index=True, nullable=False)
-    code = Column(String(10), nullable=True)  # keep nullable=True since older rows may be null
+    code = Column(String(10), nullable=True)  # nullable for legacy rows
     used = Column(Boolean, default=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    # if you still have a session_id column from earlier experiments, keep it, it's harmless.
+    # If you still have a session_id column from earlier experiments, it's fine to keep.
+
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String(20), unique=True, index=True, nullable=False)
-    email = Column(String(255), unique=True, index=True, nullable=True)  # <-- ADD THIS
+    email = Column(String(255), unique=True, index=True, nullable=True)  # keep nullable for legacy
     name = Column(String(100))
     upi_id = Column(String(100))
+    # NEW: hashed password column used by auth.py
+    password_hash = Column(String(255), nullable=True)
+    # NEW: wallet balance used by /users/me and wallet features
+    wallet_balance = Column(Numeric(12, 2), server_default="0")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 
 class TxType(str, enum.Enum):
     RECHARGE = "recharge"
     WITHDRAW = "withdraw"
 
+
 class TxStatus(str, enum.Enum):
     PENDING = "pending"
     SUCCESS = "success"
     FAILED = "failed"
+
 
 class WalletTransaction(Base):
     __tablename__ = "wallet_tx"
@@ -42,10 +53,12 @@ class WalletTransaction(Base):
 
     user = relationship("User")
 
+
 class MatchStatus(str, enum.Enum):
     WAITING = "waiting"
     ACTIVE = "active"
     FINISHED = "finished"
+
 
 class GameMatch(Base):
     __tablename__ = "game_matches"

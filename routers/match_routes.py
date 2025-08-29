@@ -7,6 +7,8 @@ from database import get_db
 from models import GameMatch, MatchStatus, User
 from utils.security import get_current_user # <- you already have this in users.py
 
+from pydantic import BaseModel
+
 router = APIRouter(prefix="/matches", tags=["matches"])
 
 

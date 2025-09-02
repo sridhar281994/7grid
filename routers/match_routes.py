@@ -1,7 +1,6 @@
-from typing import Optional
+from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-
 from database import get_db
 from models import GameMatch, MatchStatus, User
 from utils.security import get_current_user
@@ -27,9 +26,9 @@ def _match_to_dict(m: GameMatch, db: Session) -> dict:
         "status": m.status.value if hasattr(m.status, "value") else str(m.status),
         "p1_user_id": m.p1_user_id,
         "p2_user_id": m.p2_user_id,
+        "created_at": getattr(m, "created_at", None),
         "p1_name": _user_display(db, m.p1_user_id),
         "p2_name": _user_display(db, m.p2_user_id),
-        "created_at": getattr(m, "created_at", None),
     }
 
 
@@ -43,8 +42,7 @@ def list_waiting_matches(
     if stake_amount is not None:
         q = q.filter(GameMatch.stake_amount == stake_amount)
     matches = q.order_by(GameMatch.id.desc()).all()
-    items = [_match_to_dict(m, db) for m in matches]
-    return {"ok": True, "items": items}
+    return {"ok": True, "items": [_match_to_dict(m, db) for m in matches]}
 
 
 class MatchCreateIn(BaseModel):
@@ -57,6 +55,7 @@ def create_or_wait_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Try to join existing
     existing = (
         db.query(GameMatch)
         .filter(
@@ -75,10 +74,12 @@ def create_or_wait_match(
         db.refresh(existing)
         return {"ok": True, "joined": True, "match": _match_to_dict(existing, db)}
 
+    # Or create new
     new_match = GameMatch(
         stake_amount=payload.stake_amount,
         status=MatchStatus.WAITING,
         p1_user_id=current_user.id,
+        p2_user_id=None,
     )
     db.add(new_match)
     db.commit()
@@ -96,7 +97,7 @@ def join_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    m: Optional[GameMatch] = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(404, "Match not found")
     if m.status != MatchStatus.WAITING:
@@ -117,24 +118,16 @@ def check_match_ready(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    m: Optional[GameMatch] = db.query(GameMatch).filter(GameMatch.id == match_id).first()
+    m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
         raise HTTPException(404, "Match not found")
 
     ready = m.status == MatchStatus.ACTIVE
-    opponent_name: Optional[str] = None
-
-    if ready:
-        if current_user.id == m.p1_user_id:
-            opponent_name = _user_display(db, m.p2_user_id)
-        elif current_user.id == m.p2_user_id:
-            opponent_name = _user_display(db, m.p1_user_id)
-        else:
-            opponent_name = _user_display(db, m.p1_user_id) or _user_display(db, m.p2_user_id)
-
     return {
         "ok": True,
         "ready": ready,
-        "opponent_name": opponent_name,
+        "status": m.status.value if hasattr(m.status, "value") else str(m.status),
+        "p1_name": _user_display(db, m.p1_user_id),
+        "p2_name": _user_display(db, m.p2_user_id),
         "match": _match_to_dict(m, db),
     }

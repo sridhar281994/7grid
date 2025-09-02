@@ -1,12 +1,10 @@
-from typing import Optional, List
-
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import get_db
 from models import GameMatch, MatchStatus, User
-from utils.security import get_current_user  # <- already available
-
+from utils.security import get_current_user
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -42,9 +40,10 @@ def list_waiting_matches(
     q = db.query(GameMatch).filter(GameMatch.status == MatchStatus.WAITING)
     if stake_amount is not None:
         q = q.filter(GameMatch.stake_amount == stake_amount)
+    # ignore invalid rows (where p1 is None)
+    q = q.filter(GameMatch.p1_user_id.isnot(None))
     matches = q.order_by(GameMatch.id.desc()).all()
-    items = [_match_to_dict(m, db) for m in matches]
-    return {"ok": True, "items": items}
+    return {"ok": True, "items": [_match_to_dict(m, db) for m in matches]}
 
 
 class MatchCreateIn(BaseModel):
@@ -58,17 +57,16 @@ def create_or_wait_match(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Improved flow:
-    - First try to join an existing waiting match with same stake.
-    - If found -> immediately activate it (p1 vs p2).
-    - If not found -> create a new waiting match.
+    Try to join an existing waiting match with same stake.
+    If none available, create new one with this user as p1.
     """
-    # Look for an existing waiting match (not created by me)
+    # 1) Try to join existing waiting match (not your own)
     existing = (
         db.query(GameMatch)
         .filter(
             GameMatch.status == MatchStatus.WAITING,
             GameMatch.stake_amount == payload.stake_amount,
+            GameMatch.p1_user_id.isnot(None),
             GameMatch.p1_user_id != current_user.id,
         )
         .order_by(GameMatch.id.asc())
@@ -80,26 +78,19 @@ def create_or_wait_match(
         existing.status = MatchStatus.ACTIVE
         db.commit()
         db.refresh(existing)
-        return {
-            "ok": True,
-            "joined": True,
-            "match": _match_to_dict(existing, db),
-        }
+        return {"ok": True, "joined": True, "match": _match_to_dict(existing, db)}
 
-    # Otherwise create a new waiting match
+    # 2) Create new match with this user as Player 1
     new_match = GameMatch(
         stake_amount=payload.stake_amount,
         status=MatchStatus.WAITING,
         p1_user_id=current_user.id,
+        p2_user_id=None,
     )
     db.add(new_match)
     db.commit()
     db.refresh(new_match)
-    return {
-        "ok": True,
-        "joined": False,
-        "match": _match_to_dict(new_match, db),
-    }
+    return {"ok": True, "joined": False, "match": _match_to_dict(new_match, db)}
 
 
 class JoinMatchIn(BaseModel):
@@ -115,8 +106,8 @@ def join_match(
     m: Optional[GameMatch] = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(404, "Match not found")
-    if m.status != MatchStatus.WAITING:
-        raise HTTPException(400, "Match is not waiting")
+    if m.status != MatchStatus.WAITING or not m.p1_user_id:
+        raise HTTPException(400, "Match is not available for joining")
     if m.p1_user_id == current_user.id:
         raise HTTPException(400, "You cannot join your own match")
 
@@ -124,7 +115,7 @@ def join_match(
     m.status = MatchStatus.ACTIVE
     db.commit()
     db.refresh(m)
-    return {"ok": True, "match": _match_to_dict(m, db)}
+    return {"ok": True, "joined": True, "match": _match_to_dict(m, db)}
 
 
 @router.get("/check")
@@ -145,8 +136,6 @@ def check_match_ready(
             opponent_name = _user_display(db, m.p2_user_id)
         elif current_user.id == m.p2_user_id:
             opponent_name = _user_display(db, m.p1_user_id)
-        else:
-            opponent_name = _user_display(db, m.p1_user_id) or _user_display(db, m.p2_user_id)
 
     return {
         "ok": True,

@@ -1,75 +1,67 @@
-from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum, func
-)
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Numeric
 from sqlalchemy.orm import relationship
 from database import Base
 import enum
+from datetime import datetime
 
 
-class OTP(Base):
-    __tablename__ = "otps"
-    id = Column(Integer, primary_key=True, index=True)
-    phone = Column(String(20), index=True, nullable=False)
-    code = Column(String(10), nullable=True)  # nullable for legacy rows
-    used = Column(Boolean, default=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    # If you still have a session_id column from earlier experiments, it's fine to keep.
+# -------------------------
+# Enum for Match Status
+# -------------------------
+class MatchStatus(str, enum.Enum):
+    WAITING = "WAITING"
+    ACTIVE = "ACTIVE"
+    FINISHED = "FINISHED"
 
 
+# -------------------------
+# User Table
+# -------------------------
 class User(Base):
     __tablename__ = "users"
+
     id = Column(Integer, primary_key=True, index=True)
-    phone = Column(String(20), unique=True, index=True, nullable=False)
-    email = Column(String(255), unique=True, index=True, nullable=True)  # keep nullable for legacy
-    name = Column(String(100))
-    upi_id = Column(String(100))
-    # NEW: hashed password column used by auth.py
-    password_hash = Column(String(255), nullable=True)
-    # NEW: wallet balance used by /users/me and wallet features
-    wallet_balance = Column(Numeric(12, 2), server_default="0")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True)
+    phone = Column(String, unique=True, index=True)
+    password = Column(String, nullable=False)
+    upi_id = Column(String, nullable=True)
+
+    # Relationships
+    matches_as_p1 = relationship("Match", back_populates="p1", foreign_keys="Match.p1_id")
+    matches_as_p2 = relationship("Match", back_populates="p2", foreign_keys="Match.p2_id")
+    wallet = relationship("Wallet", back_populates="owner", uselist=False)
 
 
-class TxType(str, enum.Enum):
-    RECHARGE = "recharge"
-    WITHDRAW = "withdraw"
-
-
-class TxStatus(str, enum.Enum):
-    PENDING = "pending"
-    SUCCESS = "success"
-    FAILED = "failed"
-
-
-class WalletTransaction(Base):
-    __tablename__ = "wallet_tx"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    amount = Column(Numeric(12, 2), nullable=False)
-    type = Column(Enum(TxType), nullable=False)
-    status = Column(Enum(TxStatus), default=TxStatus.PENDING, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    user = relationship("User")
-
-
-class MatchStatus(str, enum.Enum):
-    WAITING = "waiting"
-    ACTIVE = "active"
-    FINISHED = "finished"
-
-
-class GameMatch(Base):
+# -------------------------
+# Match Table
+# -------------------------
+class Match(Base):
     __tablename__ = "game_matches"
-    id = Column(Integer, primary_key=True, index=True)
-    stake_amount = Column(Integer, nullable=False)  # 4, 8, 12
-    status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
-    p1_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    p2_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    p1 = relationship("User", foreign_keys=[p1_user_id])
-    p2 = relationship("User", foreign_keys=[p2_user_id])
-    winner = relationship("User", foreign_keys=[winner_user_id])
+    id = Column(Integer, primary_key=True, index=True)
+    stake_amount = Column(Integer, nullable=False)
+    status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+
+    # Player 1
+    p1_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    p1 = relationship("User", foreign_keys=[p1_id], back_populates="matches_as_p1")
+
+    # Player 2
+    p2_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    p2 = relationship("User", foreign_keys=[p2_id], back_populates="matches_as_p2")
+
+
+# -------------------------
+# Wallet Table
+# -------------------------
+class Wallet(Base):
+    __tablename__ = "wallets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
+    balance = Column(Numeric(10, 2), default=0)
+
+    owner = relationship("User", back_populates="wallet")

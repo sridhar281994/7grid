@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Dict
 
-from db import get_db
+from database import get_db
 from .models import GameMatch, MatchStatus, User
 from .auth import get_current_user
 

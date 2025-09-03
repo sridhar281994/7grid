@@ -1,87 +1,71 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from datetime import datetime
-from typing import Dict
-
-from database import get_db
-from .models import GameMatch, MatchStatus, User
-from .auth import get_current_user
-
-router = APIRouter(prefix="/matches", tags=["matches"])
-
-
+from database import get_db  # :white_check_mark: fixed import
+from models import Match, User
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime, timedelta
+router = APIRouter()
+# Pydantic models
+class MatchCreate(BaseModel):
+    stake_amount: int
+class MatchJoin(BaseModel):
+    match_id: int
+# --- Create or wait for match ---
 @router.post("/create")
-def create_or_wait_match(
-    stake_amount: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> Dict:
-    """
-    First user creates WAITING match.
-    Second user joins same match and it becomes ACTIVE.
-    """
-    # Is there a waiting match already?
-    waiting_match = (
-        db.query(GameMatch)
-        .filter(GameMatch.stake_amount == stake_amount, GameMatch.status == MatchStatus.WAITING)
-        .order_by(GameMatch.created_at.asc())
-        .first()
-    )
-
-    if waiting_match and waiting_match.p1_user_id != current_user.id:
-        # join as Player 2
-        waiting_match.p2_user_id = current_user.id
-        waiting_match.status = MatchStatus.ACTIVE
+def create_or_wait_match(data: MatchCreate, db: Session = Depends(get_db)):
+    stake = data.stake_amount
+    # look for waiting match
+    waiting = db.query(Match).filter(
+        Match.status == "WAITING",
+        Match.stake_amount == stake
+    ).first()
+    if waiting:
+        # join existing match
+        waiting.status = "ACTIVE"
+        waiting.started_at = datetime.utcnow()
         db.commit()
-        db.refresh(waiting_match)
-
-        return {
-            "ok": True,
-            "match": {
-                "id": waiting_match.id,
-                "stake_amount": waiting_match.stake_amount,
-                "status": waiting_match.status.value,
-                "p1_name": waiting_match.p1_user.name or waiting_match.p1_user.email,
-                "p2_name": waiting_match.p2_user.name or waiting_match.p2_user.email,
-            },
-        }
-
-    # Otherwise, create a new waiting match
-    new_match = GameMatch(
-        stake_amount=stake_amount,
-        status=MatchStatus.WAITING,
-        p1_user_id=current_user.id,
+        db.refresh(waiting)
+        return {"match_id": waiting.id, "status": "ACTIVE", "p1": waiting.p1_user, "p2": waiting.p2_user}
+    # else create new match
+    new_match = Match(
+        stake_amount=stake,
+        status="WAITING",
         created_at=datetime.utcnow(),
     )
     db.add(new_match)
     db.commit()
     db.refresh(new_match)
-
-    return {
-        "ok": True,
-        "match": {
-            "id": new_match.id,
-            "stake_amount": new_match.stake_amount,
-            "status": new_match.status.value,
-            "p1_name": current_user.name or current_user.email,
-            "p2_name": None,
-        },
-    }
-
-
-@router.get("/check")
-def check_match_ready(
-    match_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> Dict:
-    match = db.query(GameMatch).filter(GameMatch.id == match_id).first()
+    return {"match_id": new_match.id, "status": "WAITING"}
+# --- Join a match ---
+@router.post("/join")
+def join_match(data: MatchJoin, db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == data.match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
-
+    if match.status != "WAITING":
+        raise HTTPException(status_code=400, detail="Match is not available")
+    match.status = "ACTIVE"
+    match.started_at = datetime.utcnow()
+    db.commit()
+    db.refresh(match)
+    return {"match_id": match.id, "status": "ACTIVE", "p1": match.p1_user, "p2": match.p2_user}
+# --- Check match status ---
+@router.get("/check")
+def check_match(match_id: int, db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
     return {
-        "ready": match.status == MatchStatus.ACTIVE,
-        "p1_name": match.p1_user.name or match.p1_user.email if match.p1_user else None,
-        "p2_name": match.p2_user.name or match.p2_user.email if match.p2_user else None,
-        "status": match.status.value,
+        "match_id": match.id,
+        "status": match.status,
+        "stake_amount": match.stake_amount,
+        "p1": match.p1_user,
+        "p2": match.p2_user,
+        "created_at": match.created_at,
     }
+
+
+
+
+

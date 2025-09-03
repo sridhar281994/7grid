@@ -1,71 +1,126 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from database import get_db  # :white_check_mark: fixed import
-from models import Match, User
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime, timedelta
-router = APIRouter()
-# Pydantic models
-class MatchCreate(BaseModel):
-    stake_amount: int
-class MatchJoin(BaseModel):
-    match_id: int
-# --- Create or wait for match ---
+from sqlalchemy.exc import SQLAlchemyError
+from typing import Dict
+
+from database import get_db
+from models import Match, User, MatchStatus
+from utils.security import get_current_user # assumes JWT or session check
+
+from datetime import datetime
+
+router = APIRouter(prefix="/matches", tags=["matches"])
+
+
+# -------------------------
+# Create or wait for match
+# -------------------------
 @router.post("/create")
-def create_or_wait_match(data: MatchCreate, db: Session = Depends(get_db)):
-    stake = data.stake_amount
-    # look for waiting match
-    waiting = db.query(Match).filter(
-        Match.status == "WAITING",
-        Match.stake_amount == stake
-    ).first()
-    if waiting:
-        # join existing match
-        waiting.status = "ACTIVE"
-        waiting.started_at = datetime.utcnow()
+def create_or_wait_match(stake_amount: int, 
+                         db: Session = Depends(get_db),
+                         current_user: User = Depends(get_current_user)) -> Dict:
+    try:
+        # 1. See if a waiting match already exists
+        waiting_match = (
+            db.query(Match)
+            .filter(Match.status == MatchStatus.WAITING, Match.stake_amount == stake_amount)
+            .first()
+        )
+
+        if waiting_match:
+            # Join as Player 2
+            waiting_match.p2_id = current_user.id
+            waiting_match.status = MatchStatus.ACTIVE
+            waiting_match.started_at = datetime.utcnow()
+            db.commit()
+            db.refresh(waiting_match)
+            return {
+                "match_id": waiting_match.id,
+                "status": waiting_match.status,
+                "stake": waiting_match.stake_amount,
+                "p1": waiting_match.p1_id,
+                "p2": waiting_match.p2_id,
+            }
+
+        # 2. Otherwise create a new waiting match
+        new_match = Match(
+            stake_amount=stake_amount,
+            status=MatchStatus.WAITING,
+            p1_id=current_user.id
+        )
+        db.add(new_match)
         db.commit()
-        db.refresh(waiting)
-        return {"match_id": waiting.id, "status": "ACTIVE", "p1": waiting.p1_user, "p2": waiting.p2_user}
-    # else create new match
-    new_match = Match(
-        stake_amount=stake,
-        status="WAITING",
-        created_at=datetime.utcnow(),
-    )
-    db.add(new_match)
-    db.commit()
-    db.refresh(new_match)
-    return {"match_id": new_match.id, "status": "WAITING"}
-# --- Join a match ---
-@router.post("/join")
-def join_match(data: MatchJoin, db: Session = Depends(get_db)):
-    match = db.query(Match).filter(Match.id == data.match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    if match.status != "WAITING":
-        raise HTTPException(status_code=400, detail="Match is not available")
-    match.status = "ACTIVE"
-    match.started_at = datetime.utcnow()
-    db.commit()
-    db.refresh(match)
-    return {"match_id": match.id, "status": "ACTIVE", "p1": match.p1_user, "p2": match.p2_user}
-# --- Check match status ---
+        db.refresh(new_match)
+
+        return {
+            "match_id": new_match.id,
+            "status": new_match.status,
+            "stake": new_match.stake_amount,
+            "p1": new_match.p1_id,
+            "p2": None,
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB Error: {str(e)}")
+
+
+# -------------------------
+# Poll match readiness
+# -------------------------
 @router.get("/check")
-def check_match(match_id: int, db: Session = Depends(get_db)):
+def check_match_ready(match_id: int,
+                      db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)) -> Dict:
     match = db.query(Match).filter(Match.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
-    return {
-        "match_id": match.id,
-        "status": match.status,
-        "stake_amount": match.stake_amount,
-        "p1": match.p1_user,
-        "p2": match.p2_user,
-        "created_at": match.created_at,
-    }
+
+    if match.status == MatchStatus.ACTIVE and match.p1_id and match.p2_id:
+        return {
+            "ready": True,
+            "match_id": match.id,
+            "stake": match.stake_amount,
+            "p1": match.p1_id,
+            "p2": match.p2_id,
+        }
+    return {"ready": False, "status": match.status}
 
 
+# -------------------------
+# Cancel match
+# -------------------------
+@router.post("/{match_id}/cancel")
+def cancel_match(match_id: int,
+                 db: Session = Depends(get_db),
+                 current_user: User = Depends(get_current_user)) -> Dict:
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    # Only the player who created or joined can cancel
+    if current_user.id not in [match.p1_id, match.p2_id]:
+        raise HTTPException(status_code=403, detail="Not your match")
+
+    db.delete(match)
+    db.commit()
+    return {"message": "Match cancelled"}
 
 
-
+# -------------------------
+# List matches (debug/admin)
+# -------------------------
+@router.get("/list")
+def list_matches(db: Session = Depends(get_db)) -> Dict:
+    matches = db.query(Match).all()
+    return [
+        {
+            "id": m.id,
+            "stake": m.stake_amount,
+            "status": m.status,
+            "p1": m.p1_id,
+            "p2": m.p2_id,
+            "created_at": m.created_at,
+        }
+        for m in matches
+    ]

@@ -22,6 +22,7 @@ class CreateIn(BaseModel):
 def _now():
     return datetime.now(timezone.utc)
 
+
 def _name_for(u: Optional[User]) -> str:
     if not u:
         return "Player"
@@ -46,21 +47,21 @@ def create_or_wait_match(
             .filter(
                 GameMatch.status == MatchStatus.WAITING,
                 GameMatch.stake_amount == stake_amount,
-                GameMatch.p1_id != current_user.id,
+                GameMatch.p1_user_id != current_user.id,
             )
             .order_by(GameMatch.id.asc())
             .first()
         )
 
         if waiting:
-            waiting.p2_id = current_user.id
+            waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.started_at = _now()
             db.commit()
             db.refresh(waiting)
 
-            p1 = db.get(User, waiting.p1_id)
-            p2 = db.get(User, waiting.p2_id)
+            p1 = db.get(User, waiting.p1_user_id)
+            p2 = db.get(User, waiting.p2_user_id)
 
             return {
                 "ok": True,
@@ -75,13 +76,13 @@ def create_or_wait_match(
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
-            p1_id=current_user.id,
+            p1_user_id=current_user.id,
         )
         db.add(new_match)
         db.commit()
         db.refresh(new_match)
 
-        p1 = db.get(User, new_match.p1_id)
+        p1 = db.get(User, new_match.p1_user_id)
 
         return {
             "ok": True,
@@ -110,9 +111,9 @@ def check_match_ready(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    if m.status == MatchStatus.ACTIVE and m.p1_id and m.p2_id:
-        p1 = db.get(User, m.p1_id)
-        p2 = db.get(User, m.p2_id)
+    if m.status == MatchStatus.ACTIVE and m.p1_user_id and m.p2_user_id:
+        p1 = db.get(User, m.p1_user_id)
+        p2 = db.get(User, m.p2_user_id)
         return {
             "ready": True,
             "match_id": m.id,
@@ -138,7 +139,7 @@ def cancel_match(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    if current_user.id not in [m.p1_id, m.p2_id]:
+    if current_user.id not in [m.p1_user_id, m.p2_user_id]:
         raise HTTPException(status_code=403, detail="Not your match")
 
     db.delete(m)
@@ -157,8 +158,8 @@ def list_matches(db: Session = Depends(get_db)) -> Dict:
             "id": m.id,
             "stake": m.stake_amount,
             "status": m.status.value if hasattr(m.status, "value") else str(m.status),
-            "p1": m.p1_id,
-            "p2": m.p2_id,
+            "p1": m.p1_user_id,
+            "p2": m.p2_user_id,
             "created_at": m.created_at,
         }
         for m in matches

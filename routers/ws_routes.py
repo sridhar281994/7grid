@@ -1,78 +1,49 @@
-import json
-import aioredis
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
-from utils.security import get_current_user
-from sqlalchemy.orm import Session
-from database import get_db
-from models import GameMatch
+import redis.asyncio as redis
+import json
+import os
 
-router = APIRouter()
+router = APIRouter(prefix="/ws", tags=["websocket"])
 
-# Redis channel name pattern
-REDIS_URL = "redis://localhost:6379" # use Render/Upstash Redis in prod
+# Redis connection URL
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Active connections in-memory (per backend worker)
-connections: dict[int, set[WebSocket]] = {}
+# Create global Redis connection (lazy)
+redis_client: redis.Redis | None = None
 
-async def broadcast(match_id: int, message: dict):
-    """Send a message to all WebSocket clients in this match."""
-    if match_id in connections:
-        for ws in list(connections[match_id]):
-            try:
-                await ws.send_json(message)
-            except Exception:
-                pass # ignore broken sockets
 
-@router.websocket("/ws/match/{match_id}")
-async def match_ws(
-    websocket: WebSocket,
-    match_id: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
+async def get_redis() -> redis.Redis:
+    global redis_client
+    if redis_client is None:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    return redis_client
+
+
+@router.websocket("/match/{match_id}")
+async def ws_match(websocket: WebSocket, match_id: int):
+    """
+    WebSocket endpoint for realtime dice updates.
+    Clients subscribe to Redis pub/sub channel for their match.
+    """
     await websocket.accept()
 
-    # Register this connection
-    connections.setdefault(match_id, set()).add(websocket)
-
-    # Notify others
-    await broadcast(match_id, {
-        "type": "join",
-        "user_id": current_user.id,
-        "name": current_user.name or current_user.phone,
-    })
+    channel_name = f"match:{match_id}:updates"
+    redis_conn = await get_redis()
+    pubsub = redis_conn.pubsub()
+    await pubsub.subscribe(channel_name)
 
     try:
+        # Run a loop: listen to Redis messages and forward to client
         while True:
-            data = await websocket.receive_text()
-            try:
-                msg = json.loads(data)
-            except Exception:
-                msg = {"raw": data}
-
-            # Example: {"type": "roll", "value": 5}
-            if msg.get("type") == "roll":
-                roll_value = int(msg.get("value"))
-                await broadcast(match_id, {
-                    "type": "roll",
-                    "user_id": current_user.id,
-                    "value": roll_value,
-                })
-
-            # Example: {"type": "move", "pos": 3}
-            elif msg.get("type") == "move":
-                await broadcast(match_id, {
-                    "type": "move",
-                    "user_id": current_user.id,
-                    "pos": msg.get("pos"),
-                })
-
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5.0)
+            if msg:
+                try:
+                    data = json.loads(msg["data"])
+                except Exception:
+                    data = {"raw": msg["data"]}
+                await websocket.send_json(data)
     except WebSocketDisconnect:
-        # Remove connection
-        connections[match_id].discard(websocket)
-        if not connections[match_id]:
-            connections.pop(match_id, None)
-        await broadcast(match_id, {
-            "type": "leave",
-            "user_id": current_user.id,
-        })
+        # Cleanup when client disconnects
+        await pubsub.unsubscribe(channel_name)
+    finally:
+        await pubsub.close()

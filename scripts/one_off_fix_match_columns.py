@@ -1,27 +1,49 @@
-from sqlalchemy import create_engine, text
-import os
+# scripts/one_off_fix_match_columns.py
+"""
+One-off migration script to fix columns in the matches table.
+Safe for psycopg3 (psycopg[binary]) environments.
+"""
 
-def _normalize_db_url(url: str) -> str:
-    # Render / Heroku style URLs may start with postgres:// instead of postgresql://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
+import os
+from sqlalchemy import create_engine, text
 
 def main():
-    raw_url = os.getenv("DATABASE_URL", "")
-    if not raw_url:
-        raise RuntimeError("DATABASE_URL not set")
-    db_url = _normalize_db_url(raw_url)
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is not set")
 
+    # ✅ Force psycopg3 if only psycopg[binary] is installed
+    if db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    print("Connecting…")
     engine = create_engine(db_url, future=True)
 
+    stmts = [
+        # Rename old columns if they exist
+        ("Rename p1_id -> p1_user_id",
+         """ALTER TABLE matches RENAME COLUMN p1_id TO p1_user_id;"""),
+        ("Rename p2_id -> p2_user_id",
+         """ALTER TABLE matches RENAME COLUMN p2_id TO p2_user_id;"""),
+        # Ensure extra columns
+        ("Ensure winner_user_id",
+         """ALTER TABLE matches ADD COLUMN IF NOT EXISTS winner_user_id INTEGER;"""),
+        ("Ensure system_fee",
+         """ALTER TABLE matches ADD COLUMN IF NOT EXISTS system_fee NUMERIC(10,2) DEFAULT 0;"""),
+        ("Ensure finished_at",
+         """ALTER TABLE matches ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;"""),
+    ]
+
     with engine.begin() as conn:
-        print("🔄 Adding last_roll column to matches table…")
-        conn.execute(text("""
-            ALTER TABLE matches
-            ADD COLUMN IF NOT EXISTS last_roll INTEGER;
-        """))
-        print("✅ Migration completed successfully")
+        for label, stmt in stmts:
+            try:
+                conn.execute(text(stmt))
+                print(f"✅ {label}")
+            except Exception as e:
+                # Skip gracefully if column missing etc.
+                print(f"⚠️ Skipped {label}: {e}")
+
+    print("🎉 Migration completed.")
 
 if __name__ == "__main__":
     main()

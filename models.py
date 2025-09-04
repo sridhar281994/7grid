@@ -11,6 +11,18 @@ class MatchStatus(str, enum.Enum):
     FINISHED = "FINISHED"
     CANCELLED = "CANCELLED"
 # --------------------
+# Transaction Enums
+# --------------------
+class TxType(str, enum.Enum):
+    RECHARGE = "RECHARGE"
+    WITHDRAW = "WITHDRAW"
+    BET = "BET"
+    WIN = "WIN"
+class TxStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+# --------------------
 # User Model
 # --------------------
 class User(Base):
@@ -25,6 +37,7 @@ class User(Base):
     # Relationships
     matches_as_p1 = relationship("Match", back_populates="player1", foreign_keys="Match.p1_user_id")
     matches_as_p2 = relationship("Match", back_populates="player2", foreign_keys="Match.p2_user_id")
+    transactions = relationship("WalletTransaction", back_populates="user")
 # --------------------
 # Match Model
 # --------------------
@@ -50,8 +63,17 @@ class OTP(Base):
     used = Column(Boolean, default=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-
-
-
+# --------------------
+# Wallet Transaction
+# --------------------
+class WalletTransaction(Base):
+    __tablename__ = "wallet_transactions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    tx_type = Column(Enum(TxType), nullable=False)
+    status = Column(Enum(TxStatus), default=TxStatus.PENDING, nullable=False)
+    transaction_id = Column(String, nullable=True)  # external reference if needed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Relationship
+    user = relationship("User", back_populates="transactions")

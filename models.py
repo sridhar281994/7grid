@@ -1,11 +1,13 @@
 from sqlalchemy import (
     Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum
 )
-from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
 
-Base = declarative_base()
+# ✅ Use the same Base as everywhere else
+from database import Base
+
 
 # -----------------------
 # Enums
@@ -15,11 +17,9 @@ class MatchStatus(enum.Enum):
     ACTIVE = "active"
     FINISHED = "finished"
 
-
 class TxType(enum.Enum):
     RECHARGE = "recharge"
     WITHDRAW = "withdraw"
-
 
 class TxStatus(enum.Enum):
     PENDING = "pending"
@@ -37,18 +37,18 @@ class User(Base):
     phone = Column(String, unique=True, nullable=False)
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
+
+    # ✅ add this
+    name = Column(String, nullable=True)
+
     upi_id = Column(String, nullable=True)
     wallet_balance = Column(Numeric(10, 2), default=0)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    # ⚠️ removed updated_at (since DB didn’t have it)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    matches_as_p1 = relationship(
-        "GameMatch", foreign_keys="GameMatch.p1_id", back_populates="player1"
-    )
-    matches_as_p2 = relationship(
-        "GameMatch", foreign_keys="GameMatch.p2_id", back_populates="player2"
-    )
+    matches_as_p1 = relationship("GameMatch", foreign_keys="GameMatch.p1_user_id", back_populates="player1")
+    matches_as_p2 = relationship("GameMatch", foreign_keys="GameMatch.p2_user_id", back_populates="player2")
     transactions = relationship("WalletTransaction", back_populates="user")
 
 
@@ -75,19 +75,17 @@ class GameMatch(Base):
     id = Column(Integer, primary_key=True, index=True)
     stake_amount = Column(Integer, nullable=False)
 
-    # ✅ fixed naming: p1_id, p2_id
-    p1_id = Column(Integer, ForeignKey("users.id"))
-    p2_id = Column(Integer, ForeignKey("users.id"))
-    winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    p1_user_id = Column(Integer, ForeignKey("users.id"))
+    p2_user_id = Column(Integer, ForeignKey("users.id"))
 
+    winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
     system_fee = Column(Numeric(10, 2), default=0)
-
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
-    player1 = relationship("User", foreign_keys=[p1_id], back_populates="matches_as_p1")
-    player2 = relationship("User", foreign_keys=[p2_id], back_populates="matches_as_p2")
+    player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")
+    player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
     winner = relationship("User", foreign_keys=[winner_user_id])
 
 
@@ -101,10 +99,13 @@ class WalletTransaction(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     amount = Column(Numeric(10, 2), nullable=False)
 
-    # ✅ renamed to `type` (routers/wallet.py uses `type=TxType.RECHARGE`)
-    type = Column(Enum(TxType), nullable=False)
-
+    # keep column name aligned with your router usage
+    tx_type = Column(Enum(TxType), nullable=False)
     status = Column(Enum(TxStatus), default=TxStatus.PENDING, nullable=False)
+
+    # ✅ your router references this; add it
+    provider_ref = Column(String, nullable=True)
+
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     transaction_id = Column(String, unique=True, nullable=True)
 

@@ -4,27 +4,36 @@ from pydantic import BaseModel, conint
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_
 from database import get_db
-from models import User, Match, MatchStatus
+from models import User, GameMatch, MatchStatus   # ✅ fixed import
 from utils.security import get_current_user
 
 router = APIRouter(prefix="/game", tags=["game"])
+
+# Allowed stakes
 VALID_STAKES = {4, 8, 12}
 
 
+# -------------------------
+# Helpers
+# -------------------------
 def entry_cost(stake: int) -> Decimal:
-    # each player contributes stake/2 points
+    """Each player contributes stake/2 points"""
     return Decimal(stake) / Decimal(2)
 
 
 def winner_payout(stake: int) -> Decimal:
-    # winner gets 75% of stake (numbers given: 4->3, 8->6, 12->9)
+    """Winner gets 75% of stake (e.g., 4 -> 3, 8 -> 6, 12 -> 9)"""
     return Decimal(stake) * Decimal("0.75")
 
 
 def system_fee(stake: int) -> Decimal:
+    """System keeps the remainder (25%)"""
     return Decimal(stake) - winner_payout(stake)
 
 
+# -------------------------
+# Request models
+# -------------------------
 class MatchIn(BaseModel):
     stake_amount: conint(strict=True, ge=1)
 
@@ -34,57 +43,84 @@ class CompleteIn(BaseModel):
     winner_user_id: int
 
 
+# -------------------------
+# Endpoints
+# -------------------------
 @router.post("/request")
 def request_match(payload: MatchIn, db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
+    """
+    Request to join or create a match with the given stake.
+    If a waiting match exists, join it. Otherwise create a new one.
+    """
     stake = int(payload.stake_amount)
     if stake not in VALID_STAKES:
         raise HTTPException(400, f"Invalid stake, choose one of {sorted(VALID_STAKES)}")
+
     fee = entry_cost(stake)
     if (user.wallet_balance or 0) < fee:
         raise HTTPException(400, "Insufficient wallet for entry fee")
-    # try to join an existing waiting match
+
+    # Try to join an existing waiting match
     waiting = db.execute(
-        select(Match)
-        .where(and_(Match.stake_amount == stake, Match.status == MatchStatus.WAITING))
-        .order_by(Match.id.asc())
+        select(GameMatch)
+        .where(and_(GameMatch.stake_amount == stake, GameMatch.status == MatchStatus.WAITING))
+        .order_by(GameMatch.id.asc())
     ).scalars().first()
+
     if waiting and waiting.p1_user_id != user.id:
-        # charge second player's fee
+        # Charge second player's fee
         user.wallet_balance = (user.wallet_balance or 0) - fee
         waiting.p2_user_id = user.id
         waiting.status = MatchStatus.ACTIVE
         db.commit()
         return {"ok": True, "match_id": waiting.id, "status": waiting.status.value}
-    # else create a waiting match, charge p1
+
+    # Else create a waiting match, charge p1
     user.wallet_balance = (user.wallet_balance or 0) - fee
-    m = Match(stake_amount=stake, p1_user_id=user.id, status=MatchStatus.WAITING)
+    m = GameMatch(stake_amount=stake, p1_user_id=user.id, status=MatchStatus.WAITING)
     db.add(m)
     db.commit()
     db.refresh(m)
+
     return {"ok": True, "match_id": m.id, "status": m.status.value}
 
 
 @router.post("/complete")
 def complete_match(payload: CompleteIn, db: Session = Depends(get_db),
                    me: User = Depends(get_current_user)):
-    m = db.get(Match, payload.match_id)
+    """
+    Mark a match as complete and award payout to the winner.
+    """
+    m = db.get(GameMatch, payload.match_id)
     if not m:
         raise HTTPException(404, "Match not found")
+
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(400, "Match not active")
+
     if me.id not in {m.p1_user_id, m.p2_user_id}:
         raise HTTPException(403, "Only participants can complete the match")
+
     if payload.winner_user_id not in {m.p1_user_id, m.p2_user_id}:
         raise HTTPException(400, "Winner must be p1 or p2")
+
     winner = db.get(User, payload.winner_user_id)
     if not winner:
         raise HTTPException(404, "Winner user not found")
-    # credit winner, keep system fee
+
+    # Credit winner, keep system fee
     pay = winner_payout(m.stake_amount)
     m.system_fee = system_fee(m.stake_amount)
     winner.wallet_balance = (winner.wallet_balance or 0) + pay
+
     m.winner_user_id = winner.id
     m.status = MatchStatus.FINISHED
     db.commit()
-    return {"ok": True, "match_id": m.id, "winner_user_id": winner.id, "payout": float(pay)}
+
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "winner_user_id": winner.id,
+        "payout": float(pay)
+    }

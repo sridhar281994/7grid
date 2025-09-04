@@ -12,20 +12,18 @@ def main():
     if not db_url:
         raise RuntimeError("DATABASE_URL is not set")
 
-    # ✅ Force psycopg3 if only psycopg[binary] is installed
+    # Force psycopg3 driver
     if db_url.startswith("postgresql://"):
         db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
     print("Connecting…")
-    engine = create_engine(db_url, future=True)
+    engine = create_engine(db_url, future=True, isolation_level="AUTOCOMMIT")
 
     stmts = [
-        # Rename old columns if they exist
         ("Rename p1_id -> p1_user_id",
          """ALTER TABLE matches RENAME COLUMN p1_id TO p1_user_id;"""),
         ("Rename p2_id -> p2_user_id",
          """ALTER TABLE matches RENAME COLUMN p2_id TO p2_user_id;"""),
-        # Ensure extra columns
         ("Ensure winner_user_id",
          """ALTER TABLE matches ADD COLUMN IF NOT EXISTS winner_user_id INTEGER;"""),
         ("Ensure system_fee",
@@ -34,13 +32,12 @@ def main():
          """ALTER TABLE matches ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;"""),
     ]
 
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         for label, stmt in stmts:
             try:
                 conn.execute(text(stmt))
                 print(f"✅ {label}")
             except Exception as e:
-                # Skip gracefully if column missing etc.
                 print(f"⚠️ Skipped {label}: {e}")
 
     print("🎉 Migration completed.")

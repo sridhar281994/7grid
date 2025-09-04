@@ -2,12 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from typing import Dict
+from datetime import datetime
 
 from database import get_db
-from models import Match, User, MatchStatus
+from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user # assumes JWT or session check
-
-from datetime import datetime
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -16,14 +15,15 @@ router = APIRouter(prefix="/matches", tags=["matches"])
 # Create or wait for match
 # -------------------------
 @router.post("/create")
-def create_or_wait_match(stake_amount: int, 
+def create_or_wait_match(stake_amount: int,
                          db: Session = Depends(get_db),
                          current_user: User = Depends(get_current_user)) -> Dict:
     try:
         # 1. See if a waiting match already exists
         waiting_match = (
-            db.query(Match)
-            .filter(Match.status == MatchStatus.WAITING, Match.stake_amount == stake_amount)
+            db.query(GameMatch)
+            .filter(GameMatch.status == MatchStatus.WAITING,
+                    GameMatch.stake_amount == stake_amount)
             .first()
         )
 
@@ -43,7 +43,7 @@ def create_or_wait_match(stake_amount: int,
             }
 
         # 2. Otherwise create a new waiting match
-        new_match = Match(
+        new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_id=current_user.id
@@ -72,7 +72,7 @@ def create_or_wait_match(stake_amount: int,
 def check_match_ready(match_id: int,
                       db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_user)) -> Dict:
-    match = db.query(Match).filter(Match.id == match_id).first()
+    match = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -94,7 +94,7 @@ def check_match_ready(match_id: int,
 def cancel_match(match_id: int,
                  db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)) -> Dict:
-    match = db.query(Match).filter(Match.id == match_id).first()
+    match = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -112,7 +112,7 @@ def cancel_match(match_id: int,
 # -------------------------
 @router.get("/list")
 def list_matches(db: Session = Depends(get_db)) -> Dict:
-    matches = db.query(Match).all()
+    matches = db.query(GameMatch).all()
     return [
         {
             "id": m.id,

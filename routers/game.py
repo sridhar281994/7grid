@@ -4,7 +4,7 @@ from pydantic import BaseModel, conint
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_
 from database import get_db
-from models import User, GameMatch, MatchStatus
+from models import User, Match, MatchStatus
 from utils.security import get_current_user
 
 router = APIRouter(prefix="/game", tags=["game"])

@@ -12,4 +12,4 @@ passlib[bcrypt]
 websockets==12.0
 redis>=4.5
 setuptools
-psycopg2-binary
+

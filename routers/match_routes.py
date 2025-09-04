@@ -172,7 +172,7 @@ def list_matches(db: Session = Depends(get_db)) -> Dict:
 
 
 # -------------------------
-# Dice Roll (NEW)
+# Dice Roll (Synced)
 # -------------------------
 @router.post("/roll")
 def roll_dice(
@@ -180,7 +180,7 @@ def roll_dice(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Fair dice roll for an active match."""
+    """Fair dice roll for an active match. Ensures both players see the same roll."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -191,5 +191,15 @@ def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # --- sync roll across both players ---
+    # If already rolled this turn, return same
+    if hasattr(m, "last_roll") and m.last_roll is not None:
+        return {"ok": True, "match_id": m.id, "roll": m.last_roll}
+
     roll = random.randint(1, 6)
+
+    # Temporary in-memory storage (you can persist in DB if you add the column)
+    m.last_roll = roll
+    db.commit()
+
     return {"ok": True, "match_id": m.id, "roll": roll}

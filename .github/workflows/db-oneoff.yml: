@@ -1,0 +1,27 @@
+name: Run one-off DB fixes
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (SQLAlchemy + Psycopg)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "SQLAlchemy>=2.0" "psycopg[binary]>=3.2"
+
+      - name: Run one-off SQL
+        run: |
+          python scripts/one_off_fix_columns.py

@@ -24,4 +24,4 @@ jobs:
 
       - name: Run one-off SQL
         run: |
-          python scripts/one_off_fix_columns.py
+          python scripts/one_off_fix_match_columns.py

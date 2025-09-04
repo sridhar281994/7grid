@@ -1,41 +1,39 @@
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from sqlalchemy.orm import Session
+
 from database import get_db
 from models import User
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
-JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "43200"))  # default 30 days
 
-bearer = HTTPBearer()
+_auth = HTTPBearer(auto_error=False)
 
-def _now() -> datetime:
+def _now():
     return datetime.now(timezone.utc)
 
-def make_token(user_id: int) -> str:
-    payload = {
-        "sub": str(user_id),
-        "iat": int(_now().timestamp()),
-        "exp": int((_now() + timedelta(minutes=JWT_EXP_MIN)).timestamp()),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
-
 def get_current_user(
-    cred: HTTPAuthorizationCredentials = Depends(bearer),
+    creds: HTTPAuthorizationCredentials = Depends(_auth),
     db: Session = Depends(get_db),
 ) -> User:
-    token = cred.credentials
+    if not creds or creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = creds.credentials
     try:
-        data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        uid = int(data.get("sub"))
-    except (JWTError, ValueError):
-        raise HTTPException(401, "Invalid token")
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid token (no sub)")
+        user_id = int(sub)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    user = db.get(User, uid)
+    user = db.get(User, user_id)
     if not user:
-        raise HTTPException(401, "User not found")
+        raise HTTPException(status_code=401, detail="User not found")
     return user

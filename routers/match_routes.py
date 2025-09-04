@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import Dict, Optional
+import random
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, conint
@@ -16,6 +17,10 @@ router = APIRouter(prefix="/matches", tags=["matches"])
 # ---- Request bodies ----
 class CreateIn(BaseModel):
     stake_amount: conint(gt=0)
+
+
+class RollIn(BaseModel):
+    match_id: int
 
 
 # ---- helpers ----
@@ -164,3 +169,27 @@ def list_matches(db: Session = Depends(get_db)) -> Dict:
         }
         for m in matches
     ]
+
+
+# -------------------------
+# Dice Roll (NEW)
+# -------------------------
+@router.post("/roll")
+def roll_dice(
+    payload: RollIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    """Fair dice roll for an active match."""
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    if current_user.id not in [m.p1_user_id, m.p2_user_id]:
+        raise HTTPException(status_code=403, detail="Not your match")
+
+    if m.status != MatchStatus.ACTIVE:
+        raise HTTPException(status_code=400, detail="Match not active")
+
+    roll = random.randint(1, 6)
+    return {"ok": True, "match_id": m.id, "roll": roll}

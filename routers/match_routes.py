@@ -64,6 +64,9 @@ def create_or_wait_match(
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.started_at = _now()
+            # initialize synced state
+            waiting.last_roll = None
+            waiting.current_turn = 0 # let P1 start
             db.commit()
             db.refresh(waiting)
 
@@ -84,6 +87,8 @@ def create_or_wait_match(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_user_id=current_user.id,
+            last_roll=None,
+            current_turn=0,
         )
         db.add(new_match)
         db.commit()
@@ -129,7 +134,7 @@ def check_match_ready(
             "p1": _name_for(p1),
             "p2": _name_for(p2),
             "last_roll": m.last_roll,
-            "turn": m.turn,
+            "turn": m.current_turn,
         }
 
     return {"ready": False, "status": m.status.value}
@@ -171,7 +176,7 @@ def list_matches(db: Session = Depends(get_db)) -> Dict:
             "p2": m.p2_user_id,
             "created_at": m.created_at,
             "last_roll": m.last_roll,
-            "turn": m.turn,
+            "turn": m.current_turn,
         }
         for m in matches
     ]
@@ -200,7 +205,7 @@ async def roll_dice(
     # Roll and update match state
     roll = random.randint(1, 6)
     m.last_roll = roll
-    m.turn = 1 - (m.turn or 0) # switch turn
+    m.current_turn = 1 - (m.current_turn or 0) # switch turn (defaults to P1)
     db.commit()
     db.refresh(m)
 
@@ -217,11 +222,10 @@ async def roll_dice(
             "match_id": m.id,
             "roller_id": current_user.id,
             "roll": roll,
-            "turn": m.turn,
+            "turn": m.current_turn,
         }
         await redis_conn.publish(channel_name, json.dumps(event))
     except Exception as e:
         print(f"[WARN] Redis publish failed: {e}")
 
-    return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.turn}
-
+    return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn}

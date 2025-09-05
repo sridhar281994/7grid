@@ -64,11 +64,26 @@ def create_or_wait_match(
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.started_at = _now()
-            # initialize synced state
-            waiting.last_roll = None
             waiting.current_turn = 0 # P1 starts
+            waiting.last_roll = None
             db.commit()
             db.refresh(waiting)
+
+            # broadcast match_start
+            try:
+                import redis.asyncio as redis
+                REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+                redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
+                event = {
+                    "type": "match_start",
+                    "match_id": waiting.id,
+                    "turn": waiting.current_turn,
+                }
+                channel_name = f"match:{waiting.id}:updates"
+                import asyncio
+                asyncio.create_task(redis_conn.publish(channel_name, json.dumps(event)))
+            except Exception as e:
+                print(f"[WARN] Redis publish failed on match_start: {e}")
 
             p1 = db.get(User, waiting.p1_user_id)
             p2 = db.get(User, waiting.p2_user_id)
@@ -80,6 +95,8 @@ def create_or_wait_match(
                 "stake": waiting.stake_amount,
                 "p1": _name_for(p1),
                 "p2": _name_for(p2),
+                "turn": waiting.current_turn,
+                "last_roll": waiting.last_roll,
             }
 
         # 2) Else create a new waiting room
@@ -103,6 +120,8 @@ def create_or_wait_match(
             "stake": new_match.stake_amount,
             "p1": _name_for(p1),
             "p2": None,
+            "turn": new_match.current_turn,
+            "last_roll": new_match.last_roll,
         }
 
     except SQLAlchemyError as e:
@@ -202,24 +221,21 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # --- enforce turn ---
-    player_idx = 0 if current_user.id == m.p1_user_id else 1
-    if m.current_turn is None:
-        m.current_turn = 0
-    if m.current_turn != player_idx:
-        raise HTTPException(status_code=403, detail="Not your turn")
+    # enforce turn
+    expected_id = m.p1_user_id if (m.current_turn or 0) == 0 else m.p2_user_id
+    if current_user.id != expected_id:
+        raise HTTPException(status_code=400, detail="Not your turn")
 
     # Roll and update match state
     roll = random.randint(1, 6)
     m.last_roll = roll
-    m.current_turn = 1 - player_idx # switch turn
+    m.current_turn = 1 - (m.current_turn or 0) # switch turn
     db.commit()
     db.refresh(m)
 
     # Publish to Redis for realtime sync
     try:
         import redis.asyncio as redis
-
         REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
 

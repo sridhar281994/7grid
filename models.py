@@ -17,9 +17,11 @@ class MatchStatus(enum.Enum):
     ACTIVE = "active"
     FINISHED = "finished"
 
+
 class TxType(enum.Enum):
     RECHARGE = "recharge"
     WITHDRAW = "withdraw"
+
 
 class TxStatus(enum.Enum):
     PENDING = "pending"
@@ -38,7 +40,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
 
-    # ✅ add this
+    # ✅ allow optional display name
     name = Column(String, nullable=True)
 
     upi_id = Column(String, nullable=True)
@@ -84,6 +86,10 @@ class GameMatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
+    # ✅ new columns for synced gameplay
+    last_roll = Column(Integer, nullable=True)
+    current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2
+
     player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")
     player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
     winner = relationship("User", foreign_keys=[winner_user_id])
@@ -99,11 +105,10 @@ class WalletTransaction(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     amount = Column(Numeric(10, 2), nullable=False)
 
-    # keep column name aligned with your router usage
+    # ✅ keep column name aligned with router usage
     tx_type = Column(Enum(TxType), nullable=False)
     status = Column(Enum(TxStatus), default=TxStatus.PENDING, nullable=False)
 
-    # ✅ your router references this; add it
     provider_ref = Column(String, nullable=True)
 
     timestamp = Column(DateTime(timezone=True), server_default=func.now())

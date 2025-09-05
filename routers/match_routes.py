@@ -66,7 +66,7 @@ def create_or_wait_match(
             waiting.started_at = _now()
             # initialize synced state
             waiting.last_roll = None
-            waiting.current_turn = 0 # let P1 start
+            waiting.current_turn = 0 # P1 starts
             db.commit()
             db.refresh(waiting)
 
@@ -202,10 +202,17 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # --- enforce turn ---
+    player_idx = 0 if current_user.id == m.p1_user_id else 1
+    if m.current_turn is None:
+        m.current_turn = 0
+    if m.current_turn != player_idx:
+        raise HTTPException(status_code=403, detail="Not your turn")
+
     # Roll and update match state
     roll = random.randint(1, 6)
     m.last_roll = roll
-    m.current_turn = 1 - (m.current_turn or 0) # switch turn (defaults to P1)
+    m.current_turn = 1 - player_idx # switch turn
     db.commit()
     db.refresh(m)
 

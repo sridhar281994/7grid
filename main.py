@@ -5,14 +5,15 @@ from database import Base, engine
 from routers import auth, users, wallet, game, match_routes
 from routers import ws_routes
 
-
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
 # CORS: keep * while testing; lock down in prod
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
@@ -24,9 +25,14 @@ def health():
     return {"ok": True}
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
+    # Ensure DB tables
     Base.metadata.create_all(bind=engine)
     print("Database tables ensured/created.")
+
+    # Verify Redis connection with retry
+    from utils.redis_client import init_redis_with_retry
+    await init_redis_with_retry(max_retries=5, delay=2.0)
 
 # Routers
 app.include_router(auth.router)

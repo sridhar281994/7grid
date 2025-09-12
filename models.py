@@ -5,7 +5,6 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
 
-# ✅ Use the same Base as everywhere else
 from database import Base
 
 
@@ -40,9 +39,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
 
-    # ✅ allow optional display name
     name = Column(String, nullable=True)
-
     upi_id = Column(String, nullable=True)
     wallet_balance = Column(Numeric(10, 2), default=0)
 
@@ -86,7 +83,7 @@ class GameMatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
-    # ✅ new columns for synced gameplay
+    # Optional DB-land echoes of state (handy for debugging or later analytics)
     last_roll = Column(Integer, nullable=True)
     current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2
 
@@ -105,7 +102,6 @@ class WalletTransaction(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     amount = Column(Numeric(10, 2), nullable=False)
 
-    # ✅ keep column name aligned with router usage
     tx_type = Column(Enum(TxType), nullable=False)
     status = Column(Enum(TxStatus), default=TxStatus.PENDING, nullable=False)
 

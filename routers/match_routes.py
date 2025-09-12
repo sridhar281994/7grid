@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from typing import Dict, Optional
-import os, json, random, asyncio
+import random
+import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, conint
@@ -11,20 +13,58 @@ from database import get_db
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user
 
-# Redis (async)
-try:
-    import redis.asyncio as redis
-except Exception: # pragma: no cover
-    redis = None # app still works, just without realtime sync
+import redis.asyncio as redis
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-MATCH_TTL_SEC = int(os.getenv("MATCH_TTL_SEC", "7200")) # 2h safety
-ROLL_LOCK_SEC = int(os.getenv("ROLL_LOCK_SEC", "2")) # short critical section
+
+# ---------- Redis helpers ----------
+def _ch(match_id: int) -> str:
+    return f"match:{match_id}:updates"
+
+def _key(match_id: int) -> str:
+    return f"match:{match_id}:state"
+
+async def _r() -> redis.Redis:
+    return redis.from_url(REDIS_URL, decode_responses=True)
+
+async def _init_state(r: redis.Redis, match_id: int, stake: int):
+    key = _key(match_id)
+    exists = await r.exists(key)
+    if not exists:
+        # canonical, server-authoritative state in Redis
+        await r.hset(
+            key,
+            mapping={
+                "p1_pos": 0,
+                "p2_pos": 0,
+                "turn": 0, # 0 = P1, 1 = P2
+                "last_roll": 0,
+                "stake": stake,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        await r.publish(
+            _ch(match_id),
+            json.dumps({"type": "started", "match_id": match_id, "turn": 0})
+        )
+
+async def _load_state(r: redis.Redis, match_id: int) -> Dict:
+    d = await r.hgetall(_key(match_id))
+    if not d:
+        return {}
+    # coerce ints
+    for k in ("p1_pos","p2_pos","turn","last_roll","stake"):
+        if k in d:
+            try:
+                d[k] = int(d[k])
+            except Exception:
+                d[k] = 0
+    return d
 
 
-# ---------- Models ----------
+# ---- Request bodies ----
 class CreateIn(BaseModel):
     stake_amount: conint(gt=0)
 
@@ -32,59 +72,14 @@ class RollIn(BaseModel):
     match_id: int
 
 
-# ---------- Helpers ----------
-def _now(): return datetime.now(timezone.utc)
+# ---- helpers ----
+def _now():
+    return datetime.now(timezone.utc)
 
 def _name_for(u: Optional[User]) -> str:
-    if not u: return "Player"
+    if not u:
+        return "Player"
     return (u.name or (u.email or "").split("@")[0] or u.phone or f"User#{u.id}")
-
-async def _r() -> Optional[redis.Redis]:
-    if not redis:
-        return None
-    return redis.from_url(REDIS_URL, decode_responses=True)
-
-async def _init_state(r: redis.Redis, match_id: int, stake: int):
-    """Initialize ephemeral match state in Redis (idempotent)."""
-    key = f"match:{match_id}:state"
-    exists = await r.exists(key)
-    if not exists:
-        await r.hset(key, mapping={
-            "status": "active",
-            "turn": "0", # 0 => P1, 1 => P2
-            "p1_pos": "0",
-            "p2_pos": "0",
-            "last_roll": "0",
-            "stake": str(stake),
-        })
-    await r.expire(key, MATCH_TTL_SEC)
-
-async def _publish(r: redis.Redis, match_id: int, event: Dict):
-    chan = f"match:{match_id}:updates"
-    await r.publish(chan, json.dumps(event))
-
-
-def _positions_after_roll(p_idx: int, p1_pos: int, p2_pos: int, roll: int):
-    """
-    Your board rule: danger at 3 -> go back to 0; exact 7 -> win; overshoot -> stay; else move.
-    Returns: new_p1, new_p2, finished(bool)
-    """
-    pos = [p1_pos, p2_pos]
-    new_pos = pos[p_idx] + roll
-    finished = False
-
-    if new_pos == 3:
-        pos[p_idx] = 0
-    elif new_pos == 7:
-        pos[p_idx] = 7
-        finished = True
-    elif new_pos > 7:
-        # stay
-        pass
-    else:
-        pos[p_idx] = new_pos
-
-    return pos[0], pos[1], finished
 
 
 # -------------------------
@@ -99,7 +94,7 @@ async def create_or_wait_match(
     try:
         stake_amount = int(payload.stake_amount)
 
-        # 1) Try existing waiting room (not created by me)
+        # existing waiting (not me)
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -111,29 +106,28 @@ async def create_or_wait_match(
             .first()
         )
 
+        r = await _r()
+
         if waiting:
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
-            waiting.started_at = _now()
+            waiting.last_roll = None
+            waiting.current_turn = 0 # P1 starts
             db.commit()
             db.refresh(waiting)
 
-            # init Redis state + publish start
-            r = await _r()
-            if r:
-                await _init_state(r, waiting.id, waiting.stake_amount)
-                p1 = db.get(User, waiting.p1_user_id)
-                p2 = db.get(User, waiting.p2_user_id)
-                await _publish(r, waiting.id, {
-                    "type": "start",
-                    "match_id": waiting.id,
-                    "stake": waiting.stake_amount,
-                    "p1": _name_for(p1),
-                    "p2": _name_for(p2),
-                    "turn": 0,
-                    "p1_pos": 0,
-                    "p2_pos": 0,
-                })
+            # make Redis state authoritative
+            await _init_state(r, waiting.id, waiting.stake_amount)
+
+            # announce ready
+            await r.publish(_ch(waiting.id), json.dumps({
+                "type": "ready",
+                "match_id": waiting.id,
+                "stake": waiting.stake_amount,
+                "p1_id": waiting.p1_user_id,
+                "p2_id": waiting.p2_user_id,
+                "turn": 0,
+            }))
 
             p1 = db.get(User, waiting.p1_user_id)
             p2 = db.get(User, waiting.p2_user_id)
@@ -146,20 +140,20 @@ async def create_or_wait_match(
                 "p2": _name_for(p2),
             }
 
-        # 2) Else create a new waiting room
+        # else create new waiting room
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_user_id=current_user.id,
+            last_roll=None,
+            current_turn=0,
         )
         db.add(new_match)
         db.commit()
         db.refresh(new_match)
 
-        # Pre-create Redis state (optional)
-        r = await _r()
-        if r:
-            await _init_state(r, new_match.id, new_match.stake_amount)
+        # pre-create Redis state so both sides see consistent turn on join
+        await _init_state(r, new_match.id, new_match.stake_amount)
 
         p1 = db.get(User, new_match.p1_user_id)
         return {
@@ -192,20 +186,7 @@ async def check_match_ready(
     if m.status == MatchStatus.ACTIVE and m.p1_user_id and m.p2_user_id:
         p1 = db.get(User, m.p1_user_id)
         p2 = db.get(User, m.p2_user_id)
-
-        # Read live state from Redis (fallbacks if Redis down)
-        turn = 0
-        p1_pos = p2_pos = last_roll = 0
-        r = await _r()
-        if r:
-            key = f"match:{m.id}:state"
-            state = await r.hgetall(key)
-            if state:
-                turn = int(state.get("turn", "0"))
-                p1_pos = int(state.get("p1_pos", "0"))
-                p2_pos = int(state.get("p2_pos", "0"))
-                last_roll = int(state.get("last_roll", "0"))
-
+        state = await _load_state(await _r(), m.id)
         return {
             "ready": True,
             "match_id": m.id,
@@ -213,10 +194,10 @@ async def check_match_ready(
             "stake": m.stake_amount,
             "p1": _name_for(p1),
             "p2": _name_for(p2),
-            "turn": turn,
-            "p1_pos": p1_pos,
-            "p2_pos": p2_pos,
-            "last_roll": last_roll,
+            "last_roll": state.get("last_roll", 0),
+            "turn": state.get("turn", 0),
+            "p1_pos": state.get("p1_pos", 0),
+            "p2_pos": state.get("p2_pos", 0),
         }
 
     return {"ready": False, "status": m.status.value}
@@ -226,7 +207,7 @@ async def check_match_ready(
 # Cancel match
 # -------------------------
 @router.post("/{match_id}/cancel")
-async def cancel_match(
+def cancel_match(
     match_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -236,12 +217,6 @@ async def cancel_match(
         raise HTTPException(status_code=404, detail="Match not found")
     if current_user.id not in [m.p1_user_id, m.p2_user_id]:
         raise HTTPException(status_code=403, detail="Not your match")
-
-    # cleanup redis
-    r = await _r()
-    if r:
-        await r.delete(f"match:{match_id}:state")
-        await _publish(r, match_id, {"type": "player_left", "match_id": match_id, "user_id": current_user.id})
 
     db.delete(m)
     db.commit()
@@ -262,13 +237,15 @@ def list_matches(db: Session = Depends(get_db)) -> Dict:
             "p1": m.p1_user_id,
             "p2": m.p2_user_id,
             "created_at": m.created_at,
+            "last_roll": m.last_roll,
+            "turn": m.current_turn,
         }
         for m in matches
     ]
 
 
 # -------------------------
-# Dice Roll (server-auth, atomic, broadcast)
+# Dice Roll (authoritative)
 # -------------------------
 @router.post("/roll")
 async def roll_dice(
@@ -276,95 +253,51 @@ async def roll_dice(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    """Server-authoritative roll. Persist to Redis, mirror to DB, broadcast via pub/sub."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
-    if current_user.id not in [m.p1_user_id, m.p2_user_id]:
-        raise HTTPException(status_code=403, detail="Not your match")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
+    if current_user.id not in [m.p1_user_id, m.p2_user_id]:
+        raise HTTPException(status_code=403, detail="Not your match")
 
-    # Redis required for sync
     r = await _r()
-    if not r:
-        # Fallback (not recommended for production sync)
-        roll = random.randint(1, 6)
-        return {"ok": True, "match_id": m.id, "roll": roll}
+    state = await _load_state(r, m.id)
+    if not state:
+        # initialize if missing (defensive)
+        await _init_state(r, m.id, m.stake_amount)
+        state = await _load_state(r, m.id)
 
-    key = f"match:{m.id}:state"
-    lock_key = f"lock:match:{m.id}"
+    # Turn enforcement (optional; enable if required)
+    # expected_turn_user = m.p1_user_id if state.get("turn", 0) == 0 else m.p2_user_id
+    # if current_user.id != expected_turn_user:
+    # raise HTTPException(status_code=409, detail="Not your turn")
 
-    # Acquire short lock to prevent double-roll
-    got_lock = await r.set(lock_key, str(current_user.id), ex=ROLL_LOCK_SEC, nx=True)
-    if not got_lock:
-        raise HTTPException(status_code=409, detail="Another action in progress")
+    roll = random.randint(1, 6)
 
-    try:
-        state = await r.hgetall(key)
-        if not state:
-            await _init_state(r, m.id, m.stake_amount)
-            state = await r.hgetall(key)
+    # Apply minimal board logic on server if you want positions synced too.
+    # For now we just flip the turn; clients compute board animation.
+    new_turn = 1 - int(state.get("turn", 0))
 
-        turn = int(state.get("turn", "0"))
-        p1_pos = int(state.get("p1_pos", "0"))
-        p2_pos = int(state.get("p2_pos", "0"))
-        status = state.get("status", "active")
+    # Persist in Redis
+    await r.hset(_key(m.id), mapping={"last_roll": roll, "turn": new_turn})
+    # Mirror to DB (useful for admin/debug)
+    m.last_roll = roll
+    m.current_turn = new_turn
+    db.commit()
+    db.refresh(m)
 
-        if status != "active":
-            raise HTTPException(status_code=400, detail="Match not active")
-
-        # Determine who is rolling
-        me_idx = 0 if current_user.id == m.p1_user_id else 1
-        if me_idx != turn:
-            raise HTTPException(status_code=403, detail="Not your turn")
-
-        roll = random.randint(1, 6)
-        new_p1, new_p2, finished = _positions_after_roll(me_idx, p1_pos, p2_pos, roll)
-        next_turn = 1 - turn
-
-        # Update Redis
-        upd = {
-            "last_roll": str(roll),
-            "p1_pos": str(new_p1),
-            "p2_pos": str(new_p2),
-            "turn": str(next_turn),
-        }
-        if finished:
-            upd["status"] = "finished"
-        await r.hset(key, mapping=upd)
-        await r.expire(key, MATCH_TTL_SEC)
-
-        # Broadcast
-        await _publish(r, m.id, {
+    # Broadcast to both clients
+    await r.publish(
+        _ch(m.id),
+        json.dumps({
             "type": "dice_roll",
             "match_id": m.id,
             "roller_id": current_user.id,
             "roll": roll,
-            "turn": next_turn,
-            "p1_pos": new_p1,
-            "p2_pos": new_p2,
-            "finished": bool(finished),
-            "winner_user_id": (m.p1_user_id if me_idx == 0 else m.p2_user_id) if finished else None,
+            "turn": new_turn
         })
+    )
 
-        # If finished, also persist winner into DB for ledger
-        if finished:
-            m.winner_user_id = m.p1_user_id if me_idx == 0 else m.p2_user_id
-            m.status = MatchStatus.FINISHED
-            m.finished_at = _now()
-            db.commit()
-
-        return {
-            "ok": True,
-            "match_id": m.id,
-            "roll": roll,
-            "turn": next_turn,
-            "p1_pos": new_p1,
-            "p2_pos": new_p2,
-            "finished": finished,
-        }
-
-    finally:
-        # Let lock expire naturally; optional explicit delete
-        # await r.delete(lock_key)
-        pass
+    return {"ok": True, "match_id": m.id, "roll": roll, "turn": new_turn}

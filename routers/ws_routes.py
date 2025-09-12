@@ -1,6 +1,6 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import json
-from redis_client import redis_client
+from utils.redis_client import redis_client
 
 router = APIRouter(prefix="/ws", tags=["websocket"])
 

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 import random
 import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, conint
@@ -11,7 +12,12 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user
-from redis_client import redis_client
+
+# Redis client
+import redis.asyncio as redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -36,11 +42,25 @@ def _name_for(u: Optional[User]) -> str:
     return (u.name or (u.email or "").split("@")[0] or u.phone or f"User#{u.id}")
 
 
+async def _broadcast_match_ready(match: GameMatch, p1: User, p2: User):
+    """Send match_ready event so both clients know game started"""
+    channel_name = f"match:{match.id}:updates"
+    event = {
+        "type": "match_ready",
+        "match_id": match.id,
+        "stake": match.stake_amount,
+        "p1": _name_for(p1),
+        "p2": _name_for(p2),
+        "turn": match.current_turn or 0,
+    }
+    await redis_client.publish(channel_name, json.dumps(event))
+
+
 # -------------------------
 # Create or wait for match
 # -------------------------
 @router.post("/create")
-def create_or_wait_match(
+async def create_or_wait_match(
     payload: CreateIn,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -48,7 +68,7 @@ def create_or_wait_match(
     try:
         stake_amount = int(payload.stake_amount)
 
-        # 1) Try existing waiting room
+        # 1) Try existing waiting room (not created by me)
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -65,12 +85,15 @@ def create_or_wait_match(
             waiting.status = MatchStatus.ACTIVE
             waiting.started_at = _now()
             waiting.last_roll = None
-            waiting.current_turn = 0 # let P1 start
+            waiting.current_turn = 0 # P1 starts
             db.commit()
             db.refresh(waiting)
 
             p1 = db.get(User, waiting.p1_user_id)
             p2 = db.get(User, waiting.p2_user_id)
+
+            # broadcast match_ready
+            await _broadcast_match_ready(waiting, p1, p2)
 
             return {
                 "ok": True,
@@ -161,7 +184,7 @@ def cancel_match(
 
 
 # -------------------------
-# List matches
+# List matches (debug/admin)
 # -------------------------
 @router.get("/list")
 def list_matches(db: Session = Depends(get_db)) -> Dict:
@@ -182,7 +205,7 @@ def list_matches(db: Session = Depends(get_db)) -> Dict:
 
 
 # -------------------------
-# Dice Roll
+# Dice Roll (Synced via Redis + DB)
 # -------------------------
 @router.post("/roll")
 async def roll_dice(
@@ -201,23 +224,26 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # Roll and update match state
     roll = random.randint(1, 6)
     m.last_roll = roll
-    m.current_turn = 1 - (m.current_turn or 0)
+    m.current_turn = 1 - (m.current_turn or 0) # switch turn
     db.commit()
     db.refresh(m)
 
+    # Publish to Redis for realtime sync
+    channel_name = f"match:{m.id}:updates"
+    event = {
+        "type": "dice_roll",
+        "match_id": m.id,
+        "roller_id": current_user.id,
+        "roll": roll,
+        "turn": m.current_turn,
+    }
     try:
-        channel_name = f"match:{m.id}:updates"
-        event = {
-            "type": "dice_roll",
-            "match_id": m.id,
-            "roller_id": current_user.id,
-            "roll": roll,
-            "turn": m.current_turn,
-        }
         await redis_client.publish(channel_name, json.dumps(event))
     except Exception as e:
         print(f"[WARN] Redis publish failed: {e}")
 
     return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn}
+

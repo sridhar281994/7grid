@@ -15,10 +15,11 @@ from database import get_db
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user
 
-# --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
-# --------- Redis (optional) ---------
+# ------------------------
+# Redis (for shared state + 10s auto-roll)
+# ------------------------
 _redis = None
 _redis_ready = False
 REDIS_URL = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or "redis://localhost:6379/0"
@@ -51,7 +52,9 @@ def _name_for(u: Optional[User]) -> str:
     return base or f"User#{u.id}"
 
 
-# ---- Request bodies ----
+# ------------------------
+# Request bodies
+# ------------------------
 class CreateIn(BaseModel):
     stake_amount: conint(gt=0)
 
@@ -60,105 +63,127 @@ class RollIn(BaseModel):
     match_id: int
 
 
-# --------- helpers ---------
-def _status_value(m: GameMatch) -> str:
-    try:
-        return m.status.value
-    except Exception:
-        return str(m.status)
+# ------------------------
+# State helpers
+# ------------------------
+async def _state_key(match_id: int) -> str:
+    return f"match:{match_id}:state"
 
 
-async def _write_state_to_redis(m: GameMatch, *, override_turn_ts: Optional[datetime] = None) -> None:
+async def _write_state(m: GameMatch, state: dict) -> None:
+    """Persist the whole state for the match in Redis (24h TTL)."""
     r = await _get_redis()
     if not r:
         return
-    key = f"match:{m.id}:state"
     payload = {
-        "current_turn": m.current_turn if m.current_turn is not None else 0,
-        "last_roll": m.last_roll,
-        "last_turn_ts": (override_turn_ts or _utcnow()).isoformat(),
+        "positions": state.get("positions", [0, 0]),
+        "current_turn": state.get("current_turn", 0),
+        "last_roll": state.get("last_roll"),
+        "winner": state.get("winner"),
+        "last_turn_ts": _utcnow().isoformat(),
     }
     try:
-        await r.set(key, json.dumps(payload), ex=24 * 60 * 60)
+        await r.set(await _state_key(m.id), json.dumps(payload), ex=24 * 60 * 60)
     except Exception:
         pass
 
 
-async def _read_state_from_redis(match_id: int) -> Optional[dict]:
+async def _read_state(match_id: int) -> Optional[dict]:
     r = await _get_redis()
     if not r:
         return None
     try:
-        raw = await r.get(f"match:{match_id}:state")
-        if not raw:
-            return None
-        return json.loads(raw)
+        raw = await r.get(await _state_key(match_id))
+        return json.loads(raw) if raw else None
     except Exception:
         return None
 
 
-async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10) -> None:
+# ------------------------
+# Game rules (server-authoritative)
+# ------------------------
+def _apply_roll(positions, current_turn, roll):
+    """Deterministic 8-tile board:
+       - tile 3 = danger -> reset to 0
+       - tile 7 = win
+       - >7 = ignore movement (no change), but turn still switches to other player
+    """
+    p = current_turn
+    old = positions[p]
+    new_pos = old + roll
+    msg = None
+    winner = None
+
+    if new_pos == 3:
+        positions[p] = 0
+        msg = "Danger! Back to start."
+        next_turn = 1 - p
+    elif new_pos >= 7:
+        positions[p] = 7
+        winner = p
+        msg = "Victory!"
+        next_turn = p # winner keeps (game ends in UI)
+    elif new_pos > 7:
+        # out of range: stay, just pass turn
+        positions[p] = old
+        next_turn = 1 - p
+    else:
+        positions[p] = new_pos
+        next_turn = 1 - p
+
+    return positions, next_turn, winner, msg
+
+
+async def _auto_advance_if_needed(m: GameMatch, timeout_secs=10):
+    """If 10s since last turn stamp, auto-roll once on server."""
     r = await _get_redis()
-    if not r:
+    if not r or m.status != MatchStatus.ACTIVE:
         return
 
-    st = await _read_state_from_redis(m.id) or {}
+    st = await _read_state(m.id) or {}
     ts_str = st.get("last_turn_ts")
     if not ts_str:
         return
+
     try:
         last_ts = datetime.fromisoformat(ts_str)
     except Exception:
         return
 
-    if m.status != MatchStatus.ACTIVE:
-        return
-
     if _utcnow() - last_ts < timedelta(seconds=timeout_secs):
         return
 
+    # lock so only one instance auto-rolls
     lock_key = f"match:{m.id}:autoroll_lock"
     try:
         got_lock = await r.set(lock_key, "1", nx=True, ex=5)
     except Exception:
         got_lock = False
-
     if not got_lock:
         return
 
     roll = random.randint(1, 6)
-    m.last_roll = roll
-    m.current_turn = 1 - (m.current_turn or 0)
-
-    try:
-        db.commit()
-        db.refresh(m)
-    except SQLAlchemyError:
-        db.rollback()
-        return
-
-    # ✅ Always refresh timestamp after auto-roll
-    await _write_state_to_redis(m, override_turn_ts=_utcnow())
-    print(f"[AUTO-ADVANCE] Match {m.id} auto-rolled {roll}, next turn {m.current_turn}")
+    positions, next_turn, winner, _ = _apply_roll(st.get("positions", [0, 0]), st.get("current_turn", 0), roll)
+    new_state = {"positions": positions, "current_turn": next_turn, "last_roll": roll, "winner": winner}
+    await _write_state(m, new_state)
+    print(f"[AUTO] match={m.id} roll={roll} next_turn={next_turn} winner={winner}")
 
 
-# -------------------------
-# Create or wait for match
-# -------------------------
+# ------------------------
+# Endpoints
+# ------------------------
 @router.post("/create")
 async def create_or_wait_match(
-    payload: CreateIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    payload: CreateIn, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> Dict:
     try:
-        stake_amount = int(payload.stake_amount)
+        stake = int(payload.stake_amount)
 
         waiting = (
             db.query(GameMatch)
             .filter(
                 GameMatch.status == MatchStatus.WAITING,
-                GameMatch.stake_amount == stake_amount,
+                GameMatch.stake_amount == stake,
                 GameMatch.p1_user_id != current_user.id,
             )
             .order_by(GameMatch.id.asc())
@@ -168,166 +193,79 @@ async def create_or_wait_match(
         if waiting:
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
-            waiting.last_roll = None
-            waiting.current_turn = 0
             db.commit()
             db.refresh(waiting)
 
-            await _write_state_to_redis(waiting, override_turn_ts=_utcnow())
+            state = {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None}
+            await _write_state(waiting, state)
 
-            p1 = db.get(User, waiting.p1_user_id)
-            p2 = db.get(User, waiting.p2_user_id)
+            print(f"[MATCH] join match={waiting.id} stake={waiting.stake_amount}")
+            return {"ok": True, "match_id": waiting.id, "stake": waiting.stake_amount}
 
-            print(f"[MATCH] Player2 joined match {waiting.id} | Stake {waiting.stake_amount}")
-
-            return {
-                "ok": True,
-                "match_id": waiting.id,
-                "status": _status_value(waiting),
-                "stake": waiting.stake_amount,
-                "p1": _name_for(p1),
-                "p2": _name_for(p2),
-                "last_roll": waiting.last_roll,
-                "turn": waiting.current_turn,
-            }
-
-        new_match = GameMatch(
-            stake_amount=stake_amount,
-            status=MatchStatus.WAITING,
-            p1_user_id=current_user.id,
-            last_roll=None,
-            current_turn=0,
-        )
-        db.add(new_match)
+        # create
+        new_m = GameMatch(stake_amount=stake, status=MatchStatus.WAITING, p1_user_id=current_user.id)
+        db.add(new_m)
         db.commit()
-        db.refresh(new_match)
+        db.refresh(new_m)
 
-        await _write_state_to_redis(new_match, override_turn_ts=_utcnow())
+        state = {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None}
+        await _write_state(new_m, state)
 
-        p1 = db.get(User, new_match.p1_user_id)
-
-        print(f"[MATCH] New match {new_match.id} created by Player1 | Stake {new_match.stake_amount}")
-
-        return {
-            "ok": True,
-            "match_id": new_match.id,
-            "status": _status_value(new_match),
-            "stake": new_match.stake_amount,
-            "p1": _name_for(p1),
-            "p2": None,
-            "last_roll": new_match.last_roll,
-            "turn": new_match.current_turn,
-        }
+        print(f"[MATCH] new match={new_m.id} stake={stake}")
+        return {"ok": True, "match_id": new_m.id, "stake": new_m.stake_amount}
 
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 
-# -------------------------
-# Poll match readiness / state
-# -------------------------
 @router.get("/check")
-async def check_match_ready(
-    match_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+async def check_match(
+    match_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> Dict:
     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
     if m.status == MatchStatus.ACTIVE:
-        try:
-            await _auto_advance_if_needed(m, db)
-            db.refresh(m)
-        except Exception:
-            pass
+        await _auto_advance_if_needed(m)
 
-    if m.status == MatchStatus.ACTIVE and m.p1_user_id and m.p2_user_id:
-        p1 = db.get(User, m.p1_user_id)
-        p2 = db.get(User, m.p2_user_id)
-
-        st = await _read_state_from_redis(m.id) or {}
-        current_turn = st.get("current_turn", m.current_turn if m.current_turn is not None else 0)
-        last_roll = st.get("last_roll", m.last_roll)
-
-        print(f"[CHECK] Match {m.id} polled | Turn={current_turn} | Last roll={last_roll}")
-
-        return {
-            "ready": True,
-            "match_id": m.id,
-            "status": _status_value(m),
-            "stake": m.stake_amount,
-            "p1": _name_for(p1),
-            "p2": _name_for(p2),
-            "last_roll": last_roll,
-            "turn": current_turn,
-        }
-
-    return {"ready": False, "status": _status_value(m)}
+    st = await _read_state(m.id) or {}
+    return {"ready": m.status == MatchStatus.ACTIVE, "match_id": m.id, **st}
 
 
-# -------------------------
-# Dice Roll (server-authoritative)
-# -------------------------
 @router.post("/roll")
 async def roll_dice(
-    payload: RollIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    payload: RollIn, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> Dict:
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
-
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    if current_user.id not in [m.p1_user_id, m.p2_user_id]:
-        raise HTTPException(status_code=403, detail="Not your match")
+    st = await _read_state(m.id) or {"positions": [0, 0], "current_turn": 0}
 
+    # turn check (0=P1, 1=P2)
     me_turn = 0 if current_user.id == m.p1_user_id else 1
-    curr = m.current_turn if m.current_turn is not None else 0
-
-    if me_turn != curr:
+    if st.get("current_turn", 0) != me_turn:
         raise HTTPException(status_code=409, detail="Not your turn")
 
+    # server-authoritative roll
     roll = random.randint(1, 6)
-    m.last_roll = roll
-    m.current_turn = 1 - curr
-
-    try:
-        db.commit()
-        db.refresh(m)
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
-    # ✅ Always refresh timestamp on manual roll
-    await _write_state_to_redis(m, override_turn_ts=_utcnow())
-
-    print(
-        f"[ROLL] Match {m.id} | Player{me_turn+1} (user_id={current_user.id}) "
-        f"rolled {roll} | Next turn={m.current_turn}"
-    )
-
-    return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn}
+    positions, next_turn, winner, msg = _apply_roll(st["positions"], st["current_turn"], roll)
+    await _write_state(m, {"positions": positions, "current_turn": next_turn, "last_roll": roll, "winner": winner})
+    print(f"[ROLL] match={m.id} by=P{me_turn+1} roll={roll} next={next_turn} winner={winner}")
+    return {"ok": True, "roll": roll, "positions": positions, "turn": next_turn, "winner": winner, "message": msg}
 
 
-# -------------------------
-# Cancel match
-# -------------------------
 @router.post("/{match_id}/cancel")
 async def cancel_match(
-    match_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    match_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> Dict:
     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
-
     if current_user.id not in [m.p1_user_id, m.p2_user_id]:
         raise HTTPException(status_code=403, detail="Not your match")
 
@@ -338,41 +276,36 @@ async def cancel_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
+    # best-effort cleanup
     try:
         r = await _get_redis()
         if r:
-            await r.delete(f"match:{match_id}:state")
+            await r.delete(await _state_key(match_id))
             await r.delete(f"match:{match_id}:autoroll_lock")
     except Exception:
         pass
 
-    print(f"[CANCEL] Match {match_id} cancelled")
-
+    print(f"[CANCEL] match={match_id}")
     return {"ok": True, "message": "Match cancelled"}
 
 
-# -------------------------
-# List matches (debug/admin)
-# -------------------------
 @router.get("/list")
 async def list_matches(db: Session = Depends(get_db)) -> Dict:
-    matches = db.query(GameMatch).all()
+    rows = db.query(GameMatch).all()
     out = []
-    for m in matches:
-        try:
-            st = await _read_state_from_redis(m.id) or {}
-        except Exception:
-            st = {}
+    for m in rows:
+        st = await _read_state(m.id) or {}
         out.append(
             {
                 "id": m.id,
                 "stake": m.stake_amount,
-                "status": _status_value(m),
+                "status": m.status.value if hasattr(m.status, "value") else str(m.status),
                 "p1": m.p1_user_id,
                 "p2": m.p2_user_id,
-                "created_at": m.created_at,
-                "last_roll": st.get("last_roll", m.last_roll),
-                "turn": st.get("current_turn", m.current_turn),
+                "positions": st.get("positions"),
+                "turn": st.get("current_turn"),
+                "last_roll": st.get("last_roll"),
+                "winner": st.get("winner"),
                 "has_state": bool(st),
             }
         )

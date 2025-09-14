@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -36,7 +37,8 @@ async def _get_redis():
     try:
         import redis.asyncio as redis
 
-        # Works with redis:// and rediss://
+        # Works with redis:// and rediss:// (TLS) — no need to pass ssl kwarg;
+        # redis.from_url infers it from the scheme.
         _redis = redis.from_url(REDIS_URL, decode_responses=True)
         await _redis.ping()
         _redis_ready = True
@@ -104,20 +106,27 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int):
 
 
 async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datetime] = None):
-    """Persist state to Redis"""
+    """Persist state to Redis and publish to channel"""
     r = await _get_redis()
-    if not r:
-        return
     payload = {
+        "ready": m.status == MatchStatus.ACTIVE and m.p1_user_id and m.p2_user_id,
+        "finished": m.status == MatchStatus.FINISHED,
+        "match_id": m.id,
+        "status": _status_value(m),
+        "stake": m.stake_amount,
+        "p1": None,
+        "p2": None,
         "positions": state.get("positions", [0, 0]),
         "current_turn": state.get("current_turn", 0),
         "last_roll": state.get("last_roll"),
         "winner": state.get("winner"),
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
     }
+    # Fill names optionally (db lookups avoided here for speed; /check adds names)
     try:
-        await r.set(f"match:{m.id}:state", json.dumps(payload), ex=24 * 60 * 60)
-        await r.publish(f"match:{m.id}:events", json.dumps(payload))
+        if r:
+            await r.set(f"match:{m.id}:state", json.dumps(payload), ex=24 * 60 * 60)
+            await r.publish(f"match:{m.id}:events", json.dumps(payload))
     except Exception as e:
         print(f"[WARN] Redis write failed: {e}")
 
@@ -136,10 +145,15 @@ async def _read_state(match_id: int) -> Optional[dict]:
 async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10):
     """If last turn > timeout_secs, auto-roll for that player"""
     r = await _get_redis()
-    if not r:
-        return
+    # Still allow auto-advance even if Redis briefly down by reading DB defaults
+    st = await _read_state(m.id) or {
+        "positions": [0, 0],
+        "current_turn": m.current_turn or 0,
+        "last_roll": m.last_roll,
+        "winner": None,
+        "last_turn_ts": _utcnow().isoformat(),
+    }
 
-    st = await _read_state(m.id) or {}
     ts_str = st.get("last_turn_ts")
     if not ts_str:
         return
@@ -154,11 +168,17 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     if _utcnow() - last_ts < timedelta(seconds=timeout_secs):
         return
 
-    lock_key = f"match:{m.id}:autoroll_lock"
-    try:
-        got_lock = await r.set(lock_key, "1", nx=True, ex=5)
-    except Exception:
-        got_lock = False
+    got_lock = False
+    if r:
+        lock_key = f"match:{m.id}:autoroll_lock"
+        try:
+            got_lock = await r.set(lock_key, "1", nx=True, ex=5)
+        except Exception:
+            got_lock = False
+    else:
+        # If no Redis, proceed without lock (single-instance safety only)
+        got_lock = True
+
     if not got_lock:
         return
 
@@ -180,12 +200,15 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
         db.rollback()
         return
 
-    await _write_state(m, {
-        "positions": positions,
-        "current_turn": m.current_turn,
-        "last_roll": roll,
-        "winner": winner,
-    })
+    await _write_state(
+        m,
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+        },
+    )
 
     if winner is not None:
         print(f"[AUTO] Match {m.id} auto-rolled {roll} | WINNER={winner}")
@@ -224,12 +247,15 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            await _write_state(waiting, {
-                "positions": [0, 0],
-                "current_turn": 0,
-                "last_roll": None,
-                "winner": None,
-            })
+            await _write_state(
+                waiting,
+                {
+                    "positions": [0, 0],
+                    "current_turn": 0,
+                    "last_roll": None,
+                    "winner": None,
+                },
+            )
 
             return {
                 "ok": True,
@@ -253,12 +279,15 @@ async def create_or_wait_match(
         db.commit()
         db.refresh(new_match)
 
-        await _write_state(new_match, {
-            "positions": [0, 0],
-            "current_turn": 0,
-            "last_roll": None,
-            "winner": None,
-        })
+        await _write_state(
+            new_match,
+            {
+                "positions": [0, 0],
+                "current_turn": 0,
+                "last_roll": None,
+                "winner": None,
+            },
+        )
 
         return {
             "ok": True,
@@ -347,12 +376,15 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    await _write_state(m, {
-        "positions": positions,
-        "current_turn": m.current_turn,
-        "last_roll": roll,
-        "winner": winner,
-    })
+    await _write_state(
+        m,
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+        },
+    )
 
     return {
         "ok": True,
@@ -372,27 +404,75 @@ async def match_ws(
     websocket: WebSocket,
     match_id: int,
     current_user: User = Depends(get_current_user_ws),
+    db: Session = Depends(get_db),
 ):
     await websocket.accept()
+
+    # Try Redis Pub/Sub first
     r = await _get_redis()
     pubsub = None
     if r:
-        pubsub = r.pubsub()
-        await pubsub.subscribe(f"match:{match_id}:events")
+        try:
+            pubsub = r.pubsub()
+            await pubsub.subscribe(f"match:{match_id}:events")
+            print(f"[WS] Subscribed to match:{match_id}:events")
+        except Exception as e:
+            print(f"[WS] Redis pubsub subscribe error: {e}")
+            pubsub = None
 
     try:
         while True:
+            sent = False
+
+            # If Pub/Sub available, drain & push messages
             if pubsub:
                 try:
-                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
                     if msg and msg.get("type") == "message":
                         await websocket.send_text(msg["data"])
+                        sent = True
                 except Exception as e:
                     print(f"[WS] Redis pubsub error: {e}")
+                    # fall through to snapshot mode below
 
-            await asyncio.sleep(0.2)
+            # Fallback (or idle): send periodic snapshots + drive auto-advance
+            if not sent:
+                m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
+                if not m:
+                    await websocket.send_text(json.dumps({"error": "Match not found"}))
+                    break
+
+                if m.status == MatchStatus.ACTIVE:
+                    await _auto_advance_if_needed(m, db)
+
+                st = await _read_state(match_id) or {
+                    "positions": [0, 0],
+                    "current_turn": m.current_turn or 0,
+                    "last_roll": m.last_roll,
+                    "winner": None,
+                }
+                snapshot = {
+                    "ready": m.status == MatchStatus.ACTIVE and m.p1_user_id and m.p2_user_id,
+                    "finished": m.status == MatchStatus.FINISHED,
+                    "match_id": m.id,
+                    "status": _status_value(m),
+                    "stake": m.stake_amount,
+                    "p1": _name_for(db.get(User, m.p1_user_id)) if m.p1_user_id else None,
+                    "p2": _name_for(db.get(User, m.p2_user_id)) if m.p2_user_id else None,
+                    "last_roll": st.get("last_roll"),
+                    "turn": st.get("current_turn", m.current_turn or 0),
+                    "positions": st.get("positions", [0, 0]),
+                    "winner": st.get("winner"),
+                }
+                await websocket.send_text(json.dumps(snapshot))
+
+            await asyncio.sleep(0.3)
     except WebSocketDisconnect:
         print(f"[WS] Closed for match {match_id}")
     finally:
         if pubsub:
-            await pubsub.close()
+            try:
+                await pubsub.unsubscribe(f"match:{match_id}:events")
+                await pubsub.close()
+            except Exception:
+                pass

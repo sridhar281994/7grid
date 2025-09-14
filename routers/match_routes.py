@@ -15,35 +15,29 @@ from database import get_db
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 
-import ssl
-import redis.asyncio as aioredis
-
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
-# --------- Redis Setup ---------
+# --------- Redis ---------
 _redis = None
 _redis_ready = False
-REDIS_URL = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or "redis://localhost:6379/0"
+REDIS_URL = (
+    os.getenv("REDIS_URL")
+    or os.getenv("UPSTASH_REDIS_REST_URL")
+    or "redis://localhost:6379/0"
+)
 
 
 async def _get_redis():
+    """Lazy connect to Redis."""
     global _redis, _redis_ready
     if _redis_ready and _redis is not None:
         return _redis
     try:
-        if REDIS_URL.startswith("rediss://"):
-            ssl_ctx = ssl.create_default_context()
-            _redis = aioredis.from_url(
-                REDIS_URL,
-                decode_responses=True,
-                ssl=ssl_ctx,
-            )
-        else:
-            _redis = aioredis.from_url(
-                REDIS_URL,
-                decode_responses=True,
-            )
+        import redis.asyncio as redis
+
+        # Works with redis:// and rediss://
+        _redis = redis.from_url(REDIS_URL, decode_responses=True)
         await _redis.ping()
         _redis_ready = True
         return _redis
@@ -61,7 +55,11 @@ def _utcnow() -> datetime:
 def _name_for(u: Optional[User]) -> str:
     if not u:
         return "Player"
-    base = u.name or ((u.email or "").split("@")[0] if u.email else None) or u.phone
+    base = (
+        u.name
+        or ((u.email or "").split("@")[0] if u.email else None)
+        or u.phone
+    )
     return base or f"User#{u.id}"
 
 
@@ -119,8 +117,9 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
     }
     try:
         await r.set(f"match:{m.id}:state", json.dumps(payload), ex=24 * 60 * 60)
-    except Exception:
-        pass
+        await r.publish(f"match:{m.id}:events", json.dumps(payload))
+    except Exception as e:
+        print(f"[WARN] Redis write failed: {e}")
 
 
 async def _read_state(match_id: int) -> Optional[dict]:
@@ -181,15 +180,12 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
         db.rollback()
         return
 
-    await _write_state(
-        m,
-        {
-            "positions": positions,
-            "current_turn": m.current_turn,
-            "last_roll": roll,
-            "winner": winner,
-        },
-    )
+    await _write_state(m, {
+        "positions": positions,
+        "current_turn": m.current_turn,
+        "last_roll": roll,
+        "winner": winner,
+    })
 
     if winner is not None:
         print(f"[AUTO] Match {m.id} auto-rolled {roll} | WINNER={winner}")
@@ -228,15 +224,12 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            await _write_state(
-                waiting,
-                {
-                    "positions": [0, 0],
-                    "current_turn": 0,
-                    "last_roll": None,
-                    "winner": None,
-                },
-            )
+            await _write_state(waiting, {
+                "positions": [0, 0],
+                "current_turn": 0,
+                "last_roll": None,
+                "winner": None,
+            })
 
             return {
                 "ok": True,
@@ -260,15 +253,12 @@ async def create_or_wait_match(
         db.commit()
         db.refresh(new_match)
 
-        await _write_state(
-            new_match,
-            {
-                "positions": [0, 0],
-                "current_turn": 0,
-                "last_roll": None,
-                "winner": None,
-            },
-        )
+        await _write_state(new_match, {
+            "positions": [0, 0],
+            "current_turn": 0,
+            "last_roll": None,
+            "winner": None,
+        })
 
         return {
             "ok": True,
@@ -357,15 +347,12 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    await _write_state(
-        m,
-        {
-            "positions": positions,
-            "current_turn": m.current_turn,
-            "last_roll": roll,
-            "winner": winner,
-        },
-    )
+    await _write_state(m, {
+        "positions": positions,
+        "current_turn": m.current_turn,
+        "last_roll": roll,
+        "winner": winner,
+    })
 
     return {
         "ok": True,
@@ -375,3 +362,37 @@ async def roll_dice(
         "positions": positions,
         "winner": winner,
     }
+
+
+# -------------------------
+# WebSocket endpoint
+# -------------------------
+@router.websocket("/ws/{match_id}")
+async def match_ws(
+    websocket: WebSocket,
+    match_id: int,
+    current_user: User = Depends(get_current_user_ws),
+):
+    await websocket.accept()
+    r = await _get_redis()
+    pubsub = None
+    if r:
+        pubsub = r.pubsub()
+        await pubsub.subscribe(f"match:{match_id}:events")
+
+    try:
+        while True:
+            if pubsub:
+                try:
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if msg and msg.get("type") == "message":
+                        await websocket.send_text(msg["data"])
+                except Exception as e:
+                    print(f"[WS] Redis pubsub error: {e}")
+
+            await asyncio.sleep(0.2)
+    except WebSocketDisconnect:
+        print(f"[WS] Closed for match {match_id}")
+    finally:
+        if pubsub:
+            await pubsub.close()

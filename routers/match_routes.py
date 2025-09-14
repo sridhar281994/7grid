@@ -6,7 +6,7 @@ import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, conint
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -18,32 +18,28 @@ from utils.security import get_current_user, get_current_user_ws
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
-# --------- Redis (with reconnection) ---------
+# --------- Redis ---------
 _redis = None
 _redis_ready = False
-REDIS_URL = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or "redis://localhost:6379/0"
+REDIS_URL = (
+    os.getenv("REDIS_URL")
+    or os.getenv("UPSTASH_REDIS_REST_URL")
+    or "redis://localhost:6379/0"
+)
 
 
 async def _get_redis():
-    """Get or reconnect Redis client."""
+    """
+    Lazily connect to Redis and reuse connection.
+    Works with both redis:// and rediss:// URLs.
+    """
     global _redis, _redis_ready
-    import redis.asyncio as redis
-
-    if _redis is not None:
-        try:
-            await _redis.ping()
-            return _redis
-        except Exception:
-            # connection is dead, reset
-            _redis = None
-            _redis_ready = False
-
+    if _redis_ready and _redis is not None:
+        return _redis
     try:
-        _redis = redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            ssl=REDIS_URL.startswith("rediss://"),
-        )
+        import redis.asyncio as redis
+
+        _redis = redis.from_url(REDIS_URL, decode_responses=True)
         await _redis.ping()
         _redis_ready = True
         return _redis
@@ -83,7 +79,7 @@ def _status_value(m: GameMatch) -> str:
 
 
 def _apply_roll(positions: list[int], current_turn: int, roll: int):
-    """Apply dice roll to board state."""
+    """Apply dice roll to board state"""
     p = current_turn
     old = positions[p]
     new_pos = old + roll
@@ -100,15 +96,15 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int):
     else:
         positions[p] = new_pos
 
+    # Always flip turn unless game finished
     next_turn = 1 - p if winner is None else p
     return positions, next_turn, winner, msg
 
 
 async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datetime] = None):
-    """Persist state to Redis (with reconnection)."""
+    """Persist state to Redis"""
     r = await _get_redis()
     if not r:
-        print("[WARN] Skipping Redis write — not connected")
         return
     payload = {
         "positions": state.get("positions", [0, 0]),
@@ -118,9 +114,9 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
     }
     try:
-        await r.set(f"match:{m.id}:state", json.dumps(payload), ex=86400)
+        await r.set(f"match:{m.id}:state", json.dumps(payload), ex=24 * 60 * 60)
     except Exception as e:
-        print(f"[ERR] Redis write failed: {e}")
+        print(f"[WARN] Failed writing state to Redis: {e}")
 
 
 async def _read_state(match_id: int) -> Optional[dict]:
@@ -131,12 +127,12 @@ async def _read_state(match_id: int) -> Optional[dict]:
         raw = await r.get(f"match:{match_id}:state")
         return json.loads(raw) if raw else None
     except Exception as e:
-        print(f"[ERR] Redis read failed: {e}")
+        print(f"[WARN] Failed reading state from Redis: {e}")
         return None
 
 
 async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10):
-    """If last turn > timeout_secs, auto-roll for that player."""
+    """If last turn > timeout_secs, auto-roll for that player"""
     r = await _get_redis()
     if not r:
         return
@@ -164,6 +160,7 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     if not got_lock:
         return
 
+    # Auto roll
     roll = random.randint(1, 6)
     positions = st.get("positions", [0, 0])
     curr = st.get("current_turn", 0)
@@ -181,12 +178,15 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
         db.rollback()
         return
 
-    await _write_state(m, {
-        "positions": positions,
-        "current_turn": m.current_turn,
-        "last_roll": roll,
-        "winner": winner,
-    })
+    await _write_state(
+        m,
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+        },
+    )
 
     if winner is not None:
         print(f"[AUTO] Match {m.id} auto-rolled {roll} | WINNER={winner}")
@@ -225,12 +225,15 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            await _write_state(waiting, {
-                "positions": [0, 0],
-                "current_turn": 0,
-                "last_roll": None,
-                "winner": None,
-            })
+            await _write_state(
+                waiting,
+                {
+                    "positions": [0, 0],
+                    "current_turn": 0,
+                    "last_roll": None,
+                    "winner": None,
+                },
+            )
 
             return {
                 "ok": True,
@@ -254,12 +257,15 @@ async def create_or_wait_match(
         db.commit()
         db.refresh(new_match)
 
-        await _write_state(new_match, {
-            "positions": [0, 0],
-            "current_turn": 0,
-            "last_roll": None,
-            "winner": None,
-        })
+        await _write_state(
+            new_match,
+            {
+                "positions": [0, 0],
+                "current_turn": 0,
+                "last_roll": None,
+                "winner": None,
+            },
+        )
 
         return {
             "ok": True,
@@ -348,12 +354,15 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    await _write_state(m, {
-        "positions": positions,
-        "current_turn": m.current_turn,
-        "last_roll": roll,
-        "winner": winner,
-    })
+    await _write_state(
+        m,
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+        },
+    )
 
     return {
         "ok": True,

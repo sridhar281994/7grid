@@ -19,14 +19,10 @@ from utils.security import get_current_user
 router = APIRouter(prefix="/matches", tags=["matches"])
 
 # --------- Redis (optional) ---------
-# We keep everything running even if Redis isn't reachable.
-# Used only for: last_turn timestamp + simple once-only auto-roll lock.
-# Keys:
-# match:{id}:state -> {"last_turn_ts": "...", "current_turn": 0/1, "last_roll": n}
-# match:{id}:autoroll_lock -> set with TTL during an auto-advance attempt
 _redis = None
 _redis_ready = False
 REDIS_URL = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or "redis://localhost:6379/0"
+
 
 async def _get_redis():
     global _redis, _redis_ready
@@ -35,7 +31,6 @@ async def _get_redis():
     try:
         import redis.asyncio as redis
         _redis = redis.from_url(REDIS_URL, decode_responses=True)
-        # Probe once
         await _redis.ping()
         _redis_ready = True
         return _redis
@@ -44,29 +39,34 @@ async def _get_redis():
         _redis_ready = False
         return None
 
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def _name_for(u: Optional[User]) -> str:
     if not u:
         return "Player"
-    # Prefer name, then email prefix, then phone, then fallback id
     base = u.name or ((u.email or "").split("@")[0] if u.email else None) or u.phone
     return base or f"User#{u.id}"
+
 
 # ---- Request bodies ----
 class CreateIn(BaseModel):
     stake_amount: conint(gt=0)
 
+
 class RollIn(BaseModel):
     match_id: int
 
-# --------- tiny helpers for DB <-> JSON ---------
+
+# --------- helpers ---------
 def _status_value(m: GameMatch) -> str:
     try:
         return m.status.value
     except Exception:
         return str(m.status)
+
 
 async def _write_state_to_redis(m: GameMatch, *, override_turn_ts: Optional[datetime] = None) -> None:
     r = await _get_redis()
@@ -79,9 +79,10 @@ async def _write_state_to_redis(m: GameMatch, *, override_turn_ts: Optional[date
         "last_turn_ts": (override_turn_ts or _utcnow()).isoformat(),
     }
     try:
-        await r.set(key, json.dumps(payload), ex=24 * 60 * 60) # 1 day TTL just in case
+        await r.set(key, json.dumps(payload), ex=24 * 60 * 60)
     except Exception:
         pass
+
 
 async def _read_state_from_redis(match_id: int) -> Optional[dict]:
     r = await _get_redis()
@@ -95,11 +96,8 @@ async def _read_state_from_redis(match_id: int) -> Optional[dict]:
     except Exception:
         return None
 
+
 async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10) -> None:
-    """
-    If Redis is up: check last_turn_ts; if >= timeout, perform a server auto-roll ONCE.
-    If Redis is not available: skip (manual rolls still work).
-    """
     r = await _get_redis()
     if not r:
         return
@@ -113,15 +111,12 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     except Exception:
         return
 
-    # Already finished? do nothing
     if m.status != MatchStatus.ACTIVE:
         return
 
-    # Only if timeout exceeded
     if _utcnow() - last_ts < timedelta(seconds=timeout_secs):
         return
 
-    # Use a short lock so multiple processes don't auto-roll at once
     lock_key = f"match:{m.id}:autoroll_lock"
     try:
         got_lock = await r.set(lock_key, "1", nx=True, ex=5)
@@ -131,12 +126,10 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     if not got_lock:
         return
 
-    # Perform server-side roll and turn switch
     roll = random.randint(1, 6)
     m.last_roll = roll
     m.current_turn = 1 - (m.current_turn or 0)
-    # Do NOT change status here (win/lose is client-side deterministic board logic)
-    # Commit
+
     try:
         db.commit()
         db.refresh(m)
@@ -144,7 +137,9 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
         db.rollback()
         return
 
-    await _write_state_to_redis(m) # refresh last_turn_ts to now
+    await _write_state_to_redis(m)
+    print(f"[AUTO-ADVANCE] Match {m.id} auto-rolled {roll}, next turn {m.current_turn}")
+
 
 # -------------------------
 # Create or wait for match
@@ -158,7 +153,6 @@ async def create_or_wait_match(
     try:
         stake_amount = int(payload.stake_amount)
 
-        # 1) Try to join an existing waiting match (not created by me)
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -174,15 +168,17 @@ async def create_or_wait_match(
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
-            waiting.current_turn = 0 # P1 starts
+            waiting.current_turn = 0
             db.commit()
             db.refresh(waiting)
 
-            # Seed state to Redis (if available)
             await _write_state_to_redis(waiting)
 
             p1 = db.get(User, waiting.p1_user_id)
             p2 = db.get(User, waiting.p2_user_id)
+
+            print(f"[MATCH] Player2 joined match {waiting.id} | Stake {waiting.stake_amount}")
+
             return {
                 "ok": True,
                 "match_id": waiting.id,
@@ -194,22 +190,23 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
-        # 2) Otherwise create a new waiting match
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_user_id=current_user.id,
             last_roll=None,
-            current_turn=0, # define a default turn so state is consistent once active
+            current_turn=0,
         )
         db.add(new_match)
         db.commit()
         db.refresh(new_match)
 
-        # Pre-write a seed state too (helps consistency if the second player joins right away)
         await _write_state_to_redis(new_match)
 
         p1 = db.get(User, new_match.p1_user_id)
+
+        print(f"[MATCH] New match {new_match.id} created by Player1 | Stake {new_match.stake_amount}")
+
         return {
             "ok": True,
             "match_id": new_match.id,
@@ -225,8 +222,9 @@ async def create_or_wait_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
+
 # -------------------------
-# Poll match readiness / state (keeps your existing frontend happy)
+# Poll match readiness / state
 # -------------------------
 @router.get("/check")
 async def check_match_ready(
@@ -238,7 +236,6 @@ async def check_match_ready(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    # If active, attempt auto-advance (server-side timeout) before answering
     if m.status == MatchStatus.ACTIVE:
         try:
             await _auto_advance_if_needed(m, db)
@@ -250,10 +247,11 @@ async def check_match_ready(
         p1 = db.get(User, m.p1_user_id)
         p2 = db.get(User, m.p2_user_id)
 
-        # Try read current state from Redis if available for freshest last_turn_ts/turn
         st = await _read_state_from_redis(m.id) or {}
         current_turn = st.get("current_turn", m.current_turn if m.current_turn is not None else 0)
         last_roll = st.get("last_roll", m.last_roll)
+
+        print(f"[CHECK] Match {m.id} polled | Turn={current_turn} | Last roll={last_roll}")
 
         return {
             "ready": True,
@@ -268,6 +266,7 @@ async def check_match_ready(
 
     return {"ready": False, "status": _status_value(m)}
 
+
 # -------------------------
 # Dice Roll (server-authoritative)
 # -------------------------
@@ -277,10 +276,6 @@ async def roll_dice(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """
-    Only the server rolls. Enforces whose turn it is.
-    Keeps DB (last_roll, current_turn) and Redis (turn timestamp) in sync.
-    """
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -288,22 +283,18 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # Who am I?
     if current_user.id not in [m.p1_user_id, m.p2_user_id]:
         raise HTTPException(status_code=403, detail="Not your match")
 
-    # Check current turn (0 = P1, 1 = P2)
     me_turn = 0 if current_user.id == m.p1_user_id else 1
     curr = m.current_turn if m.current_turn is not None else 0
 
-    # Allow roll ONLY if it's your turn
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
-    # Roll and update match state
     roll = random.randint(1, 6)
     m.last_roll = roll
-    m.current_turn = 1 - curr # switch to the other player
+    m.current_turn = 1 - curr
 
     try:
         db.commit()
@@ -312,10 +303,15 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # Update Redis state timestamp so timeout counts from now
     await _write_state_to_redis(m)
 
+    print(
+        f"[ROLL] Match {m.id} | Player{me_turn+1} (user_id={current_user.id}) "
+        f"rolled {roll} | Next turn={m.current_turn}"
+    )
+
     return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn}
+
 
 # -------------------------
 # Cancel match
@@ -340,7 +336,6 @@ async def cancel_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # Best-effort: wipe Redis state
     try:
         r = await _get_redis()
         if r:
@@ -349,7 +344,10 @@ async def cancel_match(
     except Exception:
         pass
 
+    print(f"[CANCEL] Match {match_id} cancelled")
+
     return {"ok": True, "message": "Match cancelled"}
+
 
 # -------------------------
 # List matches (debug/admin)

@@ -15,31 +15,35 @@ from database import get_db
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 
+import ssl
+import redis.asyncio as aioredis
+
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
-# --------- Redis ---------
+# --------- Redis Setup ---------
 _redis = None
 _redis_ready = False
-REDIS_URL = (
-    os.getenv("REDIS_URL")
-    or os.getenv("UPSTASH_REDIS_REST_URL")
-    or "redis://localhost:6379/0"
-)
+REDIS_URL = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or "redis://localhost:6379/0"
 
 
 async def _get_redis():
-    """
-    Lazily connect to Redis and reuse connection.
-    Works with both redis:// and rediss:// URLs.
-    """
     global _redis, _redis_ready
     if _redis_ready and _redis is not None:
         return _redis
     try:
-        import redis.asyncio as redis
-
-        _redis = redis.from_url(REDIS_URL, decode_responses=True)
+        if REDIS_URL.startswith("rediss://"):
+            ssl_ctx = ssl.create_default_context()
+            _redis = aioredis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                ssl=ssl_ctx,
+            )
+        else:
+            _redis = aioredis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+            )
         await _redis.ping()
         _redis_ready = True
         return _redis
@@ -115,8 +119,8 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
     }
     try:
         await r.set(f"match:{m.id}:state", json.dumps(payload), ex=24 * 60 * 60)
-    except Exception as e:
-        print(f"[WARN] Failed writing state to Redis: {e}")
+    except Exception:
+        pass
 
 
 async def _read_state(match_id: int) -> Optional[dict]:
@@ -126,8 +130,7 @@ async def _read_state(match_id: int) -> Optional[dict]:
     try:
         raw = await r.get(f"match:{match_id}:state")
         return json.loads(raw) if raw else None
-    except Exception as e:
-        print(f"[WARN] Failed reading state from Redis: {e}")
+    except Exception:
         return None
 
 

@@ -177,6 +177,35 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 
 
 # -------------------------
+# Cleanup stale WAITING matches
+# -------------------------
+MATCH_WAIT_TIMEOUT = 60 # seconds
+
+
+async def _cleanup_stale_matches(db: Session):
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=MATCH_WAIT_TIMEOUT)
+    stale = (
+        db.query(GameMatch)
+        .filter(GameMatch.status == MatchStatus.WAITING)
+        .filter(GameMatch.created_at < cutoff)
+        .all()
+    )
+
+    for m in stale:
+        try:
+            db.delete(m)
+            db.commit()
+            r = await _get_redis()
+            if r:
+                await r.delete(f"match:{m.id}:state")
+                await r.delete(f"match:{m.id}:autoroll_lock")
+            print(f"[CLEANUP] Auto-cancelled stale match {m.id}")
+        except Exception as e:
+            db.rollback()
+            print(f"[WARN] Cleanup failed for match {m.id}: {e}")
+
+
+# -------------------------
 # Create or wait for match
 # -------------------------
 @router.post("/create")
@@ -268,6 +297,9 @@ async def check_match_ready(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    # 🔹 cleanup stale waiting matches first
+    await _cleanup_stale_matches(db)
+
     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -336,4 +368,11 @@ async def roll_dice(
         "winner": winner,
     })
 
-    return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn, "positions": positions, "winner": winner}
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "roll": roll,
+        "turn": m.current_turn,
+        "positions": positions,
+        "winner": winner,
+    }

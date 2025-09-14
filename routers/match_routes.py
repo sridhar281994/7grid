@@ -137,7 +137,8 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
         db.rollback()
         return
 
-    await _write_state_to_redis(m)
+    # ✅ Always refresh timestamp after auto-roll
+    await _write_state_to_redis(m, override_turn_ts=_utcnow())
     print(f"[AUTO-ADVANCE] Match {m.id} auto-rolled {roll}, next turn {m.current_turn}")
 
 
@@ -172,7 +173,7 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            await _write_state_to_redis(waiting)
+            await _write_state_to_redis(waiting, override_turn_ts=_utcnow())
 
             p1 = db.get(User, waiting.p1_user_id)
             p2 = db.get(User, waiting.p2_user_id)
@@ -201,7 +202,7 @@ async def create_or_wait_match(
         db.commit()
         db.refresh(new_match)
 
-        await _write_state_to_redis(new_match)
+        await _write_state_to_redis(new_match, override_turn_ts=_utcnow())
 
         p1 = db.get(User, new_match.p1_user_id)
 
@@ -303,7 +304,8 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    await _write_state_to_redis(m)
+    # ✅ Always refresh timestamp on manual roll
+    await _write_state_to_redis(m, override_turn_ts=_utcnow())
 
     print(
         f"[ROLL] Match {m.id} | Player{me_turn+1} (user_id={current_user.id}) "

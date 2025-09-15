@@ -6,7 +6,7 @@ from routers import auth, users, wallet, game, match_routes
 
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
-# CORS: keep * while testing; lock down in prod
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,11 +25,10 @@ def health():
 
 @app.on_event("startup")
 async def on_startup():
-    # Ensure DB tables
     Base.metadata.create_all(bind=engine)
     print("Database tables ensured/created.")
 
-    # Verify Redis connection with retry
+    # Redis warm-up
     from utils.redis_client import init_redis_with_retry
     await init_redis_with_retry(max_retries=5, delay=2.0)
 

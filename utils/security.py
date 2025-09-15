@@ -4,9 +4,8 @@ from datetime import datetime, timezone
 from fastapi import Depends, HTTPException, WebSocket
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
-from sqlalchemy.orm import Session
 
-from database import get_db
+from database import SessionLocal, get_db
 from models import User
 
 # JWT config
@@ -25,10 +24,11 @@ def _now():
 # --------------------------
 def get_current_user(
     creds: HTTPAuthorizationCredentials = Depends(_auth),
-    db: Session = Depends(get_db),
+    db=Depends(get_db),
 ) -> User:
     if not creds or creds.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Missing bearer token")
+
     token = creds.credentials
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
@@ -42,25 +42,25 @@ def get_current_user(
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+
     return user
 
 
 # --------------------------
 # WebSocket authentication
 # --------------------------
-async def get_current_user_ws(
-    websocket: WebSocket, db: Session = Depends(get_db)
-) -> User:
+async def get_current_user_ws(websocket: WebSocket) -> User:
     """
     Authenticate a WebSocket connection using a token
     from query params (?token=...) or 'Authorization: Bearer ...' header.
+    Closes DB session immediately after lookup (no leaks).
     """
     token = None
 
-    # 1. Try query param
+    # 1. Query param
     token = websocket.query_params.get("token")
 
-    # 2. Try Authorization header
+    # 2. Authorization header
     if not token:
         auth_header = websocket.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
@@ -81,9 +81,14 @@ async def get_current_user_ws(
         await websocket.close(code=4003)
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    user = db.get(User, user_id)
-    if not user:
-        await websocket.close(code=4004)
-        raise HTTPException(status_code=401, detail="User not found")
+    # Open/close session immediately (no connection leaks)
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if not user:
+            await websocket.close(code=4004)
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    finally:
+        db.close()
 
-    return user

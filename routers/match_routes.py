@@ -81,7 +81,7 @@ def _status_value(m: GameMatch) -> str:
 
 
 def _apply_roll(positions: list[int], current_turn: int, roll: int):
-    """Apply dice roll to board state"""
+    """Apply dice roll to board state with exact win condition"""
     p = current_turn
     old = positions[p]
     new_pos = old + roll
@@ -89,12 +89,15 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int):
 
     if new_pos == 3: # danger zone
         positions[p] = 0
-    elif new_pos >= 7: # win
+    elif new_pos == 7: # exact win
         positions[p] = 7
         winner = p
+    elif new_pos > 7: # overshoot → stay in place, no win
+        positions[p] = old
     else:
         positions[p] = new_pos
 
+    # Always flip turn unless game finished
     next_turn = 1 - p if winner is None else p
     return positions, next_turn, winner
 

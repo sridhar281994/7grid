@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from database import Base, engine
 from routers import auth, users, wallet, game, match_routes
-from routers import ws_routes
 
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
@@ -40,4 +39,3 @@ app.include_router(users.router)
 app.include_router(wallet.router)
 app.include_router(game.router)
 app.include_router(match_routes.router)
-app.include_router(ws_routes.router)

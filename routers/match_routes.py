@@ -72,6 +72,10 @@ class RollIn(BaseModel):
     match_id: int
 
 
+class ForfeitIn(BaseModel):
+    match_id: int
+
+
 # --------- helpers ---------
 def _status_value(m: GameMatch) -> str:
     try:
@@ -92,12 +96,11 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int):
     elif new_pos == 7: # exact win
         positions[p] = 7
         winner = p
-    elif new_pos > 7: # overshoot → stay in place, no win
+    elif new_pos > 7: # overshoot → stay in place
         positions[p] = old
     else:
         positions[p] = new_pos
 
-    # Always flip turn unless game finished
     next_turn = 1 - p if winner is None else p
     return positions, next_turn, winner
 
@@ -360,6 +363,52 @@ async def roll_dice(
         "positions": positions,
         "winner": winner,
     }
+
+
+# -------------------------
+# Forfeit / Give Up
+# -------------------------
+@router.post("/forfeit")
+async def forfeit_match(
+    payload: ForfeitIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    """Current player gives up → opponent wins."""
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+    if m.status != MatchStatus.ACTIVE:
+        raise HTTPException(status_code=400, detail="Match not active")
+
+    # Identify loser/winner
+    if current_user.id == m.p1_user_id:
+        winner = 1
+    elif current_user.id == m.p2_user_id:
+        winner = 0
+    else:
+        raise HTTPException(status_code=403, detail="Not your match")
+
+    m.status = MatchStatus.FINISHED
+
+    try:
+        db.commit()
+        db.refresh(m)
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="DB Error")
+
+    await _write_state(
+        m,
+        {
+            "positions": [0, 0],
+            "current_turn": m.current_turn,
+            "last_roll": m.last_roll,
+            "winner": winner,
+        },
+    )
+
+    return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
 
 
 # -------------------------

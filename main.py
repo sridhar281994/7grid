@@ -9,7 +9,7 @@ app = FastAPI(title="Spin Dice API", version="1.0.0")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # TODO: restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,6 +25,7 @@ def health():
 
 @app.on_event("startup")
 async def on_startup():
+    # Ensure DB tables
     Base.metadata.create_all(bind=engine)
     print("Database tables ensured/created.")
 

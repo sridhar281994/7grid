@@ -2,8 +2,10 @@ import os
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
 Base = declarative_base()
+
 
 def _normalize_db_url(raw: str) -> str:
     """
@@ -22,16 +24,17 @@ def _normalize_db_url(raw: str) -> str:
     new_q = urlencode({k: v[0] for k, v in q.items()})
     return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
+
 DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", ""))
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
-    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
+    poolclass=NullPool, # <-- No pooling, avoid Render stale connections
     future=True,
 )
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
 
 def get_db():
     db = SessionLocal()

@@ -1,37 +1,42 @@
 from sqlalchemy.orm import Session
-from models import User, GameMatch
-from datetime import datetime, timezone
+from models import User, GameMatch, WalletTransaction, TxType, TxStatus
+from datetime import datetime
+import uuid
 
-def _utcnow():
-    return datetime.now(timezone.utc)
 
-def deduct_wallet(db: Session, user: User, amount: int):
-    """Deduct entry fee from user wallet."""
-    if (user.wallet_balance or 0) < amount:
+def _log_transaction(db: Session, user_id: int, amount: float, tx_type: TxType, status: TxStatus, note: str = None):
+    """Helper to log wallet changes in wallet_transactions."""
+    tx = WalletTransaction(
+        user_id=user_id,
+        amount=amount,
+        tx_type=tx_type,
+        status=status,
+        provider_ref=note,
+        transaction_id=str(uuid.uuid4()),
+        timestamp=datetime.utcnow(),
+    )
+    db.add(tx)
+    db.commit()
+    db.refresh(tx)
+    return tx
+
+
+def deduct_entry_fee(db: Session, user: User, entry_fee: int):
+    """Deduct entry fee from a user's wallet."""
+    if (user.wallet_balance or 0) < entry_fee:
         raise ValueError("Insufficient balance")
-    user.wallet_balance = (user.wallet_balance or 0) - amount
-    db.add(user)
+
+    user.wallet_balance = (user.wallet_balance or 0) - entry_fee
+    _log_transaction(db, user.id, -entry_fee, TxType.WITHDRAW, TxStatus.SUCCESS, note="Entry Fee")
     db.commit()
     db.refresh(user)
 
 
-def refund_entry(db: Session, user: User, amount: int):
-    """Refund entry fee if match never started or cancelled."""
-    user.wallet_balance = (user.wallet_balance or 0) + amount
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-
-def payout_winner(db: Session, match: GameMatch, winner_idx: int):
-    """Credit winnings to the winner, apply merchant/system fee."""
+async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
+    """Distribute winnings when a match finishes."""
     stake = match.stake_amount
-    if stake <= 0:
-        return
-
-    # winner prize & fee logic
-    winner_prize = (stake * 3) // 4 # 75% to winner
-    system_fee = stake // 4 # 25% fee
+    winner_prize = (stake * 3) // 4 # 75%
+    system_fee = stake // 4 # 25%
 
     if winner_idx == 0 and match.p1_user_id:
         winner = db.get(User, match.p1_user_id)
@@ -42,12 +47,34 @@ def payout_winner(db: Session, match: GameMatch, winner_idx: int):
 
     if winner:
         winner.wallet_balance = (winner.wallet_balance or 0) + winner_prize
-        db.add(winner)
+        _log_transaction(db, winner.id, winner_prize, TxType.RECHARGE, TxStatus.SUCCESS, note="Match Win")
 
     match.system_fee = system_fee
     match.winner_user_id = winner.id if winner else None
-    match.finished_at = _utcnow()
-    db.add(match)
+    match.finished_at = datetime.utcnow()
 
+    db.commit()
+    db.refresh(match)
+
+
+async def refund_stake(db: Session, match: GameMatch):
+    """Refund entry fee to both players if the match is cancelled before completion."""
+    stake = match.stake_amount
+    entry_fee = stake // 2
+
+    if match.p1_user_id:
+        p1 = db.get(User, match.p1_user_id)
+        if p1:
+            p1.wallet_balance = (p1.wallet_balance or 0) + entry_fee
+            _log_transaction(db, p1.id, entry_fee, TxType.RECHARGE, TxStatus.SUCCESS, note="Refund")
+
+    if match.p2_user_id:
+        p2 = db.get(User, match.p2_user_id)
+        if p2:
+            p2.wallet_balance = (p2.wallet_balance or 0) + entry_fee
+            _log_transaction(db, p2.id, entry_fee, TxType.RECHARGE, TxStatus.SUCCESS, note="Refund")
+
+    match.status = match.status or "cancelled"
+    match.finished_at = datetime.utcnow()
     db.commit()
     db.refresh(match)

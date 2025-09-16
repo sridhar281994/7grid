@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
-from routers.wallet_utils import deduct_entry_fee, distribute_prize, refund_stake
+from routers.wallet_utils import distribute_prize, refund_stake, deduct_entry_fee
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -233,10 +233,8 @@ async def create_or_wait_match(
             if not (existing.status == MatchStatus.WAITING and existing.p1_user_id == current_user.id):
                 raise HTTPException(status_code=409, detail="You already have an active match")
 
-        # Ensure balance and deduct
-        try:
-            deduct_entry_fee(db, current_user, entry_fee)
-        except ValueError:
+        # Ensure wallet balance
+        if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
         # Find existing waiting match
@@ -252,6 +250,12 @@ async def create_or_wait_match(
         )
 
         if waiting:
+            # Deduct and join (with transaction log)
+            try:
+                deduct_entry_fee(db, current_user, entry_fee)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Insufficient balance")
+
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
@@ -272,6 +276,11 @@ async def create_or_wait_match(
             }
 
         # Otherwise create new match
+        try:
+            deduct_entry_fee(db, current_user, entry_fee)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
+
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -385,12 +394,14 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    """Current player gives up → opponent wins, prize distribution + state cleanup."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # Determine winner index
     if current_user.id == m.p1_user_id:
         winner = 1
     elif current_user.id == m.p2_user_id:
@@ -398,9 +409,11 @@ async def forfeit_match(
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
+    # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
+    # Try prize distribution
     try:
         await distribute_prize(db, m, winner)
     except Exception as e:
@@ -417,7 +430,12 @@ async def forfeit_match(
     await _clear_state(m.id)
     await _write_state(
         m,
-        {"positions": [0, 0], "current_turn": m.current_turn, "last_roll": m.last_roll, "winner": winner},
+        {
+            "positions": [0, 0],
+            "current_turn": m.current_turn,
+            "last_roll": m.last_roll,
+            "winner": winner,
+        },
     )
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
@@ -431,6 +449,7 @@ async def abandon_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    """Cancel any WAITING/ACTIVE matches for this user and refund if needed."""
     matches = (
         db.query(GameMatch)
         .filter(
@@ -439,15 +458,17 @@ async def abandon_match(
         )
         .all()
     )
+
     if not matches:
         return {"ok": True, "message": "No active matches"}
 
     for m in matches:
-        try:
+        if m.status == MatchStatus.WAITING:
+            # Proper refund with transaction logs
             await refund_stake(db, m)
-        except Exception as e:
-            print(f"[WARN] Refund failed: {e}")
-            db.rollback()
+        else:
+            m.status = MatchStatus.FINISHED
+            await _clear_state(m.id)
 
     try:
         db.commit()

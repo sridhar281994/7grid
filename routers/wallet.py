@@ -3,73 +3,55 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, condecimal
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from database import get_db
-from models import User, WalletTransaction, TxType, TxStatus
+from models import User, WalletTransaction, TxType, TxStatus, GameMatch
 from utils.security import get_current_user
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
 
-# ---------------------------
+
+# --------------------------
 # Schemas
-# ---------------------------
+# --------------------------
 class AmountIn(BaseModel):
     amount: condecimal(gt=0, max_digits=12, decimal_places=2)
+
 
 class WithdrawIn(BaseModel):
     amount: condecimal(gt=0, max_digits=12, decimal_places=2)
     upi_id: str
 
 
-# ---------------------------
-# Helper functions
-# ---------------------------
-def credit_balance(user: User, amount: Decimal, db: Session, note: str = ""):
-    """Credit wallet and log transaction."""
-    user.wallet_balance = (user.wallet_balance or 0) + amount
-    tx = WalletTransaction(
-        user_id=user.id,
-        amount=amount,
-        tx_type=TxType.RECHARGE, # Using RECHARGE for credits; could add WIN type if needed
-        status=TxStatus.SUCCESS,
-        provider_ref=note,
-    )
-    db.add(tx)
-    return tx
-
-
-def deduct_balance(user: User, amount: Decimal, db: Session, note: str = ""):
-    """Deduct wallet amount and log transaction."""
-    if (user.wallet_balance or 0) < amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    user.wallet_balance = (user.wallet_balance or 0) - amount
-    tx = WalletTransaction(
-        user_id=user.id,
-        amount=amount,
-        tx_type=TxType.WITHDRAW, # Using WITHDRAW for debits; could add ENTRY type if needed
-        status=TxStatus.SUCCESS,
-        provider_ref=note,
-    )
-    db.add(tx)
-    return tx
-
-
-# ---------------------------
+# --------------------------
 # Endpoints
-# ---------------------------
+# --------------------------
 @router.get("/balance")
 def balance(user: User = Depends(get_current_user)):
+    """Return current wallet balance for logged-in user."""
     return {"balance": float(user.wallet_balance or 0)}
 
 
-@router.post("/recharge/initiate")
-def recharge_initiate(payload: AmountIn,
-                      db: Session = Depends(get_db),
-                      user: User = Depends(get_current_user)):
+@router.get("/system-fees")
+def system_fees(db: Session = Depends(get_db)):
     """
-    Create a pending recharge (DEV only).
-    In production, redirect to Razorpay/UPI and mark success via callback.
+    Return total revenue (system fees) earned by the platform.
+    Admin-only in production (here exposed for testing).
+    """
+    total_fee = db.query(func.coalesce(func.sum(GameMatch.system_fee), 0)).scalar()
+    return {"total_fees": float(total_fee or 0)}
+
+
+@router.post("/recharge/initiate")
+def recharge_initiate(
+    payload: AmountIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Create a pending recharge. In production, redirect to UPI/PG.
+    For now, returns a fake reference to confirm via /recharge/mock-success.
     """
     tx = WalletTransaction(
         user_id=user.id,
@@ -81,13 +63,12 @@ def recharge_initiate(payload: AmountIn,
     db.add(tx)
     db.commit()
     db.refresh(tx)
-    return {"ok": True, "tx_id": tx.id,
-            "hint": "Call /wallet/recharge/mock-success?tx_id=... (dev only)"}
+    return {"ok": True, "tx_id": tx.id, "hint": "Use /wallet/recharge/mock-success?tx_id=..."}
 
 
 @router.post("/recharge/mock-success")
 def recharge_mock_success(tx_id: int, db: Session = Depends(get_db)):
-    """DEV ONLY: instantly credit wallet for given tx_id."""
+    """DEV ONLY: instantly mark a recharge success and credit wallet."""
     tx = db.get(WalletTransaction, tx_id)
     if not tx or tx.tx_type != TxType.RECHARGE:
         raise HTTPException(404, "Recharge tx not found")
@@ -101,31 +82,34 @@ def recharge_mock_success(tx_id: int, db: Session = Depends(get_db)):
     user.wallet_balance = (user.wallet_balance or 0) + tx.amount
     tx.status = TxStatus.SUCCESS
     db.commit()
-    return {"ok": True, "credited": float(tx.amount)}
+    return {"ok": True}
 
 
 @router.post("/withdraw")
-def withdraw(payload: WithdrawIn,
-             db: Session = Depends(get_db),
-             user: User = Depends(get_current_user)):
+def withdraw(
+    payload: WithdrawIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Request withdrawal from wallet."""
     amount = Decimal(payload.amount)
     if (user.wallet_balance or 0) < amount:
         raise HTTPException(400, "Insufficient balance")
 
-    # Deduct instantly
+    # Deduct immediately
     user.wallet_balance = (user.wallet_balance or 0) - amount
     tx = WalletTransaction(
         user_id=user.id,
         amount=amount,
         tx_type=TxType.WITHDRAW,
         status=TxStatus.PENDING,
-        provider_ref=payload.upi_id,
+        provider_ref=None,
     )
     db.add(tx)
     db.commit()
     db.refresh(tx)
 
-    # DEV MODE: auto mark success
+    # Mock payout flow: instantly mark success if MOCK_PAYOUT is true
     if os.getenv("MOCK_PAYOUT", "true").lower() == "true":
         tx.status = TxStatus.SUCCESS
         db.commit()

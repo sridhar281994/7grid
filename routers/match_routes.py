@@ -387,22 +387,25 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    """Current player gives up → opponent wins (wallet updated)."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # Who is loser/winner
     if current_user.id == m.p1_user_id:
-        winner = 1
+        winner_idx = 1
     elif current_user.id == m.p2_user_id:
-        winner = 0
+        winner_idx = 0
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
+    # Mark finished and distribute prize
     m.status = MatchStatus.FINISHED
-    await distribute_prize(db, m, winner)
-    await _clear_state(m.id)
+    await distribute_prize(db, m, winner_idx) # <-- wallet update included
+    await _clear_state(m.id) # <-- remove Redis cache
 
     try:
         db.commit()
@@ -411,8 +414,25 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error")
 
-    await _write_state(m, {"positions": [0, 0], "current_turn": m.current_turn, "last_roll": m.last_roll, "winner": winner})
-    return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
+    # Broadcast final state
+    await _write_state(
+        m,
+        {
+            "positions": [0, 0],
+            "current_turn": m.current_turn,
+            "last_roll": m.last_roll,
+            "winner": winner_idx,
+        },
+    )
+
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "winner": winner_idx,
+        "forfeit": True,
+        "message": f"Player {winner_idx + 1} wins by forfeit",
+    }
+
 
 
 # -------------------------

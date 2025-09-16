@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
-from routers.wallet_utils import deduct_wallet, payout_winner, refund_entry
+from routers.wallet_utils import distribute_prize, refund_stake
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -55,11 +55,7 @@ def _utcnow() -> datetime:
 def _name_for(u: Optional[User]) -> str:
     if not u:
         return "Player"
-    base = (
-        u.name
-        or ((u.email or "").split("@")[0] if u.email else None)
-        or u.phone
-    )
+    base = u.name or ((u.email or "").split("@")[0] if u.email else None) or u.phone
     return base or f"User#{u.id}"
 
 
@@ -96,7 +92,7 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int):
     elif new_pos == 7: # exact win
         positions[p] = 7
         winner = p
-    elif new_pos > 7: # overshoot → stay in place
+    elif new_pos > 7: # overshoot → stay
         positions[p] = old
     else:
         positions[p] = new_pos
@@ -130,16 +126,6 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         print(f"[WARN] Redis write failed: {e}")
 
 
-async def _clear_state(match_id: int):
-    """Remove redis cache after match finish."""
-    r = await _get_redis()
-    if r:
-        try:
-            await r.delete(f"match:{match_id}:state")
-        except Exception as e:
-            print(f"[WARN] Failed clearing cache: {e}")
-
-
 async def _read_state(match_id: int) -> Optional[dict]:
     r = await _get_redis()
     if not r:
@@ -149,6 +135,16 @@ async def _read_state(match_id: int) -> Optional[dict]:
         return json.loads(raw) if raw else None
     except Exception:
         return None
+
+
+async def _clear_state(match_id: int):
+    """Remove Redis cache for a finished/cancelled match"""
+    r = await _get_redis()
+    if r:
+        try:
+            await r.delete(f"match:{match_id}:state")
+        except Exception:
+            pass
 
 
 async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10):
@@ -183,7 +179,6 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
             got_lock = False
     else:
         got_lock = True
-
     if not got_lock:
         return
 
@@ -196,7 +191,7 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     m.current_turn = next_turn
     if winner is not None:
         m.status = MatchStatus.FINISHED
-        await payout_winner(db, m, winner)
+        await distribute_prize(db, m, winner)
         await _clear_state(m.id)
 
     try:
@@ -225,24 +220,25 @@ async def create_or_wait_match(
         stake_amount = int(payload.stake_amount)
         entry_fee = stake_amount // 2
 
-        # Ensure user has enough balance
-        if (current_user.wallet_balance or 0) < entry_fee:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-
-        # Prevent user from having multiple active/waiting matches
+        # Guard: does this user already have a truly active match?
         existing = (
             db.query(GameMatch)
             .filter(
                 GameMatch.status.in_([MatchStatus.WAITING, MatchStatus.ACTIVE]),
-                (GameMatch.p1_user_id == current_user.id) |
-                (GameMatch.p2_user_id == current_user.id),
+                (GameMatch.p1_user_id == current_user.id) | (GameMatch.p2_user_id == current_user.id),
             )
             .first()
         )
         if existing:
-            raise HTTPException(status_code=409, detail="You already have an active match")
+            # Allow if it’s the same WAITING match they just created
+            if not (existing.status == MatchStatus.WAITING and existing.p1_user_id == current_user.id):
+                raise HTTPException(status_code=409, detail="You already have an active match")
 
-        # Find waiting opponent
+        # Ensure wallet balance
+        if (current_user.wallet_balance or 0) < entry_fee:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
+
+        # Find existing waiting match
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -255,16 +251,8 @@ async def create_or_wait_match(
         )
 
         if waiting:
-            # Deduct entry fee for current user
+            # Deduct and join
             current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
-
-            # Also deduct entry fee for p1 (if not deducted already)
-            p1 = db.get(User, waiting.p1_user_id)
-            if p1 and (p1.wallet_balance or 0) >= entry_fee and waiting.p2_user_id is None:
-                p1.wallet_balance = (p1.wallet_balance or 0) - entry_fee
-            elif waiting.p2_user_id is None:
-                raise HTTPException(status_code=400, detail="Opponent has insufficient balance")
-
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
@@ -272,11 +260,7 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            await _write_state(
-                waiting,
-                {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None},
-            )
-
+            await _write_state(waiting, {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None})
             return {
                 "ok": True,
                 "match_id": waiting.id,
@@ -288,7 +272,7 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
-        # If no opponent, create new match
+        # Otherwise create new match
         current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
         new_match = GameMatch(
             stake_amount=stake_amount,
@@ -301,11 +285,7 @@ async def create_or_wait_match(
         db.commit()
         db.refresh(new_match)
 
-        await _write_state(
-            new_match,
-            {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None},
-        )
-
+        await _write_state(new_match, {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None})
         return {
             "ok": True,
             "match_id": new_match.id,
@@ -320,7 +300,6 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
 
 
 # -------------------------
@@ -369,7 +348,6 @@ async def roll_dice(
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
-
     if current_user.id not in [m.p1_user_id, m.p2_user_id]:
         raise HTTPException(status_code=403, detail="Not your match")
 
@@ -386,7 +364,7 @@ async def roll_dice(
     m.current_turn = next_turn
     if winner is not None:
         m.status = MatchStatus.FINISHED
-        await payout_winner(db, m, winner)
+        await distribute_prize(db, m, winner)
         await _clear_state(m.id)
 
     try:
@@ -396,18 +374,8 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    await _write_state(
-        m,
-        {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner},
-    )
-    return {
-        "ok": True,
-        "match_id": m.id,
-        "roll": roll,
-        "turn": m.current_turn,
-        "positions": positions,
-        "winner": winner,
-    }
+    await _write_state(m, {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner})
+    return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn, "positions": positions, "winner": winner}
 
 
 # -------------------------
@@ -419,7 +387,6 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Current player gives up → opponent wins (refund loser’s unused entry if needed)."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -428,18 +395,15 @@ async def forfeit_match(
 
     if current_user.id == m.p1_user_id:
         winner = 1
-        loser_id = m.p1_user_id
     elif current_user.id == m.p2_user_id:
         winner = 0
-        loser_id = m.p2_user_id
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
     m.status = MatchStatus.FINISHED
-    await payout_winner(db, m, winner)
+    await distribute_prize(db, m, winner)
     await _clear_state(m.id)
 
-    # No refund for loser (stake lost), winner prize credited
     try:
         db.commit()
         db.refresh(m)
@@ -447,10 +411,7 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error")
 
-    await _write_state(
-        m,
-        {"positions": [0, 0], "current_turn": m.current_turn, "last_roll": m.last_roll, "winner": winner},
-    )
+    await _write_state(m, {"positions": [0, 0], "current_turn": m.current_turn, "last_roll": m.last_roll, "winner": winner})
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
 
 
@@ -460,6 +421,7 @@ async def forfeit_match(
 @router.websocket("/ws/{match_id}")
 async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Depends(get_current_user_ws)):
     await websocket.accept()
+
     r = await _get_redis()
     pubsub = None
     if r:
@@ -490,7 +452,6 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                     if not m:
                         await websocket.send_text(json.dumps({"error": "Match not found"}))
                         break
-
                     if m.status == MatchStatus.ACTIVE:
                         await _auto_advance_if_needed(m, db)
 

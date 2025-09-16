@@ -1,133 +1,13 @@
 import os
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, condecimal
-from sqlalchemy.orm import Session
-from sqlalchemy import select, func
-
-from database import get_db
-from models import User, WalletTransaction, TxType, TxStatus, GameMatch
-from utils.security import get_current_user
-
-router = APIRouter(prefix="/wallet", tags=["wallet"])
-
-
-# --------------------------
-# Schemas
-# --------------------------
-class AmountIn(BaseModel):
-    amount: condecimal(gt=0, max_digits=12, decimal_places=2)
-
-
-class WithdrawIn(BaseModel):
-    amount: condecimal(gt=0, max_digits=12, decimal_places=2)
-    upi_id: str
-
-
-# --------------------------
-# Endpoints
-# --------------------------
-@router.get("/balance")
-def balance(user: User = Depends(get_current_user)):
-    """Return current wallet balance for logged-in user."""
-    return {"balance": float(user.wallet_balance or 0)}
-
-
-@router.post("/recharge/initiate")
-def recharge_initiate(
-    payload: AmountIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """
-    Create a pending recharge.
-    In production: redirect to UPI/PG (Cashfree, Razorpay, etc).
-    Dev mode: returns tx_id and hint for mock-success.
-    """
-    tx = WalletTransaction(
-        user_id=user.id,
-        amount=Decimal(payload.amount),
-        tx_type=TxType.RECHARGE,
-        status=TxStatus.PENDING,
-    )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-
-    return {
-        "ok": True,
-        "tx_id": tx.id,
-        "hint": "Call /wallet/recharge/mock-success?tx_id=... in dev",
-    }
-
-
-@router.post("/recharge/mock-success")
-def recharge_mock_success(tx_id: int, db: Session = Depends(get_db)):
-    """DEV ONLY: instantly mark a recharge as success and credit wallet."""
-    tx = db.get(WalletTransaction, tx_id)
-    if not tx or tx.tx_type != TxType.RECHARGE:
-        raise HTTPException(404, "Recharge tx not found")
-    if tx.status == TxStatus.SUCCESS:
-        return {"ok": True, "already": True}
-
-    user = db.get(User, tx.user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
-
-    user.wallet_balance = (user.wallet_balance or 0) + tx.amount
-    tx.status = TxStatus.SUCCESS
-    db.commit()
-    return {"ok": True, "balance": float(user.wallet_balance)}
-
-
-@router.post("/withdraw")
-def withdraw(
-    payload: WithdrawIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """
-    Deduct from wallet and create a pending withdrawal.
-    In production: trigger payout API (Cashfree/RazorpayX).
-    """
-    amount = Decimal(payload.amount)
-    if (user.wallet_balance or 0) < amount:
-        raise HTTPException(400, "Insufficient balance")
-
-    user.wallet_balance = (user.wallet_balance or 0) - amount
-    tx = WalletTransaction(
-        user_id=user.id,
-        amount=amount,
-        tx_type=TxType.WITHDRAW,
-        status=TxStatus.PENDING,
-        provider_ref=None,
-    )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-
-    # Dev mode: auto-success
-    if os.getenv("MOCK_PAYOUT", "true").lower() == "true":
-        tx.status = TxStatus.SUCCESS
-        db.commit()
-
-    return {"ok": True, "tx_id": tx.id, "status": tx.status.value}
-
-
-# --------------------------
-# Admin only — System Fees
-# --------------------------
-@router.get("/system-fees")
-def system_fees(import os
-from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from pydantic import BaseModel, condecimal
 from sqlalchemy.orm import Session
 
 from database import get_db
 from models import User, WalletTransaction, TxType, TxStatus
 from utils.security import get_current_user
-from routers.wallet_utils import deduct_wallet, refund_entry, payout_winner # central helpers
+from routers.wallet_utils import deduct_wallet, refund_entry, payout_winner
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
 
@@ -144,12 +24,60 @@ class WithdrawIn(BaseModel):
     upi_id: str
 
 
+class RefundIn(BaseModel):
+    user_id: int
+    amount: condecimal(gt=0, max_digits=12, decimal_places=2)
+
+
 # -----------------------
-# Endpoints
+# User Endpoints
 # -----------------------
 @router.get("/balance")
 def balance(user: User = Depends(get_current_user)):
     return {"balance": float(user.wallet_balance or 0)}
+
+
+@router.get("/history")
+def history(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Paginated wallet transactions for the current user.
+    Example: /wallet/history?limit=20&offset=20
+    """
+    q = (
+        db.query(WalletTransaction)
+        .filter(WalletTransaction.user_id == user.id)
+        .order_by(WalletTransaction.timestamp.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    total = (
+        db.query(WalletTransaction)
+        .filter(WalletTransaction.user_id == user.id)
+        .count()
+    )
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "transactions": [
+            {
+                "id": tx.id,
+                "amount": float(tx.amount),
+                "type": tx.tx_type.value,
+                "status": tx.status.value,
+                "timestamp": tx.timestamp.isoformat(),
+                "provider_ref": tx.provider_ref,
+            }
+            for tx in q
+        ],
+    }
 
 
 @router.post("/recharge/initiate")
@@ -193,7 +121,14 @@ def recharge_mock_success(tx_id: int, db: Session = Depends(get_db)):
     user.wallet_balance = (user.wallet_balance or 0) + tx.amount
     tx.status = TxStatus.SUCCESS
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "tx": {
+        "id": tx.id,
+        "user_id": tx.user_id,
+        "amount": float(tx.amount),
+        "type": tx.tx_type.value,
+        "status": tx.status.value,
+        "timestamp": tx.timestamp.isoformat(),
+    }}
 
 
 @router.post("/withdraw")
@@ -225,15 +160,101 @@ def withdraw(payload: WithdrawIn, db: Session = Depends(get_db),
         tx.status = TxStatus.SUCCESS
         db.commit()
 
-    return {"ok": True, "tx_id": tx.id, "status": tx.status.value}
+    return {"ok": True, "tx": {
+        "id": tx.id,
+        "user_id": tx.user_id,
+        "amount": float(tx.amount),
+        "type": tx.tx_type.value,
+        "status": tx.status.value,
+        "timestamp": tx.timestamp.isoformat(),
+    }}
 
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
+
+# -----------------------
+# Admin Endpoints
+# -----------------------
+@router.post("/admin/refund")
+def admin_refund(payload: RefundIn,
+                 db: Session = Depends(get_db),
+                 x_admin_secret: str = Header(None)):
     """
-    ADMIN ONLY: View total system fees collected from matches.
-    In production, add an admin guard (e.g., user.is_admin check).
+    Admin-only refund.
+    Requires X-Admin-Secret header = ADMIN_SECRET from env.
     """
-    # TODO: Add admin guard after production (user.is_admin).
-    total_fee = db.query(func.coalesce(func.sum(GameMatch.system_fee), 0)).scalar()
-    return {"system_fees": float(total_fee or 0)}
+    admin_secret = os.getenv("ADMIN_SECRET", "changeme")
+    if x_admin_secret != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    user = db.get(User, payload.user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    amount = Decimal(payload.amount)
+
+    # Credit wallet
+    refund_entry(db, user, amount)
+
+    # Log transaction
+    tx = WalletTransaction(
+        user_id=user.id,
+        amount=amount,
+        tx_type=TxType.RECHARGE, # Treat refund as recharge
+        status=TxStatus.SUCCESS,
+        provider_ref="admin_refund"
+    )
+    db.add(tx)
+    db.commit()
+    db.refresh(tx)
+
+    return {
+        "ok": True,
+        "refunded": float(amount),
+        "user_id": user.id,
+        "tx": {
+            "id": tx.id,
+            "amount": float(tx.amount),
+            "type": tx.tx_type.value,
+            "status": tx.status.value,
+            "timestamp": tx.timestamp.isoformat(),
+        }
+    }
+
+
+@router.get("/admin/transactions")
+def admin_transactions(db: Session = Depends(get_db),
+                       x_admin_secret: str = Header(None),
+                       limit: int = Query(50, ge=1, le=200),
+                       offset: int = Query(0, ge=0)):
+    """
+    Admin-only: paginated recent wallet transactions.
+    """
+    admin_secret = os.getenv("ADMIN_SECRET", "changeme")
+    if x_admin_secret != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    q = (
+        db.query(WalletTransaction)
+        .order_by(WalletTransaction.timestamp.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    total = db.query(WalletTransaction).count()
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "transactions": [
+            {
+                "id": tx.id,
+                "user_id": tx.user_id,
+                "amount": float(tx.amount),
+                "type": tx.tx_type.value,
+                "status": tx.status.value,
+                "timestamp": tx.timestamp.isoformat(),
+                "provider_ref": tx.provider_ref,
+            }
+            for tx in q
+        ],
+    }

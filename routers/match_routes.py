@@ -416,6 +416,45 @@ async def forfeit_match(
 
 
 # -------------------------
+# Abandon / Cancel stale match
+# -------------------------
+@router.post("/abandon")
+async def abandon_match(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    """Cancel any WAITING/ACTIVE matches for this user and refund if needed."""
+    matches = (
+        db.query(GameMatch)
+        .filter(
+            GameMatch.status.in_([MatchStatus.WAITING, MatchStatus.ACTIVE]),
+            ((GameMatch.p1_user_id == current_user.id) | (GameMatch.p2_user_id == current_user.id)),
+        )
+        .all()
+    )
+
+    if not matches:
+        return {"ok": True, "message": "No active matches"}
+
+    for m in matches:
+        if m.status == MatchStatus.WAITING:
+            # Refund entry fee only if second player never joined
+            entry_fee = m.stake_amount // 2
+            current_user.wallet_balance = (current_user.wallet_balance or 0) + entry_fee
+
+        m.status = MatchStatus.FINISHED
+        await _clear_state(m.id)
+
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="DB Error during abandon")
+
+    return {"ok": True, "message": "Stale matches cleared and refunded if applicable"}
+
+
+# -------------------------
 # WebSocket endpoint
 # -------------------------
 @router.websocket("/ws/{match_id}")

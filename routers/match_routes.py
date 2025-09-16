@@ -6,6 +6,7 @@ import os
 import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, conint
@@ -27,6 +28,13 @@ REDIS_URL = (
     or os.getenv("UPSTASH_REDIS_REST_URL")
     or "redis://localhost:6379/0"
 )
+
+# Allowed stake levels
+ALLOWED_STAKES = {4, 8, 12}
+# Timeout for auto-cancel of waiting matches (seconds)
+WAITING_TIMEOUT_SECS = int(os.getenv("WAITING_TIMEOUT_SECS", "120"))
+# Turn inactivity auto-roll timeout (seconds)
+TURN_TIMEOUT_SECS = int(os.getenv("TURN_TIMEOUT_SECS", "10"))
 
 
 async def _get_redis():
@@ -54,11 +62,7 @@ def _utcnow() -> datetime:
 def _name_for(u: Optional[User]) -> str:
     if not u:
         return "Player"
-    base = (
-        u.name
-        or ((u.email or "").split("@")[0] if u.email else None)
-        or u.phone
-    )
+    base = u.name or ((u.email or "").split("@")[0] if u.email else None) or u.phone
     return base or f"User#{u.id}"
 
 
@@ -72,6 +76,10 @@ class RollIn(BaseModel):
 
 
 class ForfeitIn(BaseModel):
+    match_id: int
+
+
+class CancelIn(BaseModel):
     match_id: int
 
 
@@ -140,9 +148,18 @@ async def _read_state(match_id: int) -> Optional[dict]:
         return None
 
 
-async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10):
-    """If last turn > timeout_secs, auto-roll for that player"""
+async def _clear_redis_state(match_id: int):
     r = await _get_redis()
+    if not r:
+        return
+    try:
+        await r.delete(f"match:{match_id}:state")
+    except Exception:
+        pass
+
+
+async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = TURN_TIMEOUT_SECS):
+    """If last turn > timeout_secs, auto-roll for that player"""
     st = await _read_state(m.id) or {
         "positions": [0, 0],
         "current_turn": m.current_turn or 0,
@@ -162,18 +179,6 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     if m.status != MatchStatus.ACTIVE:
         return
     if _utcnow() - last_ts < timedelta(seconds=timeout_secs):
-        return
-
-    got_lock = False
-    if r:
-        try:
-            got_lock = await r.set(f"match:{m.id}:autoroll_lock", "1", nx=True, ex=5)
-        except Exception:
-            got_lock = False
-    else:
-        got_lock = True
-
-    if not got_lock:
         return
 
     roll = random.randint(1, 6)
@@ -196,29 +201,93 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 
     await _write_state(
         m,
-        {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner},
+        {"positions": positions, "current_turn": next_turn, "last_roll": roll, "winner": winner},
     )
 
 
 # --------- payout logic ---------
 async def _finalize_payout(m: GameMatch, db: Session, winner_idx: int):
     """Distribute winnings when a match finishes."""
-    stake = m.stake_amount
-    winner_prize = (stake * 3) // 4
-    system_fee = stake // 4
+    stake = Decimal(m.stake_amount)
+    winner_prize = stake * Decimal("0.75")
+    system_fee = stake * Decimal("0.25")
 
+    winner: Optional[User] = None
     if winner_idx == 0 and m.p1_user_id:
         winner = db.get(User, m.p1_user_id)
     elif winner_idx == 1 and m.p2_user_id:
         winner = db.get(User, m.p2_user_id)
-    else:
-        return
 
     if winner:
         winner.wallet_balance = (winner.wallet_balance or 0) + winner_prize
+
     m.system_fee = system_fee
     m.winner_user_id = winner.id if winner else None
     m.finished_at = _utcnow()
+
+
+# --------- stale cleanup ---------
+def _cancel_stale_waiting_for_user(db: Session, user_id: int, stake_amount: int) -> Decimal:
+    """Cancel & refund any WAITING matches this user created for this stake."""
+    refunded = Decimal("0")
+    entry_fee = Decimal(stake_amount) / Decimal(2)
+    stale = (
+        db.query(GameMatch)
+        .filter(
+            GameMatch.status == MatchStatus.WAITING,
+            GameMatch.stake_amount == stake_amount,
+            GameMatch.p1_user_id == user_id,
+        )
+        .all()
+    )
+    for m in stale:
+        user = db.get(User, m.p1_user_id)
+        if user:
+            user.wallet_balance = (user.wallet_balance or 0) + entry_fee
+            refunded += entry_fee
+        db.delete(m)
+        # Redis cleanup (fire and forget)
+        asyncio.create_task(_clear_redis_state(m.id))
+    if refunded > 0:
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            raise HTTPException(status_code=500, detail="DB Error during stale cancel/refund")
+    return refunded
+
+
+def _ensure_no_active_match(db: Session, user_id: int):
+    active = (
+        db.query(GameMatch)
+        .filter(GameMatch.status == MatchStatus.ACTIVE)
+        .filter((GameMatch.p1_user_id == user_id) | (GameMatch.p2_user_id == user_id))
+        .first()
+    )
+    if active:
+        raise HTTPException(status_code=409, detail="You already have an active match")
+
+
+def _expire_old_waiting(db: Session):
+    """Cancel WAITING matches older than WAITING_TIMEOUT_SECS (global cleanup)."""
+    cutoff = _utcnow() - timedelta(seconds=WAITING_TIMEOUT_SECS)
+    old = (
+        db.query(GameMatch)
+        .filter(GameMatch.status == MatchStatus.WAITING, GameMatch.created_at < cutoff)
+        .all()
+    )
+    for m in old:
+        entry_fee = Decimal(m.stake_amount) / Decimal(2)
+        user = db.get(User, m.p1_user_id)
+        if user:
+            user.wallet_balance = (user.wallet_balance or 0) + entry_fee
+        db.delete(m)
+        asyncio.create_task(_clear_redis_state(m.id))
+    if old:
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
 
 
 # -------------------------
@@ -232,12 +301,21 @@ async def create_or_wait_match(
 ) -> Dict:
     try:
         stake_amount = int(payload.stake_amount)
-        entry_fee = stake_amount // 2
+        if stake_amount not in ALLOWED_STAKES:
+            raise HTTPException(status_code=400, detail="Invalid stake amount")
 
-        # Ensure user has enough balance
+        entry_fee = Decimal(stake_amount) / Decimal(2)
+
+        # Safety: no parallel active game & no stale WAITING left
+        _ensure_no_active_match(db, current_user.id)
+        _cancel_stale_waiting_for_user(db, current_user.id, stake_amount)
+        _expire_old_waiting(db)
+
+        # Balance check
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
+        # Try to join the oldest WAITING match with same stake
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -250,7 +328,9 @@ async def create_or_wait_match(
         )
 
         if waiting:
+            # Deduct for joining player (P2)
             current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
+
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
@@ -274,6 +354,7 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
+        # Otherwise create a new WAITING match (deduct for P1)
         current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
         new_match = GameMatch(
             stake_amount=stake_amount,
@@ -308,6 +389,39 @@ async def create_or_wait_match(
 
 
 # -------------------------
+# Cancel WAITING match (refund)
+# -------------------------
+@router.post("/cancel")
+async def cancel_waiting_match(
+    payload: CancelIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+    if m.status != MatchStatus.WAITING:
+        raise HTTPException(status_code=400, detail="Cannot cancel: match already active")
+
+    # Only creator (P1) can cancel their waiting match
+    if current_user.id != m.p1_user_id:
+        raise HTTPException(status_code=403, detail="Not your match to cancel")
+
+    entry_fee = Decimal(m.stake_amount) / Decimal(2)
+    current_user.wallet_balance = (current_user.wallet_balance or 0) + entry_fee
+
+    try:
+        db.delete(m)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="DB Error on cancel")
+
+    await _clear_redis_state(payload.match_id)
+    return {"ok": True, "canceled": True, "refunded": float(entry_fee)}
+
+
+# -------------------------
 # Poll match readiness / state
 # -------------------------
 @router.get("/check")
@@ -320,8 +434,22 @@ async def check_match_ready(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
+    # Auto-expire very old WAITING matches on check (extra guard)
+    if m.status == MatchStatus.WAITING and (_utcnow() - (m.created_at or _utcnow())) > timedelta(seconds=WAITING_TIMEOUT_SECS):
+        entry_fee = Decimal(m.stake_amount) / Decimal(2)
+        creator = db.get(User, m.p1_user_id) if m.p1_user_id else None
+        if creator:
+            creator.wallet_balance = (creator.wallet_balance or 0) + entry_fee
+        try:
+            db.delete(m)
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+        await _clear_redis_state(match_id)
+        raise HTTPException(status_code=410, detail="Match expired")
+
     if m.status == MatchStatus.ACTIVE:
-        await _auto_advance_if_needed(m, db)
+        await _auto_advance_if_needed(m, db, timeout_secs=TURN_TIMEOUT_SECS)
 
     st = await _read_state(m.id) or {}
     return {
@@ -363,7 +491,7 @@ async def roll_dice(
         raise HTTPException(status_code=409, detail="Not your turn")
 
     roll = random.randint(1, 6)
-    st = await _read_state(m.id) or {"positions": [0, 0]}
+    st = await _read_state(m.id) or {"positions": [0, 0], "current_turn": curr}
     positions, next_turn, winner = _apply_roll(st["positions"], curr, roll)
 
     m.last_roll = roll
@@ -381,7 +509,7 @@ async def roll_dice(
 
     await _write_state(
         m,
-        {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner},
+        {"positions": positions, "current_turn": next_turn, "last_roll": roll, "winner": winner},
     )
 
     return {
@@ -403,13 +531,14 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Current player gives up → opponent wins."""
+    """Current player gives up → opponent wins (and receives prize)."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # Identify loser/winner by who called forfeit
     if current_user.id == m.p1_user_id:
         winner = 1
     elif current_user.id == m.p2_user_id:
@@ -479,7 +608,7 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         break
 
                     if m.status == MatchStatus.ACTIVE:
-                        await _auto_advance_if_needed(m, db)
+                        await _auto_advance_if_needed(m, db, timeout_secs=TURN_TIMEOUT_SECS)
 
                     st = await _read_state(match_id) or {
                         "positions": [0, 0],
@@ -514,3 +643,4 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                 await pubsub.close()
             except Exception:
                 pass
+

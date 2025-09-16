@@ -225,11 +225,24 @@ async def create_or_wait_match(
         stake_amount = int(payload.stake_amount)
         entry_fee = stake_amount // 2
 
-        # Ensure balance
+        # Ensure user has enough balance
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # Look for waiting match
+        # Prevent user from having multiple active/waiting matches
+        existing = (
+            db.query(GameMatch)
+            .filter(
+                GameMatch.status.in_([MatchStatus.WAITING, MatchStatus.ACTIVE]),
+                (GameMatch.p1_user_id == current_user.id) |
+                (GameMatch.p2_user_id == current_user.id),
+            )
+            .first()
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail="You already have an active match")
+
+        # Find waiting opponent
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -242,8 +255,16 @@ async def create_or_wait_match(
         )
 
         if waiting:
-            # Deduct wallet for P2
-            deduct_wallet(db, current_user, entry_fee)
+            # Deduct entry fee for current user
+            current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
+
+            # Also deduct entry fee for p1 (if not deducted already)
+            p1 = db.get(User, waiting.p1_user_id)
+            if p1 and (p1.wallet_balance or 0) >= entry_fee and waiting.p2_user_id is None:
+                p1.wallet_balance = (p1.wallet_balance or 0) - entry_fee
+            elif waiting.p2_user_id is None:
+                raise HTTPException(status_code=400, detail="Opponent has insufficient balance")
+
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
@@ -255,6 +276,7 @@ async def create_or_wait_match(
                 waiting,
                 {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None},
             )
+
             return {
                 "ok": True,
                 "match_id": waiting.id,
@@ -266,8 +288,8 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
-        # Otherwise create new match as P1
-        deduct_wallet(db, current_user, entry_fee)
+        # If no opponent, create new match
+        current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -283,6 +305,7 @@ async def create_or_wait_match(
             new_match,
             {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None},
         )
+
         return {
             "ok": True,
             "match_id": new_match.id,
@@ -297,6 +320,7 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
 
 
 # -------------------------

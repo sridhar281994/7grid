@@ -1,5 +1,5 @@
 """
-One-off migration: add wallet_balance column to users and create transactions table.
+One-off migration: extend TxType enum with ENTRY, WIN, and FEE.
 """
 import os
 from sqlalchemy import create_engine, text
@@ -12,25 +12,11 @@ def main():
         db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
     print("Connecting to DB…")
     engine = create_engine(db_url, future=True)
+    # PostgreSQL ENUM alter
     stmts = [
-        (
-            "Ensure wallet_balance in users",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_balance FLOAT DEFAULT 0;"
-        ),
-        (
-            "Create transactions table",
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                amount FLOAT NOT NULL,
-                txn_type VARCHAR NOT NULL,
-                status VARCHAR DEFAULT 'pending',
-                provider_txn_id VARCHAR,
-                created_at TIMESTAMP DEFAULT now()
-            );
-            """
-        ),
+        ("Add ENTRY to TxType", "ALTER TYPE txtype ADD VALUE IF NOT EXISTS 'entry';"),
+        ("Add WIN to TxType", "ALTER TYPE txtype ADD VALUE IF NOT EXISTS 'win';"),
+        ("Add FEE to TxType", "ALTER TYPE txtype ADD VALUE IF NOT EXISTS 'fee';"),
     ]
     with engine.begin() as conn:
         for label, stmt in stmts:
@@ -42,3 +28,8 @@ def main():
     print(":tada: Migration completed successfully.")
 if __name__ == "__main__":
     main()
+
+
+
+
+

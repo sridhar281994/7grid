@@ -387,52 +387,53 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Current player gives up → opponent wins (wallet updated)."""
+    """Current player gives up → opponent wins, prize distribution + state cleanup."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # Who is loser/winner
+    # Determine winner index
     if current_user.id == m.p1_user_id:
-        winner_idx = 1
+        winner = 1
     elif current_user.id == m.p2_user_id:
-        winner_idx = 0
+        winner = 0
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
-    # Mark finished and distribute prize
+    # Mark finished
     m.status = MatchStatus.FINISHED
-    await distribute_prize(db, m, winner_idx) # <-- wallet update included
-    await _clear_state(m.id) # <-- remove Redis cache
+    m.finished_at = _utcnow()
 
+    # Try prize distribution
+    try:
+        await distribute_prize(db, m, winner)
+    except Exception as e:
+        print(f"[WARN] Forfeit distribute_prize failed: {e}")
+        db.rollback()
+
+    # Commit game state
     try:
         db.commit()
         db.refresh(m)
-    except SQLAlchemyError:
+    except SQLAlchemyError as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail="DB Error")
+        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # Broadcast final state
+    # Clear redis + push winner state
+    await _clear_state(m.id)
     await _write_state(
         m,
         {
             "positions": [0, 0],
             "current_turn": m.current_turn,
             "last_roll": m.last_roll,
-            "winner": winner_idx,
+            "winner": winner,
         },
     )
 
-    return {
-        "ok": True,
-        "match_id": m.id,
-        "winner": winner_idx,
-        "forfeit": True,
-        "message": f"Player {winner_idx + 1} wins by forfeit",
-    }
-
+    return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
 
 
 # -------------------------

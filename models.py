@@ -18,8 +18,11 @@ class MatchStatus(enum.Enum):
 
 
 class TxType(enum.Enum):
-    RECHARGE = "recharge"
-    WITHDRAW = "withdraw"
+    RECHARGE = "recharge" # User adds money
+    WITHDRAW = "withdraw" # User withdraws money
+    ENTRY = "entry" # Stake deducted when user joins match
+    WIN = "win" # Prize credited to winner
+    FEE = "fee" # System/merchant fee
 
 
 class TxStatus(enum.Enum):

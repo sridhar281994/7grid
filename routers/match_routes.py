@@ -6,7 +6,6 @@ import os
 import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, conint
@@ -37,7 +36,6 @@ async def _get_redis():
         return _redis
     try:
         import redis.asyncio as redis
-
         _redis = redis.from_url(REDIS_URL, decode_responses=True)
         await _redis.ping()
         _redis_ready = True
@@ -106,18 +104,6 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int):
     return positions, next_turn, winner
 
 
-def _compute_pricing(stake: int) -> tuple[Decimal, Decimal, Decimal]:
-    """
-    Return (per_player_contribution, winner_prize, system_fee) as Decimals
-    Using your rule: fee = stake // 4, per = stake // 2, prize = stake - fee
-    Example: 4 -> per=2, prize=3, fee=1
-    """
-    fee = Decimal(stake // 4)
-    per = Decimal(stake // 2)
-    prize = Decimal(stake) - fee
-    return per, prize, fee
-
-
 async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datetime] = None):
     """Persist state to Redis and publish"""
     r = await _get_redis()
@@ -152,38 +138,6 @@ async def _read_state(match_id: int) -> Optional[dict]:
         return json.loads(raw) if raw else None
     except Exception:
         return None
-
-
-def _credit_winner_and_finalize(db: Session, m: GameMatch, winner_idx: int):
-    """
-    Credit winner wallet according to stake rules, set winner_user_id,
-    stamp finished_at and keep system_fee previously stored.
-    Idempotent per finished match transition (only called at finish points).
-    """
-    if m.status == MatchStatus.FINISHED and m.winner_user_id:
-        # Already finalized
-        return
-
-    # Map winner index to user id
-    winner_user_id = m.p1_user_id if winner_idx == 0 else m.p2_user_id
-    if not winner_user_id:
-        raise HTTPException(status_code=400, detail="Winner not resolvable")
-
-    per, prize, fee = _compute_pricing(int(m.stake_amount or 0))
-    # Ensure system_fee reflects configured fee (may already be set)
-    m.system_fee = fee
-
-    winner = db.get(User, winner_user_id)
-    if not winner:
-        raise HTTPException(status_code=404, detail="Winner user not found")
-
-    # Credit winner
-    winner.wallet_balance = (winner.wallet_balance or Decimal(0)) + prize
-
-    # Finalize match
-    m.status = MatchStatus.FINISHED
-    m.winner_user_id = winner_user_id
-    m.finished_at = _utcnow()
 
 
 async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int = 10):
@@ -230,8 +184,8 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     m.last_roll = roll
     m.current_turn = next_turn
     if winner is not None:
-        # finalize + credit winner
-        _credit_winner_and_finalize(db, m, winner)
+        m.status = MatchStatus.FINISHED
+        await _finalize_payout(m, db, winner)
 
     try:
         db.commit()
@@ -246,6 +200,27 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     )
 
 
+# --------- payout logic ---------
+async def _finalize_payout(m: GameMatch, db: Session, winner_idx: int):
+    """Distribute winnings when a match finishes."""
+    stake = m.stake_amount
+    winner_prize = (stake * 3) // 4
+    system_fee = stake // 4
+
+    if winner_idx == 0 and m.p1_user_id:
+        winner = db.get(User, m.p1_user_id)
+    elif winner_idx == 1 and m.p2_user_id:
+        winner = db.get(User, m.p2_user_id)
+    else:
+        return
+
+    if winner:
+        winner.wallet_balance = (winner.wallet_balance or 0) + winner_prize
+    m.system_fee = system_fee
+    m.winner_user_id = winner.id if winner else None
+    m.finished_at = _utcnow()
+
+
 # -------------------------
 # Create or wait for match
 # -------------------------
@@ -257,6 +232,11 @@ async def create_or_wait_match(
 ) -> Dict:
     try:
         stake_amount = int(payload.stake_amount)
+        entry_fee = stake_amount // 2
+
+        # Ensure user has enough balance
+        if (current_user.wallet_balance or 0) < entry_fee:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
 
         waiting = (
             db.query(GameMatch)
@@ -270,31 +250,11 @@ async def create_or_wait_match(
         )
 
         if waiting:
-            # Second player is joining => move to ACTIVE and collect buy-in from both
-            per, _, fee = _compute_pricing(stake_amount)
-
-            p1 = db.get(User, waiting.p1_user_id) if waiting.p1_user_id else None
-            p2 = db.get(User, current_user.id)
-
-            if not p1 or not p2:
-                raise HTTPException(status_code=404, detail="Players not found")
-
-            if (p1.wallet_balance or Decimal(0)) < per:
-                raise HTTPException(status_code=400, detail="Player 1 has insufficient balance for this stake")
-            if (p2.wallet_balance or Decimal(0)) < per:
-                raise HTTPException(status_code=400, detail="Insufficient balance for this stake")
-
-            # Deduct per-player contribution
-            p1.wallet_balance = (p1.wallet_balance or Decimal(0)) - per
-            p2.wallet_balance = (p2.wallet_balance or Decimal(0)) - per
-
-            # Activate and stamp fee
+            current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
-            waiting.system_fee = fee
             waiting.last_roll = None
             waiting.current_turn = 0
-
             db.commit()
             db.refresh(waiting)
 
@@ -314,7 +274,7 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
-        # No waiting match -> create a new WAITING record (no deduction yet)
+        current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -409,8 +369,8 @@ async def roll_dice(
     m.last_roll = roll
     m.current_turn = next_turn
     if winner is not None:
-        # finalize + credit winner
-        _credit_winner_and_finalize(db, m, winner)
+        m.status = MatchStatus.FINISHED
+        await _finalize_payout(m, db, winner)
 
     try:
         db.commit()
@@ -443,23 +403,22 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Current player gives up → opponent wins (opponent gets prize)."""
+    """Current player gives up → opponent wins."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # Identify loser/winner
     if current_user.id == m.p1_user_id:
-        winner_idx = 1
+        winner = 1
     elif current_user.id == m.p2_user_id:
-        winner_idx = 0
+        winner = 0
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
-    # finalize + credit winner
-    _credit_winner_and_finalize(db, m, winner_idx)
+    m.status = MatchStatus.FINISHED
+    await _finalize_payout(m, db, winner)
 
     try:
         db.commit()
@@ -474,11 +433,11 @@ async def forfeit_match(
             "positions": [0, 0],
             "current_turn": m.current_turn,
             "last_roll": m.last_roll,
-            "winner": winner_idx,
+            "winner": winner,
         },
     )
 
-    return {"ok": True, "match_id": m.id, "winner": winner_idx, "forfeit": True}
+    return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
 
 
 # -------------------------

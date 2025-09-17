@@ -388,10 +388,14 @@ async def forfeit_match(
     current_user: User = Depends(get_current_user),
 ) -> Dict:
     """Current player gives up → opponent wins, prize distribution + state cleanup."""
+    print(f"[DEBUG] Forfeit called: match_id={payload.match_id}, user_id={current_user.id}")
+
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
+        print(f"[ERROR] Forfeit: match_id={payload.match_id} not found")
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
+        print(f"[WARN] Forfeit: match_id={m.id} not active (status={m.status})")
         raise HTTPException(status_code=400, detail="Match not active")
 
     # Determine winner index
@@ -400,38 +404,45 @@ async def forfeit_match(
     elif current_user.id == m.p2_user_id:
         winner = 0
     else:
+        print(f"[ERROR] Forfeit: user_id={current_user.id} not in match {m.id}")
         raise HTTPException(status_code=403, detail="Not your match")
+
+    print(f"[DEBUG] Forfeit: match_id={m.id}, loser_id={current_user.id}, winner_idx={winner}")
 
     # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # Distribute prize
+    # Try prize distribution
     try:
         await distribute_prize(db, m, winner)
+        print(f"[DEBUG] Forfeit: prize distribution completed for match_id={m.id}")
+    except Exception as e:
+        print(f"[ERROR] Forfeit distribute_prize failed: {e}")
+        db.rollback()
+
+    # Commit game state
+    try:
         db.commit()
         db.refresh(m)
-    except Exception as e:
+        print(f"[DEBUG] Forfeit: DB commit successful for match_id={m.id}, winner_user_id={m.winner_user_id}")
+    except SQLAlchemyError as e:
         db.rollback()
-        print(f"[ERR] Forfeit prize distribution failed: {e}")
-        raise HTTPException(status_code=500, detail="Prize distribution failed")
+        print(f"[ERROR] Forfeit: DB commit failed {e}")
+        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # Load last known state so winner sees final board
-    st = await _read_state(m.id) or {
-        "positions": [0, 0],
-        "current_turn": m.current_turn,
-        "last_roll": m.last_roll,
-        "winner": None,
-    }
-    st.update({
-        "winner": winner,
-        "current_turn": m.current_turn,
-        "last_roll": m.last_roll,
-    })
-
-    # Clear Redis cache and push final state with winner included
+    # Clear redis + push winner state
     await _clear_state(m.id)
-    await _write_state(m, st)
+    await _write_state(
+        m,
+        {
+            "positions": [0, 0],
+            "current_turn": m.current_turn,
+            "last_roll": m.last_roll,
+            "winner": winner,
+        },
+    )
+    print(f"[DEBUG] Forfeit: redis state cleared and winner broadcasted for match_id={m.id}")
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
 

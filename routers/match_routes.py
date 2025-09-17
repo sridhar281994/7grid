@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
-from routers.wallet_utils import distribute_prize, refund_stake, deduct_entry_fee
+from routers.wallet_utils import distribute_prize, refund_stake
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -230,6 +230,7 @@ async def create_or_wait_match(
             .first()
         )
         if existing:
+            # Allow if it’s the same WAITING match they just created
             if not (existing.status == MatchStatus.WAITING and existing.p1_user_id == current_user.id):
                 raise HTTPException(status_code=409, detail="You already have an active match")
 
@@ -250,12 +251,8 @@ async def create_or_wait_match(
         )
 
         if waiting:
-            # Deduct and join (with transaction log)
-            try:
-                deduct_entry_fee(db, current_user, entry_fee)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Insufficient balance")
-
+            # Deduct and join
+            current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
@@ -276,11 +273,7 @@ async def create_or_wait_match(
             }
 
         # Otherwise create new match
-        try:
-            deduct_entry_fee(db, current_user, entry_fee)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-
+        current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -420,6 +413,7 @@ async def forfeit_match(
         print(f"[WARN] Forfeit distribute_prize failed: {e}")
         db.rollback()
 
+    # Commit game state
     try:
         db.commit()
         db.refresh(m)
@@ -427,6 +421,7 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
+    # Clear redis + push winner state
     await _clear_state(m.id)
     await _write_state(
         m,
@@ -464,11 +459,12 @@ async def abandon_match(
 
     for m in matches:
         if m.status == MatchStatus.WAITING:
-            # Proper refund with transaction logs
-            await refund_stake(db, m)
-        else:
-            m.status = MatchStatus.FINISHED
-            await _clear_state(m.id)
+            # Refund entry fee only if second player never joined
+            entry_fee = m.stake_amount // 2
+            current_user.wallet_balance = (current_user.wallet_balance or 0) + entry_fee
+
+        m.status = MatchStatus.FINISHED
+        await _clear_state(m.id)
 
     try:
         db.commit()

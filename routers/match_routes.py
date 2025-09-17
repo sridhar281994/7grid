@@ -406,20 +406,12 @@ async def forfeit_match(
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # Try prize distribution
+    # Prize distribution (handles wallet + commit inside)
     try:
         await distribute_prize(db, m, winner)
     except Exception as e:
         print(f"[WARN] Forfeit distribute_prize failed: {e}")
-        db.rollback()
-
-    # Commit game state
-    try:
-        db.commit()
-        db.refresh(m)
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+        raise HTTPException(status_code=500, detail="Prize distribution failed")
 
     # Clear redis + push winner state
     await _clear_state(m.id)

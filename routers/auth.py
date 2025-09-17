@@ -12,6 +12,7 @@ from passlib.hash import bcrypt   # ✅ secure hashing
 from database import get_db
 from models import OTP, User
 from utils.email_utils import send_email_otp
+from utils.security import get_current_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -150,3 +151,25 @@ def verify_otp_phone(payload: VerifyIn, db: Session = Depends(get_db)):
 
     token = _jwt_for_user(user.id)
     return {"ok": True, "user_id": user.id, "access_token": token, "token_type": "bearer"}
+
+
+@router.get("/me")
+def get_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return always fresh user info including wallet balance."""
+    user = db.get(User, current_user.id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "id": user.id,
+        "phone": user.phone,
+        "email": user.email,
+        "name": user.name,
+        "upi_id": user.upi_id,
+        "wallet_balance": float(user.wallet_balance or 0),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+

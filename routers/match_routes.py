@@ -394,7 +394,6 @@ async def forfeit_match(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # Determine winner index
     if current_user.id == m.p1_user_id:
         winner = 1
     elif current_user.id == m.p2_user_id:
@@ -402,18 +401,18 @@ async def forfeit_match(
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
-    # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # Prize distribution (handles wallet + commit inside)
     try:
         await distribute_prize(db, m, winner)
+        db.commit() # ✅ commit here
+        db.refresh(m)
     except Exception as e:
-        print(f"[WARN] Forfeit distribute_prize failed: {e}")
+        db.rollback()
+        print(f"[ERR] Forfeit prize distribution failed: {e}")
         raise HTTPException(status_code=500, detail="Prize distribution failed")
 
-    # Clear redis + push winner state
     await _clear_state(m.id)
     await _write_state(
         m,

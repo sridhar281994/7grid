@@ -392,10 +392,8 @@ async def forfeit_match(
 
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
-        print(f"[ERROR] Forfeit: match_id={payload.match_id} not found")
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
-        print(f"[WARN] Forfeit: match_id={m.id} not active (status={m.status})")
         raise HTTPException(status_code=400, detail="Match not active")
 
     # Determine winner index
@@ -404,7 +402,6 @@ async def forfeit_match(
     elif current_user.id == m.p2_user_id:
         winner = 0
     else:
-        print(f"[ERROR] Forfeit: user_id={current_user.id} not in match {m.id}")
         raise HTTPException(status_code=403, detail="Not your match")
 
     print(f"[DEBUG] Forfeit: match_id={m.id}, loser_id={current_user.id}, winner_idx={winner}")
@@ -413,23 +410,14 @@ async def forfeit_match(
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # Try prize distribution
+    # Prize distribution
     try:
         await distribute_prize(db, m, winner)
-        print(f"[DEBUG] Forfeit: prize distribution completed for match_id={m.id}")
+        print(f"[DEBUG] Forfeit: prize distribution done for match_id={m.id}, winner_user_id={m.winner_user_id}")
     except Exception as e:
-        print(f"[ERROR] Forfeit distribute_prize failed: {e}")
         db.rollback()
-
-    # Commit game state
-    try:
-        db.commit()
-        db.refresh(m)
-        print(f"[DEBUG] Forfeit: DB commit successful for match_id={m.id}, winner_user_id={m.winner_user_id}")
-    except SQLAlchemyError as e:
-        db.rollback()
-        print(f"[ERROR] Forfeit: DB commit failed {e}")
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+        print(f"[ERROR] Forfeit prize distribution failed: {e}")
+        raise HTTPException(status_code=500, detail="Prize distribution failed")
 
     # Clear redis + push winner state
     await _clear_state(m.id)
@@ -442,10 +430,9 @@ async def forfeit_match(
             "winner": winner,
         },
     )
-    print(f"[DEBUG] Forfeit: redis state cleared and winner broadcasted for match_id={m.id}")
+    print(f"[DEBUG] Forfeit: redis state cleared + winner broadcasted for match_id={m.id}")
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
-
 
 
 # -------------------------

@@ -549,3 +549,56 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                 await pubsub.close()
             except Exception:
                 pass
+
+
+# -------------------------
+# Finish Match (Normal End)
+# -------------------------
+class FinishIn(BaseModel):
+    match_id: int
+    winner_idx: int
+
+
+@router.post("/finish")
+async def finish_match(
+    payload: FinishIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    """Explicitly finish a match with a declared winner."""
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+    if m.status != MatchStatus.ACTIVE:
+        raise HTTPException(status_code=400, detail="Match not active")
+
+    # validate winner index
+    if payload.winner_idx not in (0, 1):
+        raise HTTPException(status_code=400, detail="Invalid winner index")
+
+    # mark as finished
+    m.status = MatchStatus.FINISHED
+    m.finished_at = _utcnow()
+
+    try:
+        await distribute_prize(db, m, payload.winner_idx)
+        db.commit()
+        db.refresh(m)
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] Finish prize distribution failed: {e}")
+        raise HTTPException(status_code=500, detail="Prize distribution failed")
+
+    # push final state to redis
+    await _clear_state(m.id)
+    await _write_state(
+        m,
+        {
+            "positions": [0, 0],
+            "current_turn": m.current_turn,
+            "last_roll": m.last_roll,
+            "winner": payload.winner_idx,
+        },
+    )
+
+    return {"ok": True, "match_id": m.id, "winner": payload.winner_idx, "finished": True}

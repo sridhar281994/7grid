@@ -67,14 +67,18 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
 
     if winner:
         winner.wallet_balance = (winner.wallet_balance or 0) + winner_prize
-        _log_transaction(db, winner.id, winner_prize, TxType.RECHARGE, TxStatus.SUCCESS, note="Match Win")
+        _log_transaction(
+            db,
+            winner.id,
+            winner_prize,
+            TxType.RECHARGE,
+            TxStatus.SUCCESS,
+            note="Match Win",
+        )
 
     match.system_fee = system_fee
     match.winner_user_id = winner.id if winner else None
     match.finished_at = datetime.utcnow()
-
-    db.commit()
-    db.refresh(match)
 
 
 async def refund_stake(db: Session, match: GameMatch):

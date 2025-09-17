@@ -43,6 +43,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
 
     stake = match.stake_amount
+    print(f"[DEBUG] distribute_prize called: match_id={match.id}, stake={stake}, winner_idx={winner_idx}")
 
     if stake == 4:
         winner_prize = 3
@@ -58,27 +59,40 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         winner_prize = (stake * 3) // 4
         system_fee = stake // 4
 
+    print(f"[DEBUG] Calculated prize distribution: winner_prize={winner_prize}, system_fee={system_fee}")
+
+    # Determine winner
     if winner_idx == 0 and match.p1_user_id:
         winner = db.get(User, match.p1_user_id)
     elif winner_idx == 1 and match.p2_user_id:
         winner = db.get(User, match.p2_user_id)
     else:
+        print(f"[ERROR] Invalid winner_idx={winner_idx}, skipping prize distribution")
         return
 
     if winner:
-        winner.wallet_balance = (winner.wallet_balance or 0) + winner_prize
+        before_balance = winner.wallet_balance or 0
+        winner.wallet_balance = before_balance + winner_prize
+        after_balance = winner.wallet_balance
+        print(f"[DEBUG] Winner user_id={winner.id} balance before={before_balance} after={after_balance}")
         _log_transaction(
-            db,
-            winner.id,
-            winner_prize,
-            TxType.RECHARGE,
-            TxStatus.SUCCESS,
-            note="Match Win",
+            db, winner.id, winner_prize,
+            TxType.RECHARGE, TxStatus.SUCCESS,
+            note=f"Match Win (stake={stake}, fee={system_fee})"
         )
 
     match.system_fee = system_fee
     match.winner_user_id = winner.id if winner else None
     match.finished_at = datetime.utcnow()
+
+    try:
+        db.commit()
+        db.refresh(match)
+        print(f"[DEBUG] distribute_prize commit successful for match_id={match.id}, winner_id={match.winner_user_id}")
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] distribute_prize DB commit failed: {e}")
+
 
 
 async def refund_stake(db: Session, match: GameMatch):

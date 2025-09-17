@@ -394,6 +394,7 @@ async def forfeit_match(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # Determine winner index
     if current_user.id == m.p1_user_id:
         winner = 1
     elif current_user.id == m.p2_user_id:
@@ -401,30 +402,39 @@ async def forfeit_match(
     else:
         raise HTTPException(status_code=403, detail="Not your match")
 
+    # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
+    # Distribute prize
     try:
         await distribute_prize(db, m, winner)
-        db.commit() # ✅ commit here
+        db.commit()
         db.refresh(m)
     except Exception as e:
         db.rollback()
         print(f"[ERR] Forfeit prize distribution failed: {e}")
         raise HTTPException(status_code=500, detail="Prize distribution failed")
 
+    # Load last known state so winner sees final board
+    st = await _read_state(m.id) or {
+        "positions": [0, 0],
+        "current_turn": m.current_turn,
+        "last_roll": m.last_roll,
+        "winner": None,
+    }
+    st.update({
+        "winner": winner,
+        "current_turn": m.current_turn,
+        "last_roll": m.last_roll,
+    })
+
+    # Clear Redis cache and push final state with winner included
     await _clear_state(m.id)
-    await _write_state(
-        m,
-        {
-            "positions": [0, 0],
-            "current_turn": m.current_turn,
-            "last_roll": m.last_roll,
-            "winner": winner,
-        },
-    )
+    await _write_state(m, st)
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
+
 
 
 # -------------------------

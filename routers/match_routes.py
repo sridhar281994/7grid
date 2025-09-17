@@ -428,11 +428,13 @@ async def forfeit_match(
             "current_turn": m.current_turn,
             "last_roll": m.last_roll,
             "winner": winner,
+            "finished": True,
         },
     )
     print(f"[DEBUG] Forfeit: redis state cleared + winner broadcasted for match_id={m.id}")
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
+
 
 
 # -------------------------

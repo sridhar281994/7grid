@@ -259,11 +259,18 @@ async def create_or_wait_match(
             waiting.p2_user_id = current_user.id
             waiting.status = MatchStatus.ACTIVE
             waiting.last_roll = None
-            waiting.current_turn = 0
+
+            # 🎲 Randomize first turn (0 = p1, 1 = p2)
+            import random
+            waiting.current_turn = random.choice([0, 1])
+
             db.commit()
             db.refresh(waiting)
 
-            await _write_state(waiting, {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None})
+            await _write_state(
+                waiting,
+                {"positions": [0, 0], "current_turn": waiting.current_turn, "last_roll": None, "winner": None},
+            )
             return {
                 "ok": True,
                 "match_id": waiting.id,
@@ -277,18 +284,23 @@ async def create_or_wait_match(
 
         # Otherwise create new match
         current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
+        import random
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_user_id=current_user.id,
             last_roll=None,
-            current_turn=0,
+            # 🎲 Randomize who will start once opponent joins
+            current_turn=random.choice([0, 1]),
         )
         db.add(new_match)
         db.commit()
         db.refresh(new_match)
 
-        await _write_state(new_match, {"positions": [0, 0], "current_turn": 0, "last_roll": None, "winner": None})
+        await _write_state(
+            new_match,
+            {"positions": [0, 0], "current_turn": new_match.current_turn, "last_roll": None, "winner": None},
+        )
         return {
             "ok": True,
             "match_id": new_match.id,
@@ -303,6 +315,7 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
 
 
 # -------------------------

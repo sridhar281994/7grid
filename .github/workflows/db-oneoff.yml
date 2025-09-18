@@ -1,48 +1,31 @@
-name: Deploy with Alembic Migrations
+name: Run Alembic Migrations
+
 on:
+  workflow_dispatch:
   push:
     branches:
-      - main   # change if your default branch is different
+      - main
+
 jobs:
-  deploy:
+  migrate:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15
-        ports:
-          - 5432:5432
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: testdb
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
+
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install alembic psycopg[binary]
+          pip install alembic psycopg2-binary
+
       - name: Run Alembic migrations
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}   # stored in GitHub secrets
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          echo "Running Alembic migrations..."
+          echo "🚀 Running Alembic migrations..."
           alembic upgrade head
-      - name: Deploy app (Render / your platform)
-        run: |
-          echo "Deploy step — replace with Render CLI or your deployment script"
-
-
-
-
-

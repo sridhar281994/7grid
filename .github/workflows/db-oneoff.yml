@@ -1,27 +1,48 @@
-name: Run one-off DB fixes
-
+name: Deploy with Alembic Migrations
 on:
-  workflow_dispatch: {}
-
+  push:
+    branches:
+      - main   # change if your default branch is different
 jobs:
-  migrate:
+  deploy:
     runs-on: ubuntu-latest
-    env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    services:
+      postgres:
+        image: postgres:15
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install deps (SQLAlchemy + Psycopg)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install alembic
-
-      - name: Run one-off SQL
+          pip install -r requirements.txt
+          pip install alembic psycopg[binary]
+      - name: Run Alembic migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}   # stored in GitHub secrets
         run: |
-          python scripts/one_off_fix_match_columns.py
+          echo "Running Alembic migrations..."
+          alembic upgrade head
+      - name: Deploy app (Render / your platform)
+        run: |
+          echo "Deploy step — replace with Render CLI or your deployment script"
+
+
+
+
+

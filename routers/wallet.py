@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, condecimal
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc
+from sqlalchemy.exc import SQLAlchemyError
 
 from database import get_db
 from models import User, WalletTransaction, TxType, TxStatus
@@ -22,6 +23,19 @@ class AmountIn(BaseModel):
 class WithdrawIn(BaseModel):
     amount: condecimal(gt=0, max_digits=12, decimal_places=2)
     upi_id: str
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _lock_user(db: Session, user_id: int) -> User:
+    """🔒 Always lock row before modifying wallet balance."""
+    u = db.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    ).scalar_one_or_none()
+    if not u:
+        raise HTTPException(404, "User not found")
+    return u
 
 
 # -----------------------------
@@ -65,14 +79,16 @@ def recharge_mock_success(tx_id: int, db: Session = Depends(get_db)):
     if tx.status == TxStatus.SUCCESS:
         return {"ok": True, "already": True}
 
-    user = db.get(User, tx.user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
+    try:
+        user = _lock_user(db, tx.user_id) # 🔒 prevent race
+        user.wallet_balance = (user.wallet_balance or 0) + tx.amount
+        tx.status = TxStatus.SUCCESS
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(500, f"DB error: {e}")
 
-    user.wallet_balance = (user.wallet_balance or 0) + tx.amount
-    tx.status = TxStatus.SUCCESS
-    db.commit()
-    return {"ok": True}
+    return {"ok": True, "balance": float(user.wallet_balance or 0)}
 
 
 @router.post("/withdraw")
@@ -81,29 +97,34 @@ def withdraw(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    amount = Decimal(payload.amount)
-    if (user.wallet_balance or 0) < amount:
-        raise HTTPException(400, "Insufficient balance")
+    try:
+        u = _lock_user(db, user.id) # 🔒
+        amount = Decimal(payload.amount)
+        if (u.wallet_balance or 0) < amount:
+            raise HTTPException(400, "Insufficient balance")
 
-    # hold amount
-    user.wallet_balance = (user.wallet_balance or 0) - amount
-    tx = WalletTransaction(
-        user_id=user.id,
-        amount=amount,
-        tx_type=TxType.WITHDRAW,
-        status=TxStatus.PENDING,
-        provider_ref=payload.upi_id,
-    )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-
-    # Dev: auto success
-    if os.getenv("MOCK_PAYOUT", "true").lower() == "true":
-        tx.status = TxStatus.SUCCESS
+        u.wallet_balance = (u.wallet_balance or 0) - amount
+        tx = WalletTransaction(
+            user_id=u.id,
+            amount=amount,
+            tx_type=TxType.WITHDRAW,
+            status=TxStatus.PENDING,
+            provider_ref=payload.upi_id,
+        )
+        db.add(tx)
         db.commit()
+        db.refresh(tx)
 
-    return {"ok": True, "tx_id": tx.id, "status": tx.status.value}
+        # Dev auto success
+        if os.getenv("MOCK_PAYOUT", "true").lower() == "true":
+            tx.status = TxStatus.SUCCESS
+            db.commit()
+
+        return {"ok": True, "tx_id": tx.id, "status": tx.status.value,
+                "balance": float(u.wallet_balance or 0)}
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(500, f"DB error: {e}")
 
 
 @router.get("/history")
@@ -131,7 +152,12 @@ def wallet_history(
             "amount": float(tx.amount),
             "type": tx.tx_type.value,
             "status": tx.status.value,
-            "note": tx.provider_ref,
+            # Mask UPI ID for privacy (optional)
+            "note": (
+                tx.provider_ref[:4] + "****" + tx.provider_ref[-4:]
+                if tx.tx_type == TxType.WITHDRAW and tx.provider_ref
+                else tx.provider_ref
+            ),
             "timestamp": tx.timestamp.isoformat(),
         }
         for tx in rows

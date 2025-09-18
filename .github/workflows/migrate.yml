@@ -1,0 +1,24 @@
+name: One-off DB Migration
+
+on:
+  workflow_dispatch: # run manually
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install psycopg
+        run: pip install psycopg[binary]
+
+      - name: Run migration script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python 7grid/scripts/one_off_fix_wallet_timestamp.py

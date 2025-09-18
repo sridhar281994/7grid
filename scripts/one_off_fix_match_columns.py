@@ -1,23 +1,25 @@
+"""Add timestamp column to wallet_transactions
+Revision ID: add_timestamp_wallet_tx
+Revises: <your_last_revision_id>
+Create Date: 2025-09-18
 """
-One-off migration: mark all matches for a user as finished.
-"""
-import os
-from sqlalchemy import create_engine, text
-def main():
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is not set")
-    if db_url.startswith("postgresql://"):
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
-    engine = create_engine(db_url, future=True)
-    with engine.begin() as conn:
-        # Replace 123 with the user_id that is stuck
-        conn.execute(text("UPDATE matches SET status='finished' WHERE (p1_user_id=123 OR p2_user_id=123) AND status='active';"))
-    print(":white_check_mark: Cleaned up stuck matches.")
-if __name__ == "__main__":
-    main()
-
-
-
-
-
+from alembic import op
+import sqlalchemy as sa
+from datetime import datetime
+# revision identifiers, used by Alembic.
+revision = "add_timestamp_wallet_tx"
+down_revision = "<your_last_revision_id>"
+branch_labels = None
+depends_on = None
+def upgrade() -> None:
+    op.add_column(
+        "wallet_transactions",
+        sa.Column(
+            "timestamp",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+            nullable=False,
+        ),
+    )
+def downgrade() -> None:
+    op.drop_column("wallet_transactions", "timestamp")

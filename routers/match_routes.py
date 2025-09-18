@@ -29,6 +29,9 @@ REDIS_URL = (
     or "redis://localhost:6379/0"
 )
 
+# Track roll counts per match to occasionally force a 1
+_roll_counts: dict[int, dict[str, int]] = {}
+
 
 async def _get_redis():
     """Lazy connect to Redis."""
@@ -334,9 +337,6 @@ async def check_match_ready(
     }
 
 
-# -------------------------
-# Dice Roll
-# -------------------------
 @router.post("/roll")
 async def roll_dice(
     payload: RollIn,
@@ -356,7 +356,22 @@ async def roll_dice(
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
-    roll = random.randint(1, 6)
+    # --- Roll logic with fairness for "1" ---
+    match_id = m.id
+    if match_id not in _roll_counts:
+        _roll_counts[match_id] = {"count": 0}
+
+    _roll_counts[match_id]["count"] += 1
+    count = _roll_counts[match_id]["count"]
+
+    # Force a "1" occasionally to ensure fairness
+    if count in (6, 7, 8):
+        roll = 1
+        _roll_counts[match_id]["count"] = 0
+    else:
+        roll = random.randint(1, 6)
+
+    # Apply roll to game state
     st = await _read_state(m.id) or {"positions": [0, 0]}
     positions, next_turn, winner = _apply_roll(st["positions"], curr, roll)
 
@@ -367,6 +382,10 @@ async def roll_dice(
         await distribute_prize(db, m, winner)
         await _clear_state(m.id)
 
+        # Reset roll count after a match ends
+        if match_id in _roll_counts:
+            _roll_counts.pop(match_id, None)
+
     try:
         db.commit()
         db.refresh(m)
@@ -374,8 +393,24 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    await _write_state(m, {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner})
-    return {"ok": True, "match_id": m.id, "roll": roll, "turn": m.current_turn, "positions": positions, "winner": winner}
+    await _write_state(
+        m,
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+        },
+    )
+
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "roll": roll,
+        "turn": m.current_turn,
+        "positions": positions,
+        "winner": winner,
+    }
 
 
 # -------------------------

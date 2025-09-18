@@ -392,8 +392,10 @@ async def forfeit_match(
 
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
+        print(f"[ERROR] Forfeit: match_id={payload.match_id} not found")
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
+        print(f"[WARN] Forfeit: match_id={m.id} not active (status={m.status})")
         raise HTTPException(status_code=400, detail="Match not active")
 
     # Determine winner index
@@ -402,6 +404,7 @@ async def forfeit_match(
     elif current_user.id == m.p2_user_id:
         winner = 0
     else:
+        print(f"[ERROR] Forfeit: user_id={current_user.id} not in match {m.id}")
         raise HTTPException(status_code=403, detail="Not your match")
 
     print(f"[DEBUG] Forfeit: match_id={m.id}, loser_id={current_user.id}, winner_idx={winner}")
@@ -410,13 +413,13 @@ async def forfeit_match(
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # Prize distribution
+    # Try prize distribution (wallet update only)
     try:
         await distribute_prize(db, m, winner)
-        print(f"[DEBUG] Forfeit: prize distribution done for match_id={m.id}, winner_user_id={m.winner_user_id}")
+        print(f"[DEBUG] Forfeit: prize distribution completed for match_id={m.id}")
     except Exception as e:
+        print(f"[ERROR] Forfeit distribute_prize failed: {e}")
         db.rollback()
-        print(f"[ERROR] Forfeit prize distribution failed: {e}")
         raise HTTPException(status_code=500, detail="Prize distribution failed")
 
     # Clear redis + push winner state
@@ -428,13 +431,11 @@ async def forfeit_match(
             "current_turn": m.current_turn,
             "last_roll": m.last_roll,
             "winner": winner,
-            "finished": True,
         },
     )
-    print(f"[DEBUG] Forfeit: redis state cleared + winner broadcasted for match_id={m.id}")
+    print(f"[DEBUG] Forfeit: redis state cleared and winner broadcasted for match_id={m.id}")
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
-
 
 
 # -------------------------
@@ -552,44 +553,56 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
 
 
 # -------------------------
-# Finish Match (Normal End)
+# Finish Match (normal win)
 # -------------------------
-class FinishIn(BaseModel):
-    match_id: int
-    winner_idx: int
-
-
 @router.post("/finish")
 async def finish_match(
-    payload: FinishIn,
+    payload: ForfeitIn, # reuse same model with match_id
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Explicitly finish a match with a declared winner."""
+    """
+    Mark match finished and distribute prize.
+    Called when a player reaches the last box normally (not give up).
+    """
+    print(f"[DEBUG] Finish called: match_id={payload.match_id}, user_id={current_user.id}")
+
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # validate winner index
-    if payload.winner_idx not in (0, 1):
-        raise HTTPException(status_code=400, detail="Invalid winner index")
+    # Determine winner index
+    if current_user.id == m.p1_user_id:
+        winner = 0
+    elif current_user.id == m.p2_user_id:
+        winner = 1
+    else:
+        raise HTTPException(status_code=403, detail="Not your match")
 
-    # mark as finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
     try:
-        await distribute_prize(db, m, payload.winner_idx)
-        db.commit()
-        db.refresh(m)
+        await distribute_prize(db, m, winner)
+        print(f"[DEBUG] Finish: prize distribution completed for match_id={m.id}")
     except Exception as e:
+        print(f"[ERROR] Finish distribute_prize failed: {e}")
         db.rollback()
-        print(f"[ERROR] Finish prize distribution failed: {e}")
         raise HTTPException(status_code=500, detail="Prize distribution failed")
 
-    # push final state to redis
+    # Commit match state
+    try:
+        db.commit()
+        db.refresh(m)
+        print(f"[DEBUG] Finish: DB commit OK for match_id={m.id}, winner_user_id={m.winner_user_id}")
+    except SQLAlchemyError as e:
+        db.rollback()
+        print(f"[ERROR] Finish DB commit failed {e}")
+        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
+    # Push winner to redis so both apps close gracefully
     await _clear_state(m.id)
     await _write_state(
         m,
@@ -597,8 +610,11 @@ async def finish_match(
             "positions": [0, 0],
             "current_turn": m.current_turn,
             "last_roll": m.last_roll,
-            "winner": payload.winner_idx,
+            "winner": winner,
+            "finished": True,
         },
     )
+    print(f"[DEBUG] Finish: broadcasted winner={winner} for match_id={m.id}")
 
-    return {"ok": True, "match_id": m.id, "winner": payload.winner_idx, "finished": True}
+    return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": False}
+

@@ -21,4 +21,4 @@ jobs:
       - name: Run migration script
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python 7grid/scripts/one_off_fix_wallet_timestamp.py
+        run: python scripts/one_off_fix_wallet_timestamp.py

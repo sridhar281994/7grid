@@ -350,6 +350,9 @@ async def check_match_ready(
     }
 
 
+# -------------------------
+# Roll Dice
+# -------------------------
 @router.post("/roll")
 async def roll_dice(
     payload: RollIn,
@@ -377,27 +380,32 @@ async def roll_dice(
     _roll_counts[match_id]["count"] += 1
     count = _roll_counts[match_id]["count"]
 
-    # Force a "1" occasionally to ensure fairness
     if count in (6, 7, 8):
         roll = 1
         _roll_counts[match_id]["count"] = 0
     else:
         roll = random.randint(1, 6)
 
-    # Apply roll to game state
+    # Apply roll
     st = await _read_state(m.id) or {"positions": [0, 0]}
     positions, next_turn, winner = _apply_roll(st["positions"], curr, roll)
 
     m.last_roll = roll
     m.current_turn = next_turn
+
     if winner is not None:
         m.status = MatchStatus.FINISHED
-        await distribute_prize(db, m, winner)
+        try:
+            await distribute_prize(db, m, winner)
+            print(f"[DEBUG] Prize distributed on normal finish: match_id={m.id}")
+        except Exception as e:
+            db.rollback()
+            print(f"[ERROR] Roll distribute_prize failed: {e}")
+            raise HTTPException(status_code=500, detail="Prize distribution failed")
         await _clear_state(m.id)
 
-        # Reset roll count after a match ends
-        if match_id in _roll_counts:
-            _roll_counts.pop(match_id, None)
+        # Reset roll count
+        _roll_counts.pop(match_id, None)
 
     try:
         db.commit()
@@ -435,42 +443,42 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Current player gives up → opponent wins, prize distribution + state cleanup."""
     print(f"[DEBUG] Forfeit called: match_id={payload.match_id}, user_id={current_user.id}")
 
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
-        print(f"[ERROR] Forfeit: match_id={payload.match_id} not found")
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
-        print(f"[WARN] Forfeit: match_id={m.id} not active (status={m.status})")
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # Determine winner index
     if current_user.id == m.p1_user_id:
         winner = 1
     elif current_user.id == m.p2_user_id:
         winner = 0
     else:
-        print(f"[ERROR] Forfeit: user_id={current_user.id} not in match {m.id}")
         raise HTTPException(status_code=403, detail="Not your match")
 
-    print(f"[DEBUG] Forfeit: match_id={m.id}, loser_id={current_user.id}, winner_idx={winner}")
-
-    # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # Try prize distribution (wallet update only)
     try:
         await distribute_prize(db, m, winner)
         print(f"[DEBUG] Forfeit: prize distribution completed for match_id={m.id}")
     except Exception as e:
-        print(f"[ERROR] Forfeit distribute_prize failed: {e}")
         db.rollback()
+        print(f"[ERROR] Forfeit distribute_prize failed: {e}")
         raise HTTPException(status_code=500, detail="Prize distribution failed")
 
-    # Clear redis + push winner state
+    # Reset roll count for this match
+    _roll_counts.pop(m.id, None)
+
+    try:
+        db.commit()
+        db.refresh(m)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
     await _clear_state(m.id)
     await _write_state(
         m,
@@ -481,7 +489,6 @@ async def forfeit_match(
             "winner": winner,
         },
     )
-    print(f"[DEBUG] Forfeit: redis state cleared and winner broadcasted for match_id={m.id}")
 
     return {"ok": True, "match_id": m.id, "winner": winner, "forfeit": True}
 

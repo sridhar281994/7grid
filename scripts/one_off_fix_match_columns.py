@@ -1,23 +1,23 @@
-"""Add timestamp column to wallet_transactions
-Revision ID: add_timestamp_wallet_tx
-Revises: <your_last_revision_id>
+"""add timestamp column to wallet_transactions
+Revision ID: 20240918_add_timestamp_wallet_transactions
+Revises: <PUT_PREVIOUS_REVISION_ID_HERE>
 Create Date: 2025-09-18
 """
 from alembic import op
 import sqlalchemy as sa
-from datetime import datetime
-# revision identifiers, used by Alembic.
-revision = "add_timestamp_wallet_tx"
-down_revision = "<your_last_revision_id>"
+# --- Revision identifiers, used by Alembic ---
+revision = "20240918_add_timestamp_wallet_transactions"
+down_revision = "<PUT_PREVIOUS_REVISION_ID_HERE>"  # :warning: replace with your last migration ID
 branch_labels = None
 depends_on = None
 def upgrade() -> None:
+    # Add column with default NOW()
     op.add_column(
         "wallet_transactions",
         sa.Column(
             "timestamp",
             sa.DateTime(timezone=True),
-            server_default=sa.text("CURRENT_TIMESTAMP"),
+            server_default=sa.func.now(),
             nullable=False,
         ),
     )

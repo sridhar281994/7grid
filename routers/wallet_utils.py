@@ -33,78 +33,52 @@ def deduct_entry_fee(db: Session, user: User, entry_fee: int):
     db.refresh(user)
 
 
+# -------------------------
+# Prize Distribution
+# -------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
     Distribute winnings when a match finishes.
-    Rules:
+    Logic:
       - 4rs game: each pays 2, winner gets 3, merchant gets 1
       - 8rs game: each pays 4, winner gets 6, merchant gets 2
       - 12rs game: each pays 6, winner gets 9, merchant gets 3
     """
+
     stake = match.stake_amount
 
     if stake == 4:
-        winner_prize, system_fee, stake_share = 3, 1, 2
+        winner_prize = 3
+        system_fee = 1
     elif stake == 8:
-        winner_prize, system_fee, stake_share = 6, 2, 4
+        winner_prize = 6
+        system_fee = 2
     elif stake == 12:
-        winner_prize, system_fee, stake_share = 9, 3, 6
+        winner_prize = 9
+        system_fee = 3
     else:
-        # fallback: 75% to winner, 25% merchant
+        # fallback: 75% winner, 25% merchant
         winner_prize = (stake * 3) // 4
         system_fee = stake // 4
-        stake_share = stake // 2
 
-    # 🔻 Deduct stake from both players
-    if match.p1_user_id:
-        p1 = db.get(User, match.p1_user_id)
-        if p1:
-            p1.wallet_balance = (p1.wallet_balance or 0) - stake_share
-            tx = Transaction(
-                user_id=p1.id,
-                amount=-stake_share,
-                tx_type=TxType.WITHDRAW,
-                status=TxStatus.SUCCESS,
-                note="Stake Deduction",
-                timestamp=datetime.utcnow(),
-            )
-            db.add(tx)
-
-    if match.p2_user_id:
-        p2 = db.get(User, match.p2_user_id)
-        if p2:
-            p2.wallet_balance = (p2.wallet_balance or 0) - stake_share
-            tx = Transaction(
-                user_id=p2.id,
-                amount=-stake_share,
-                tx_type=TxType.WITHDRAW,
-                status=TxStatus.SUCCESS,
-                note="Stake Deduction",
-                timestamp=datetime.utcnow(),
-            )
-            db.add(tx)
-
-    # 🏆 Credit winner
+    # Pick winner
     if winner_idx == 0 and match.p1_user_id:
         winner = db.get(User, match.p1_user_id)
     elif winner_idx == 1 and match.p2_user_id:
         winner = db.get(User, match.p2_user_id)
     else:
+        print(f"[ERROR] distribute_prize: Invalid winner index {winner_idx}")
         return
 
+    # ✅ Update winner balance
     if winner:
-        winner.wallet_balance = (winner.wallet_balance or 0) + winner_prize
-        tx = Transaction(
-            user_id=winner.id,
-            amount=winner_prize,
-            tx_type=TxType.RECHARGE,
-            status=TxStatus.SUCCESS,
-            note="Match Win",
-            timestamp=datetime.utcnow(),
-        )
-        db.add(tx)
+        old_balance = float(winner.wallet_balance or 0)
+        new_balance = old_balance + winner_prize
+        winner.wallet_balance = new_balance
+        print(f"[DEBUG] Prize distributed: user_id={winner.id}, "
+              f"old_balance={old_balance}, prize={winner_prize}, new_balance={new_balance}")
 
-    # 📌 Save system fee + winner info
+    # Save in match
     match.system_fee = system_fee
     match.winner_user_id = winner.id if winner else None
     match.finished_at = datetime.utcnow()

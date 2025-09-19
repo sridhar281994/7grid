@@ -1,8 +1,6 @@
-name: Run DB Migration
+name: Run One-Off DB Migration
 on:
-  workflow_dispatch:   # :white_check_mark: manual trigger
-  # push:
-  #   branches: [ "main" ]   # uncomment if you want it to run on every main push
+  workflow_dispatch:
 jobs:
   migrate:
     runs-on: ubuntu-latest
@@ -15,13 +13,15 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install sqlalchemy psycopg2-binary
-      - name: Run migration script
+      - name: Run migration
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           echo ":rocket: Running one-off DB migration..."
           python scripts/one_off_fix_add_p3_and_reset_stakes.py
+
+
+
 
 

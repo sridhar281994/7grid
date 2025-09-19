@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine, text
 import os
-# :white_check_mark: Render/GitHub Actions will provide DATABASE_URL in env
+# :white_check_mark: Render/GitHub Actions will provide DATABASE_URL
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set in environment")
@@ -20,9 +20,19 @@ with engine.begin() as conn:
             END IF;
         END$$;
     """))
-    # --- 2) Reset stakes table ---
+    # --- 2) Create stakes table if not exists ---
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS stakes (
+            id SERIAL PRIMARY KEY,
+            amount INTEGER NOT NULL UNIQUE
+        );
+    """))
+    # --- 3) Reset stakes data ---
     conn.execute(text("TRUNCATE TABLE stakes RESTART IDENTITY CASCADE;"))
     conn.execute(text("""
         INSERT INTO stakes (amount) VALUES (2), (4), (10);
     """))
-print(":white_check_mark: Migration complete: p3_user_id ensured, stakes reset to (2, 4, 10)")
+print(":white_check_mark: Migration complete: p3_user_id ensured, stakes table created/reset with (2, 4, 10)")
+
+
+

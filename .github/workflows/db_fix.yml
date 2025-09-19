@@ -1,4 +1,4 @@
-name: Run DB Migrations
+name: DB Migration
 on:
   workflow_dispatch:
 jobs:
@@ -6,11 +6,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
-      - name: Install deps
+          python-version: '3.11'
+      - name: Install SQLAlchemy + psycopg
         run: pip install sqlalchemy psycopg2-binary
       - name: Run migration
-        run: python scripts/one_off_fix_add_p3_user.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/one_off_fix_add_p3_and_reset_stakes.py
+

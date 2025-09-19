@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
 from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, constr
 from sqlalchemy.orm import Session
 
@@ -9,7 +9,6 @@ from utils.security import get_current_user
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-
 # -----------------------------
 # Schemas
 # -----------------------------
@@ -18,17 +17,18 @@ class UserOut(BaseModel):
     email: str | None = None
     name: str | None = None
     upi_id: str | None = None
-    description: str | None = None   # :white_check_mark: matches models.py column
+    description: str | None = None  # ✅ matches models.py column
     wallet_balance: float
-    created_at: datetime | None = None   # :white_check_mark: accept datetime directly
-    
+    created_at: datetime | None = None  # ✅ accept datetime directly
+
     class Config:
         from_attributes = True  # pydantic v2
-        
+
+
 class UserUpdate(BaseModel):
     name: str | None = None
     upi_id: str | None = None
-    description: constr(max_length=50) | None = None  # :white_check_mark: enforce 50 chars
+    description: constr(max_length=50) | None = None  # ✅ enforce 50 chars
 
 
 # -----------------------------
@@ -36,15 +36,7 @@ class UserUpdate(BaseModel):
 # -----------------------------
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
-    return {
-        "id": user.id,
-        "email": user.email,
-        "name": user.name,
-        "upi_id": user.upi_id,
-        "description": user.description, # ✅ safe fetch
-        "wallet_balance": float(user.wallet_balance or 0),
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-    }
+    return user
 
 
 @router.patch("/me", response_model=UserOut)
@@ -53,20 +45,13 @@ def update_me(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    updated = False
-
+    """Update only the provided fields. Missing fields stay unchanged."""
     if payload.name is not None:
-        user.name = payload.name
-        updated = True
+        user.name = payload.name.strip() or None
     if payload.upi_id is not None:
-        user.upi_id = payload.upi_id
-        updated = True
+        user.upi_id = payload.upi_id.strip() or None
     if payload.description is not None:
-        user.description = payload.description
-        updated = True
-
-    if not updated:
-        raise HTTPException(400, "No fields to update")
+        user.description = payload.description.strip() or None
 
     db.commit()
     db.refresh(user)

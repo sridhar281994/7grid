@@ -1,19 +1,25 @@
-name: DB Migration
+name: Run One-Off Migration
 on:
   workflow_dispatch:
 jobs:
   migrate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install SQLAlchemy + psycopg
-        run: pip install sqlalchemy psycopg2-binary
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Run migration
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/one_off_fix_add_p3_and_reset_stakes.py
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python scripts/one_off_fix_add_p3_and_reset_stakes.py
+
 

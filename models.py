@@ -52,6 +52,7 @@ class User(Base):
 
     matches_as_p1 = relationship("GameMatch", foreign_keys="GameMatch.p1_user_id", back_populates="player1")
     matches_as_p2 = relationship("GameMatch", foreign_keys="GameMatch.p2_user_id", back_populates="player2")
+    matches_as_p3 = relationship("GameMatch", foreign_keys="GameMatch.p3_user_id", back_populates="player3")
     transactions = relationship("WalletTransaction", back_populates="user")
 
 
@@ -80,6 +81,7 @@ class GameMatch(Base):
 
     p1_user_id = Column(Integer, ForeignKey("users.id"))
     p2_user_id = Column(Integer, ForeignKey("users.id"))
+    p3_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
@@ -87,12 +89,13 @@ class GameMatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Optional DB-land echoes of state (handy for debugging or later analytics)
+    # Optional DB-land echoes of state
     last_roll = Column(Integer, nullable=True)
-    current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2
+    current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2, 2 = P3
 
     player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")
     player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
+    player3 = relationship("User", foreign_keys=[p3_user_id], back_populates="matches_as_p3")
     winner = relationship("User", foreign_keys=[winner_user_id])
 
 
@@ -115,3 +118,15 @@ class WalletTransaction(Base):
     transaction_id = Column(String, unique=True, nullable=True)
 
     user = relationship("User", back_populates="transactions")
+
+
+# -----------------------
+# Stakes Table (new)
+# -----------------------
+class Stake(Base):
+    __tablename__ = "stakes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stage = Column(Integer, unique=True, nullable=False) # 1, 2, 3...
+    stake_amount = Column(Integer, nullable=False) # amount each player pays
+    winner_payout = Column(Integer, nullable=False) # amount winner gets

@@ -42,97 +42,26 @@ def _lock_user(db: Session, user_id: int) -> User:
     return u
 
 
+def _verify_rzp_signature(secret: str, body_bytes: bytes, signature: str) -> bool:
+    digest = hmac.new(
+        key=secret.encode("utf-8"),
+        msg=body_bytes,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(digest, signature)
+
+
+def _amount_to_paise(amount: Decimal) -> int:
+    # Razorpay expects integer paise
+    return int(Decimal(amount) * 100)
+
+
 # -----------------------------
-# Endpoints
+# Endpoints: balance + history
 # -----------------------------
 @router.get("/balance")
 def balance(user: User = Depends(get_current_user)):
     return {"balance": float(user.wallet_balance or 0)}
-
-
-@router.post("/recharge/initiate")
-def recharge_initiate(
-    payload: AmountIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Create a pending recharge (fake gateway for dev)."""
-    tx = WalletTransaction(
-        user_id=user.id,
-        amount=Decimal(payload.amount),
-        tx_type=TxType.RECHARGE,
-        status=TxStatus.PENDING,
-        provider_ref=None,
-    )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-    return {
-        "ok": True,
-        "tx_id": tx.id,
-        "hint": "Call /wallet/recharge/mock-success?tx_id=... in dev",
-    }
-
-
-@router.post("/recharge/mock-success")
-def recharge_mock_success(tx_id: int, db: Session = Depends(get_db)):
-    """DEV ONLY: instantly mark a recharge as success and credit wallet."""
-    tx = db.get(WalletTransaction, tx_id)
-    if not tx or tx.tx_type != TxType.RECHARGE:
-        raise HTTPException(404, "Recharge tx not found")
-    if tx.status == TxStatus.SUCCESS:
-        return {"ok": True, "already": True}
-
-    try:
-        user = _lock_user(db, tx.user_id) # 🔒 prevent race
-        user.wallet_balance = (user.wallet_balance or 0) + tx.amount
-        tx.status = TxStatus.SUCCESS
-        db.commit()
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(500, f"DB error: {e}")
-
-    return {"ok": True, "balance": float(user.wallet_balance or 0)}
-
-
-@router.post("/withdraw")
-def withdraw(
-    payload: WithdrawIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    try:
-        u = _lock_user(db, user.id) # 🔒
-        amount = Decimal(payload.amount)
-        if (u.wallet_balance or 0) < amount:
-            raise HTTPException(400, "Insufficient balance")
-
-        u.wallet_balance = (u.wallet_balance or 0) - amount
-        tx = WalletTransaction(
-            user_id=u.id,
-            amount=amount,
-            tx_type=TxType.WITHDRAW,
-            status=TxStatus.PENDING,
-            provider_ref=payload.upi_id,
-        )
-        db.add(tx)
-        db.commit()
-        db.refresh(tx)
-
-        # Dev auto success
-        if os.getenv("MOCK_PAYOUT", "true").lower() == "true":
-            tx.status = TxStatus.SUCCESS
-            db.commit()
-
-        return {
-            "ok": True,
-            "tx_id": tx.id,
-            "status": tx.status.value,
-            "balance": float(u.wallet_balance or 0),
-        }
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(500, f"DB error: {e}")
 
 
 @router.get("/history")
@@ -166,7 +95,7 @@ def wallet_history(
                 if tx.tx_type == TxType.WITHDRAW and tx.provider_ref
                 else tx.provider_ref
             ),
-            "timestamp": tx.timestamp.isoformat(),
+            "timestamp": tx.timestamp.isoformat() if tx.timestamp else None,
         }
         for tx in rows
     ]
@@ -180,7 +109,6 @@ RZP_KEY_SECRET = os.getenv("RZP_KEY_SECRET")
 RZP_WEBHOOK_SECRET = os.getenv("RZP_WEBHOOK_SECRET")
 FRONTEND_SUCCESS_URL = os.getenv("FRONTEND_SUCCESS_URL", "")
 FRONTEND_FAILURE_URL = os.getenv("FRONTEND_FAILURE_URL", "")
-
 RAZORPAY_API = "https://api.razorpay.com/v1"
 
 
@@ -188,11 +116,6 @@ def _rzp_auth():
     if not (RZP_KEY_ID and RZP_KEY_SECRET):
         raise HTTPException(500, "Payment gateway not configured")
     return (RZP_KEY_ID, RZP_KEY_SECRET)
-
-
-def _amount_to_paise(amount: Decimal) -> int:
-    # Razorpay expects integer paise
-    return int(Decimal(amount) * 100)
 
 
 # -------------------------------------------------
@@ -204,8 +127,13 @@ def recharge_create_link(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Create a Payment Link and a PENDING wallet transaction."""
+    """
+    Create a Payment Link and a PENDING wallet transaction.
+    Wallet is credited ONLY by the webhook after Razorpay confirms payment.
+    """
     amount = Decimal(payload.amount)
+    if amount <= 0:
+        raise HTTPException(400, "Invalid amount")
 
     # 1) Create the PENDING tx
     tx = WalletTransaction(
@@ -213,7 +141,7 @@ def recharge_create_link(
         amount=amount,
         tx_type=TxType.RECHARGE,
         status=TxStatus.PENDING,
-        provider_ref=None,
+        provider_ref=None, # will store Razorpay payment_link_id after creation
     )
     db.add(tx)
     db.commit()
@@ -246,10 +174,12 @@ def recharge_create_link(
             raise Exception(r.text)
         data = r.json()
     except Exception as e:
+        # rollback tx if payment link creation fails
         db.delete(tx)
         db.commit()
         raise HTTPException(502, f"Failed to create payment link: {e}")
 
+    # Save Razorpay payment_link_id
     tx.provider_ref = data.get("id")
     db.commit()
 
@@ -258,22 +188,19 @@ def recharge_create_link(
         "tx_id": tx.id,
         "payment_link_id": data.get("id"),
         "short_url": data.get("short_url"),
-        "status": "PENDING",
+        "status": tx.status.value,
     }
-
-
-def _verify_rzp_signature(secret: str, body_bytes: bytes, signature: str) -> bool:
-    digest = hmac.new(
-        key=secret.encode("utf-8"),
-        msg=body_bytes,
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(digest, signature)
 
 
 @router.post("/recharge/webhook")
 async def recharge_webhook(request: Request, db: Session = Depends(get_db)):
-    """Razorpay webhook receiver."""
+    """
+    Razorpay webhook receiver — verifies signature and credits wallet for successful payments.
+    Configure this URL in Razorpay Dashboard with secret RZP_WEBHOOK_SECRET.
+    We process:
+      - payment_link.paid → credit wallet
+      - payment_link.expired → mark tx as FAILED (no credit)
+    """
     body = await request.body()
     sig = request.headers.get("X-Razorpay-Signature") or ""
 
@@ -281,7 +208,7 @@ async def recharge_webhook(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(400, "Invalid signature")
 
     payload = json.loads(body.decode("utf-8"))
-    event = payload.get("event")
+    event = payload.get("event", "")
     payload_data = payload.get("payload", {})
 
     # --- Payment Link paid ---
@@ -296,11 +223,12 @@ async def recharge_webhook(request: Request, db: Session = Depends(get_db)):
         if not tx or tx.tx_type != TxType.RECHARGE:
             return {"ok": True, "ignored": "tx missing or wrong type"}
 
+        # Idempotent: only process if still pending
         if tx.status == TxStatus.PENDING:
             user = _lock_user(db, tx.user_id) # 🔒 lock before credit
             user.wallet_balance = (user.wallet_balance or 0) + tx.amount
             tx.status = TxStatus.SUCCESS
-            tx.provider_ref = pl.get("id")
+            # Keep provider_ref as the payment_link_id already saved on creation
             db.commit()
 
         return {"ok": True, "updated": True}
@@ -317,6 +245,7 @@ async def recharge_webhook(request: Request, db: Session = Depends(get_db)):
                 db.commit()
         return {"ok": True, "expired": True}
 
+    # Ignore other events safely
     return {"ok": True, "ignored_event": event}
 
 
@@ -352,25 +281,35 @@ def withdraw_request(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Hold amount and mark PENDING. Process via worker/webhook later."""
+    """
+    Production flow:
+      1) Put amount on hold (deduct immediately).
+      2) Create a PENDING withdrawal tx.
+      3) A background worker / admin approves and sends payout via provider.
+      4) On payout-success webhook, mark tx SUCCESS. On failure, refund user.
+    """
     amount = Decimal(payload.amount)
 
-    if (user.wallet_balance or 0) < amount:
+    u = _lock_user(db, user.id) # 🔒
+    if (u.wallet_balance or 0) < amount:
         raise HTTPException(400, "Insufficient balance")
 
-    user.wallet_balance = (user.wallet_balance or 0) - amount
+    # hold amount
+    u.wallet_balance = (u.wallet_balance or 0) - amount
     tx = WalletTransaction(
-        user_id=user.id,
+        user_id=u.id,
         amount=amount,
         tx_type=TxType.WITHDRAW,
         status=TxStatus.PENDING,
-        provider_ref=payload.upi_id,
+        provider_ref=payload.upi_id, # store UPI ID here (or elsewhere)
     )
     db.add(tx)
     db.commit()
     db.refresh(tx)
 
-    return {"ok": True, "tx_id": tx.id, "status": "PENDING"}
+    # TODO: enqueue job to your payout worker (or call RazorpayX/Cashfree payouts)
+
+    return {"ok": True, "tx_id": tx.id, "status": tx.status.value, "balance": float(u.wallet_balance or 0)}
 
 
 # Admin tool (protect in prod!)
@@ -407,6 +346,7 @@ def withdraw_mark_failed(
     if tx.status != TxStatus.PENDING:
         return {"ok": True, "already": tx.status.value}
 
+    # Refund the hold
     user = db.get(User, tx.user_id)
     if user:
         user.wallet_balance = (user.wallet_balance or 0) + tx.amount

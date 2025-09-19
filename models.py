@@ -18,11 +18,11 @@ class MatchStatus(enum.Enum):
 
 
 class TxType(enum.Enum):
-    RECHARGE = "recharge" # User adds money
-    WITHDRAW = "withdraw" # User withdraws money
-    ENTRY = "entry" # Stake deducted when user joins match
-    WIN = "win" # Prize credited to winner
-    FEE = "fee" # System/merchant fee
+    RECHARGE = "recharge"
+    WITHDRAW = "withdraw"
+    ENTRY = "entry"
+    WIN = "win"
+    FEE = "fee"
 
 
 class TxStatus(enum.Enum):
@@ -89,7 +89,6 @@ class GameMatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Optional DB-land echoes of state
     last_roll = Column(Integer, nullable=True)
     current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2, 2 = P3
 
@@ -121,12 +120,13 @@ class WalletTransaction(Base):
 
 
 # -----------------------
-# Stakes Table (new)
+# Stakes Table
 # -----------------------
 class Stake(Base):
     __tablename__ = "stakes"
 
     id = Column(Integer, primary_key=True, index=True)
-    stage = Column(Integer, unique=True, nullable=False) # 1, 2, 3...
-    stake_amount = Column(Integer, nullable=False) # amount each player pays
-    winner_payout = Column(Integer, nullable=False) # amount winner gets
+    stake_amount = Column(Integer, unique=True, nullable=False) # stage key
+    entry_fee = Column(Integer, nullable=False) # each player pays
+    winner_payout = Column(Integer, nullable=False) # winner gets
+    label = Column(String(50), nullable=False) # UI label

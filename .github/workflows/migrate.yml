@@ -18,4 +18,4 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python scripts/one_off_add_user_desc.py
+          python scripts/one_off_fix_wallet_timestamp.py

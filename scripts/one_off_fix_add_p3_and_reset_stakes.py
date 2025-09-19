@@ -1,39 +1,34 @@
-from sqlalchemy import create_engine, text
-import os
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set in environment")
-engine = create_engine(DATABASE_URL)
-with engine.begin() as conn:
-    # 1. Ensure p3_user_id exists on matches
-    conn.execute(text("""
-        ALTER TABLE matches
-        ADD COLUMN IF NOT EXISTS p3_user_id INTEGER REFERENCES users(id);
-    """))
-    print(":white_check_mark: p3_user_id ensured in matches table")
-    # 2. Drop & recreate stakes table with correct schema
-    conn.execute(text("DROP TABLE IF EXISTS stakes CASCADE;"))
-    conn.execute(text("""
-        CREATE TABLE stakes (
-            stake_amount INTEGER PRIMARY KEY,
-            entry_fee NUMERIC(10,2) NOT NULL,
-            winner_payout NUMERIC(10,2) NOT NULL,
-            label TEXT NOT NULL
-        );
-    """))
-    print(":white_check_mark: stakes table recreated with label column")
-    # 3. Insert rules with friendly labels
-    conn.execute(text("""
-        INSERT INTO stakes (stake_amount, entry_fee, winner_payout, label) VALUES
-            (0, 0, 0, 'Free Play'),
-            (4, 2, 4, '4rs Bounty'),
-            (8, 4, 8, '8rs Bounty'),
-            (20, 10, 20, '20rs Bounty');
-    """))
-    print(":white_check_mark: stakes table seeded with Free/4/8/20 rules and labels")
+from sqlalchemy import inspect
+from sqlalchemy.orm import Session
+from sqlalchemy import Column, Integer, ForeignKey
+from database import engine, Base
+from models import GameMatch, Stake
+# --- Ensure p3_user_id column exists in matches ---
+with engine.connect() as conn:
+    insp = inspect(engine)
+    cols = [c["name"] for c in insp.get_columns("matches")]
+    if "p3_user_id" not in cols:
+        print("[INFO] Adding p3_user_id to matches table...")
+        conn.execute("ALTER TABLE matches ADD COLUMN p3_user_id INTEGER REFERENCES users(id)")
+        conn.commit()
+    else:
+        print(":white_check_mark: p3_user_id already exists")
+# --- Ensure stakes table exists ---
+Base.metadata.create_all(bind=engine, tables=[Stake.__table__])
+print(":white_check_mark: stakes table ensured with ORM model")
+# --- Reset stakes with new rules ---
+with Session(engine) as db:
+    db.query(Stake).delete()  # clear old rules
+    stakes = [
+        Stake(stake_amount=0, entry_fee=0, winner_payout=0, label="Free Play"),
+        Stake(stake_amount=4, entry_fee=2, winner_payout=4, label="₹4 Bounty"),
+        Stake(stake_amount=8, entry_fee=4, winner_payout=8, label="₹8 Bounty"),
+        Stake(stake_amount=20, entry_fee=10, winner_payout=20, label="₹20 Bounty"),
+    ]
+    db.add_all(stakes)
+    db.commit()
+    print(":white_check_mark: stakes table seeded with Free/4/8/20 bounty rules")
 print(":tada: Migration complete")
-
-
 
 
 

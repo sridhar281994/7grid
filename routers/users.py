@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
 from pydantic import BaseModel, constr
 from sqlalchemy.orm import Session
 
@@ -17,18 +18,17 @@ class UserOut(BaseModel):
     email: str | None = None
     name: str | None = None
     upi_id: str | None = None
-    description: str | None = None # ✅ match models.py column
+    description: str | None = None   # :white_check_mark: matches models.py column
     wallet_balance: float
-    created_at: str | None = None
-
+    created_at: datetime | None = None   # :white_check_mark: accept datetime directly
+    
     class Config:
-        from_attributes = True # pydantic v2
-
-
+        from_attributes = True  # pydantic v2
+        
 class UserUpdate(BaseModel):
     name: str | None = None
     upi_id: str | None = None
-    description: constr(max_length=50) | None = None # ✅ enforce 50 chars
+    description: constr(max_length=50) | None = None  # :white_check_mark: enforce 50 chars
 
 
 # -----------------------------

@@ -241,6 +241,12 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 # -------------------------
 # Create or wait for match
 # -------------------------
+from pydantic import BaseModel, conint, Field
+
+# ✅ Bot user IDs (must be consistent with users.py BOT_PROFILES)
+BOT_USER_ID = -1000 # Sharp (Bot)
+BOT_USER_ID2 = -1001 # Crazy Boy (Bot)
+
 class CreateIn(BaseModel):
     stake_amount: conint(ge=0) # 0 = free play
     num_players: conint(ge=2, le=3) = Field(default=2, description="2-player or 3-player mode")
@@ -279,7 +285,7 @@ async def create_or_wait_match(
                     status=MatchStatus.ACTIVE,
                     p1_user_id=current_user.id,
                     p2_user_id=BOT_USER_ID,
-                    p3_user_id=BOT_USER_ID_ALT,
+                    p3_user_id=BOT_USER_ID2,
                     current_turn=random.choice([0, 1, 2]),
                     last_roll=None,
                     num_players=3,
@@ -406,7 +412,6 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
 
 
 # -------------------------

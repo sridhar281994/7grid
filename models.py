@@ -79,6 +79,7 @@ class GameMatch(Base):
     id = Column(Integer, primary_key=True, index=True)
     stake_amount = Column(Integer, nullable=False)
 
+    # 👥 Player slots
     p1_user_id = Column(Integer, ForeignKey("users.id"))
     p2_user_id = Column(Integer, ForeignKey("users.id"))
     p3_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -86,12 +87,17 @@ class GameMatch(Base):
     winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
     system_fee = Column(Numeric(10, 2), default=0)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
     last_roll = Column(Integer, nullable=True)
     current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2, 2 = P3
 
+    # 🔥 NEW → track whether this match is 2-player or 3-player
+    num_players = Column(Integer, nullable=False, default=2)
+
+    # Relationships
     player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")
     player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
     player3 = relationship("User", foreign_keys=[p3_user_id], back_populates="matches_as_p3")
@@ -112,7 +118,6 @@ class WalletTransaction(Base):
     status = Column(Enum(TxStatus), default=TxStatus.PENDING, nullable=False)
 
     provider_ref = Column(String, nullable=True)
-
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     transaction_id = Column(String, unique=True, nullable=True)
 

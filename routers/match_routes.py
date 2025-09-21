@@ -746,9 +746,6 @@ async def forfeit_match(
     }
 
 
----
-
-🔥 Full Patch — /finish
 
 # -------------------------
 # Finish Match (normal win)

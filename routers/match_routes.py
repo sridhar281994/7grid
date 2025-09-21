@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, conint, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -33,7 +33,8 @@ REDIS_URL = (
 _roll_counts: dict[int, dict[str, int]] = {}
 
 # --------- BOT IDs (pseudo users for free play) ---------
-BOT_USER_ID = -1000 # starting ID for bots
+BOT_USER_ID = -1000 # Sharp (Bot)
+BOT_USER_ID_ALT = -1001 # Crazy Boy (Bot)
 
 # -------------------------
 # Pydantic models
@@ -240,8 +241,6 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 # -------------------------
 # Create or wait for match
 # -------------------------
-from pydantic import BaseModel, conint, Field
-
 class CreateIn(BaseModel):
     stake_amount: conint(ge=0) # 0 = free play
     num_players: conint(ge=2, le=3) = Field(default=2, description="2-player or 3-player mode")
@@ -280,7 +279,7 @@ async def create_or_wait_match(
                     status=MatchStatus.ACTIVE,
                     p1_user_id=current_user.id,
                     p2_user_id=BOT_USER_ID,
-                    p3_user_id=BOT_USER_ID - 1,
+                    p3_user_id=BOT_USER_ID_ALT,
                     current_turn=random.choice([0, 1, 2]),
                     last_roll=None,
                     num_players=3,
@@ -407,6 +406,7 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
 
 
 # -------------------------

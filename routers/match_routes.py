@@ -240,6 +240,13 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 # -------------------------
 # Create or wait for match
 # -------------------------
+from pydantic import BaseModel, conint, Field
+
+class CreateIn(BaseModel):
+    stake_amount: conint(ge=0) # 0 = free play
+    num_players: conint(ge=2, le=3) = Field(default=2, description="2-player or 3-player mode")
+
+
 @router.post("/create")
 async def create_or_wait_match(
     payload: CreateIn,
@@ -248,23 +255,37 @@ async def create_or_wait_match(
 ) -> Dict:
     try:
         stake_amount = int(payload.stake_amount)
-        num_players = int(payload.num_players)
+        num_players = int(payload.num_players or 2)
         entry_fee = stake_amount // num_players if stake_amount > 0 else 0
 
         # Paid mode → ensure balance
         if stake_amount > 0 and (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # -------- Free Play (WAITING, bots added later in /check) --------
+        # -------- Free Play (bots allowed) --------
         if stake_amount == 0:
-            new_match = GameMatch(
-                stake_amount=0,
-                status=MatchStatus.WAITING,
-                p1_user_id=current_user.id,
-                num_players=num_players,
-                last_roll=None,
-                current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
-            )
+            if num_players == 2:
+                new_match = GameMatch(
+                    stake_amount=0,
+                    status=MatchStatus.ACTIVE,
+                    p1_user_id=current_user.id,
+                    p2_user_id=BOT_USER_ID,
+                    current_turn=random.choice([0, 1]),
+                    last_roll=None,
+                    num_players=2,
+                )
+            else: # 3-player free play
+                new_match = GameMatch(
+                    stake_amount=0,
+                    status=MatchStatus.ACTIVE,
+                    p1_user_id=current_user.id,
+                    p2_user_id=BOT_USER_ID,
+                    p3_user_id=BOT_USER_ID - 1,
+                    current_turn=random.choice([0, 1, 2]),
+                    last_roll=None,
+                    num_players=3,
+                )
+
             db.add(new_match)
             db.commit()
             db.refresh(new_match)
@@ -286,8 +307,8 @@ async def create_or_wait_match(
                 "stake": 0,
                 "num_players": num_players,
                 "p1": _name_for_id(db, new_match.p1_user_id),
-                "p2": None,
-                "p3": None,
+                "p2": _name_for_id(db, new_match.p2_user_id),
+                "p3": _name_for_id(db, new_match.p3_user_id) if num_players == 3 else None,
                 "turn": new_match.current_turn,
             }
 
@@ -378,8 +399,8 @@ async def create_or_wait_match(
             "stake": new_match.stake_amount,
             "num_players": num_players,
             "p1": _name_for_id(db, new_match.p1_user_id),
-            "p2": None,
-            "p3": None,
+            "p2": _name_for_id(db, new_match.p2_user_id),
+            "p3": _name_for_id(db, new_match.p3_user_id) if num_players == 3 else None,
             "turn": new_match.current_turn,
         }
 
@@ -401,57 +422,63 @@ async def check_match_ready(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    # Auto-bot fill for free play after 10s
-    if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
-        elapsed = (datetime.utcnow() - m.created_at.replace(tzinfo=None)).total_seconds()
-        if elapsed >= 10:
-            if m.num_players == 2:
-                if not m.p2_user_id:
-                    m.p2_user_id = BOT_USER_ID
-                m.status = MatchStatus.ACTIVE
-                m.current_turn = random.choice([0, 1])
-            else:
-                if not m.p2_user_id:
-                    m.p2_user_id = BOT_USER_ID
-                if not m.p3_user_id:
-                    m.p3_user_id = BOT_USER_ID - 1
-                m.status = MatchStatus.ACTIVE
-                m.current_turn = random.choice([0, 1, 2])
-            db.commit()
-            db.refresh(m)
+    # Auto-advance logic if match is active
+    if m.status == MatchStatus.ACTIVE:
+        await _auto_advance_if_needed(m, db)
 
-            await _write_state(
-                m,
-                {
-                    "positions": [0] * m.num_players,
-                    "current_turn": m.current_turn,
-                    "last_roll": None,
-                    "winner": None,
-                },
-            )
+    # Determine expected number of players (defaults to 2 if missing)
+    expected_players = m.num_players or 2
 
-    players = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    # Collect player IDs
+    players = [m.p1_user_id, m.p2_user_id]
+    if expected_players == 3:
+        players.append(m.p3_user_id)
+
+    # Filter out None
     players = [pid for pid in players if pid]
 
+    # Read state from cache/redis/db
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
+    # Prize distribution info (informational only)
+    prize_info = None
+    if winner_idx is not None:
+        if expected_players == 2:
+            prize_info = {
+                "winner": winner_idx,
+                "winner_share": "75%",
+                "company": "25%",
+                "rule": "2-player"
+            }
+        else:
+            prize_info = {
+                "winner": winner_idx,
+                "winner_amount": 4, # you can adjust these values as needed
+                "company_amount": 2,
+                "rule": "3-player"
+            }
+
     return {
-        "ready": m.status == MatchStatus.ACTIVE
-        and m.p1_user_id
-        and m.p2_user_id
-        and (m.num_players == 2 or m.p3_user_id),
+        "ready": (
+            m.status == MatchStatus.ACTIVE
+            and m.p1_user_id
+            and m.p2_user_id
+            and (expected_players == 2 or m.p3_user_id)
+        ),
         "finished": m.status == MatchStatus.FINISHED,
         "match_id": m.id,
         "status": _status_value(m),
         "stake": m.stake_amount,
+        "num_players": expected_players,
         "p1": _name_for_id(db, m.p1_user_id),
         "p2": _name_for_id(db, m.p2_user_id),
-        "p3": _name_for_id(db, m.p3_user_id) if m.num_players == 3 else None,
+        "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
         "last_roll": st.get("last_roll", m.last_roll),
         "turn": st.get("current_turn", m.current_turn or 0),
-        "positions": st.get("positions", [0] * m.num_players),
+        "positions": st.get("positions", [0] * expected_players),
         "winner": winner_idx,
+        "prize_info": prize_info,
     }
 
 

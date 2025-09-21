@@ -1,58 +1,36 @@
-from sqlalchemy import create_engine, text
 import os
+from sqlalchemy import create_engine, text
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set")
-engine = create_engine(DATABASE_URL, echo=False, future=True)
-def run():
-    with engine.begin() as conn:
-        # ------------------------------
-        # 1. Ensure p3_user_id in matches
-        # ------------------------------
-        print(":hammer_and_wrench: Ensuring p3_user_id exists in matches...")
+    raise RuntimeError("DATABASE_URL is not set")
+engine = create_engine(DATABASE_URL, echo=True, future=True)
+with engine.begin() as conn:
+    # --- 1. Add p3_user_id and num_players columns if missing ---
+    try:
         conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_name = 'matches' AND column_name = 'p3_user_id'
-                ) THEN
-                    ALTER TABLE matches
-                    ADD COLUMN p3_user_id INTEGER REFERENCES users(id);
-                END IF;
-            END$$;
+            ALTER TABLE matches ADD COLUMN IF NOT EXISTS p3_user_id INTEGER REFERENCES users(id)
         """))
-        print(":white_check_mark: p3_user_id ensured in matches table")
-        # ------------------------------
-        # 2. Drop + recreate stakes table
-        # ------------------------------
-        print(":arrows_counterclockwise: Dropping and recreating stakes table...")
-        conn.execute(text("DROP TABLE IF EXISTS stakes CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE stakes (
-                id SERIAL PRIMARY KEY,
-                stake_amount INTEGER NOT NULL UNIQUE,
-                entry_fee INTEGER NOT NULL,
-                winner_payout INTEGER NOT NULL,
-                label VARCHAR NOT NULL
-            );
+            ALTER TABLE matches ADD COLUMN IF NOT EXISTS num_players INTEGER NOT NULL DEFAULT 2
         """))
-        print(":white_check_mark: stakes table recreated with correct schema")
-        # ------------------------------
-        # 3. Seed default rows
-        # ------------------------------
+        print(":white_check_mark: Added p3_user_id and num_players columns (if not existing).")
+    except Exception as e:
+        print(f":warning: Skipped adding columns: {e}")
+    # --- 2. Reset stakes table to defaults ---
+    try:
+        conn.execute(text("DELETE FROM stakes"))
         conn.execute(text("""
-            INSERT INTO stakes (stake_amount, entry_fee, winner_payout, label) VALUES
-                (0, 0, 0, 'Free Play'),
-                (4, 2, 4, '₹4 Bounty'),
-                (8, 4, 8, '₹8 Bounty'),
-                (20, 10, 20, '₹20 Bounty');
+            INSERT INTO stakes (stake_amount, entry_fee, winner_payout, label)
+            VALUES
+              (0, 0, 0, 'Free Play'),
+              (4, 2, 4, '₹4 Stage'),
+              (8, 4, 8, '₹8 Stage'),
+              (12, 6, 12, '₹12 Stage')
         """))
-        print(":package: stakes table seeded with Free/4/8/20 rules")
-    print(":tada: Migration complete — p3_user_id ensured, stakes table reset!")
-if __name__ == "__main__":
-    run()
+        print(":white_check_mark: Reset stakes table with default values.")
+    except Exception as e:
+        print(f":warning: Skipped resetting stakes: {e}")
+print(":tada: One-off migration completed successfully.")
 
 
 

@@ -47,6 +47,9 @@ class User(Base):
     description = Column(String(50), nullable=True)
     wallet_balance = Column(Numeric(10, 2), default=0)
 
+    # ✅ New column
+    profile_image = Column(String, nullable=True, default="assets/default.png")
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

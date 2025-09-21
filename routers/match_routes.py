@@ -847,3 +847,41 @@ async def finish_match(
         "winner": _name_for_id(db, winner_id),
         "stake": stake,
     }
+
+#....................cleanup..........
+STALE_TIMEOUT = timedelta(seconds=12) # free-play WAITING match cutoff
+
+
+async def _cleanup_stale_matches():
+    """Background loop to delete stale WAITING matches (free play)."""
+    from database import SessionLocal
+
+    while True:
+        try:
+            db = SessionLocal()
+            cutoff = datetime.utcnow() - STALE_TIMEOUT
+
+            # Find and delete free-play WAITING matches older than cutoff
+            stale = (
+                db.query(GameMatch)
+                .filter(
+                    GameMatch.status == MatchStatus.WAITING,
+                    GameMatch.stake_amount == 0,
+                    GameMatch.created_at < cutoff,
+                )
+                .all()
+            )
+
+            if stale:
+                count = len(stale)
+                for m in stale:
+                    db.delete(m)
+                db.commit()
+                print(f"[CLEANUP] Removed {count} stale free-play matches")
+
+        except Exception as e:
+            print(f"[CLEANUP ERROR] {e}")
+        finally:
+            db.close()
+
+        await asyncio.sleep(30) # run every 30s

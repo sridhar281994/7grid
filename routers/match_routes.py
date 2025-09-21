@@ -35,6 +35,13 @@ _roll_counts: dict[int, dict[str, int]] = {}
 # --------- BOT IDs (pseudo users for free play) ---------
 BOT_USER_ID = -1000 # starting ID for bots
 
+# -------------------------
+# Pydantic models
+# -------------------------
+class CreateIn(BaseModel):
+    stake_amount: conint(ge=0) # 0 = free play
+    num_players: conint(ge=2, le=3) = 2 # allow 2-player or 3-player
+    
 
 async def _get_redis():
     """Lazy connect to Redis."""
@@ -233,11 +240,6 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 # -------------------------
 # Create or wait for match
 # -------------------------
-class CreateIn(BaseModel):
-    stake_amount: conint(ge=0) # 0 = free play
-    num_players: conint(ge=2, le=3) = 2 # allow 2-player or 3-player
-
-
 @router.post("/create")
 async def create_or_wait_match(
     payload: CreateIn,
@@ -253,28 +255,16 @@ async def create_or_wait_match(
         if stake_amount > 0 and (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # -------- Free Play (bots allowed) --------
+        # -------- Free Play (WAITING, bots added later in /check) --------
         if stake_amount == 0:
-            if num_players == 2:
-                new_match = GameMatch(
-                    stake_amount=0,
-                    status=MatchStatus.ACTIVE,
-                    p1_user_id=current_user.id,
-                    p2_user_id=BOT_USER_ID,
-                    current_turn=random.choice([0, 1]),
-                    last_roll=None,
-                )
-            else: # 3-player free play
-                new_match = GameMatch(
-                    stake_amount=0,
-                    status=MatchStatus.ACTIVE,
-                    p1_user_id=current_user.id,
-                    p2_user_id=BOT_USER_ID,
-                    p3_user_id=BOT_USER_ID - 1,
-                    current_turn=random.choice([0, 1, 2]),
-                    last_roll=None,
-                )
-
+            new_match = GameMatch(
+                stake_amount=0,
+                status=MatchStatus.WAITING,
+                p1_user_id=current_user.id,
+                num_players=num_players,
+                last_roll=None,
+                current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
+            )
             db.add(new_match)
             db.commit()
             db.refresh(new_match)
@@ -296,22 +286,20 @@ async def create_or_wait_match(
                 "stake": 0,
                 "num_players": num_players,
                 "p1": _name_for_id(db, new_match.p1_user_id),
-                "p2": _name_for_id(db, new_match.p2_user_id),
-                "p3": _name_for_id(db, new_match.p3_user_id) if num_players == 3 else None,
+                "p2": None,
+                "p3": None,
                 "turn": new_match.current_turn,
             }
 
         # -------- Paid Matches --------
-        # Deduct entry fee
         current_user.wallet_balance -= entry_fee
 
-        # Look for waiting match with same stake + mode
         waiting = (
             db.query(GameMatch)
             .filter(
                 GameMatch.status == MatchStatus.WAITING,
                 GameMatch.stake_amount == stake_amount,
-                GameMatch.num_players == num_players, # requires column in DB
+                GameMatch.num_players == num_players,
                 GameMatch.p1_user_id != current_user.id,
             )
             .order_by(GameMatch.id.asc())
@@ -365,7 +353,7 @@ async def create_or_wait_match(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_user_id=current_user.id,
-            num_players=num_players, # requires column in DB
+            num_players=num_players,
             last_roll=None,
             current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
         )
@@ -390,15 +378,14 @@ async def create_or_wait_match(
             "stake": new_match.stake_amount,
             "num_players": num_players,
             "p1": _name_for_id(db, new_match.p1_user_id),
-            "p2": _name_for_id(db, new_match.p2_user_id),
-            "p3": _name_for_id(db, new_match.p3_user_id) if num_players == 3 else None,
+            "p2": None,
+            "p3": None,
             "turn": new_match.current_turn,
         }
 
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
 
 
 # -------------------------
@@ -414,51 +401,57 @@ async def check_match_ready(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    if m.status == MatchStatus.ACTIVE:
-        await _auto_advance_if_needed(m, db)
+    # Auto-bot fill for free play after 10s
+    if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
+        elapsed = (datetime.utcnow() - m.created_at.replace(tzinfo=None)).total_seconds()
+        if elapsed >= 10:
+            if m.num_players == 2:
+                if not m.p2_user_id:
+                    m.p2_user_id = BOT_USER_ID
+                m.status = MatchStatus.ACTIVE
+                m.current_turn = random.choice([0, 1])
+            else:
+                if not m.p2_user_id:
+                    m.p2_user_id = BOT_USER_ID
+                if not m.p3_user_id:
+                    m.p3_user_id = BOT_USER_ID - 1
+                m.status = MatchStatus.ACTIVE
+                m.current_turn = random.choice([0, 1, 2])
+            db.commit()
+            db.refresh(m)
+
+            await _write_state(
+                m,
+                {
+                    "positions": [0] * m.num_players,
+                    "current_turn": m.current_turn,
+                    "last_roll": None,
+                    "winner": None,
+                },
+            )
 
     players = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
     players = [pid for pid in players if pid]
-    num_players = len(players)
 
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
-
-    # Prize distribution info (informational only, no wallet ops here)
-    prize_info = None
-    if winner_idx is not None:
-        if num_players == 2:
-            prize_info = {
-                "winner": winner_idx,
-                "winner_share": "75%",
-                "company": "25%",
-                "rule": "2-player"
-            }
-        else:
-            prize_info = {
-                "winner": winner_idx,
-                "winner_amount": 4,
-                "company_amount": 2,
-                "rule": "3-player"
-            }
 
     return {
         "ready": m.status == MatchStatus.ACTIVE
         and m.p1_user_id
         and m.p2_user_id
-        and (num_players == 2 or m.p3_user_id),
+        and (m.num_players == 2 or m.p3_user_id),
         "finished": m.status == MatchStatus.FINISHED,
         "match_id": m.id,
         "status": _status_value(m),
         "stake": m.stake_amount,
         "p1": _name_for_id(db, m.p1_user_id),
         "p2": _name_for_id(db, m.p2_user_id),
-        "p3": _name_for_id(db, m.p3_user_id) if num_players == 3 else None,
+        "p3": _name_for_id(db, m.p3_user_id) if m.num_players == 3 else None,
         "last_roll": st.get("last_roll", m.last_roll),
         "turn": st.get("current_turn", m.current_turn or 0),
-        "positions": st.get("positions", [0] * num_players),
+        "positions": st.get("positions", [0] * m.num_players),
         "winner": winner_idx,
-        "prize_info": prize_info,
     }
 
 
@@ -635,41 +628,36 @@ async def forfeit_match(
 
 
 # -------------------------
-# Abandon / Cancel stale match
+# Abandon match (clean free play)
 # -------------------------
 @router.post("/abandon")
 async def abandon_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> Dict:
-    matches = (
+):
+    m = (
         db.query(GameMatch)
         .filter(
             GameMatch.status.in_([MatchStatus.WAITING, MatchStatus.ACTIVE]),
-            ((GameMatch.p1_user_id == current_user.id) |
-             (GameMatch.p2_user_id == current_user.id) |
-             (GameMatch.p3_user_id == current_user.id)),
+            GameMatch.p1_user_id == current_user.id,
         )
-        .all()
+        .first()
     )
 
-    if not matches:
+    if not m:
         return {"ok": True, "message": "No active matches"}
 
-    for m in matches:
-        if m.status == MatchStatus.WAITING:
-            entry_fee = m.stake_amount // 2
-            current_user.wallet_balance = (current_user.wallet_balance or 0) + entry_fee
-        m.status = MatchStatus.FINISHED
-        await _clear_state(m.id)
-
-    try:
+    # If free play still WAITING, delete instead of filling bots
+    if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
+        db.delete(m)
         db.commit()
-    except SQLAlchemyError:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="DB Error during abandon")
+        return {"ok": True, "message": "Free play abandoned"}
 
-    return {"ok": True, "message": "Stale matches cleared and refunded if applicable"}
+    # Otherwise just mark as finished
+    m.status = MatchStatus.FINISHED
+    db.commit()
+    return {"ok": True, "message": "Match abandoned"}
+
 
 
 # -------------------------
@@ -841,69 +829,81 @@ async def forfeit_match(
 # -------------------------
 # Finish Match (normal win)
 # -------------------------
+class FinishIn(BaseModel):
+    match_id: int
+    winner: Optional[int] = None # index: 0 = p1, 1 = p2, 2 = p3
+
+
 @router.post("/finish")
 async def finish_match(
-    payload: ForfeitIn, # reuse same model with match_id
+    payload: FinishIn,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """
-    Called when a player reaches the last box normally (not give up).
-    Marks the match as finished and applies payout rules.
-    """
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
-    if m.status != MatchStatus.ACTIVE:
-        raise HTTPException(status_code=400, detail="Match not active")
 
-    num_players = 3 if m.p3_user_id else 2
-    players = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:num_players]
-    if current_user.id not in players and current_user.id > 0:
-        raise HTTPException(status_code=403, detail="Not your match")
+    # already finished
+    if m.status == MatchStatus.FINISHED:
+        return {"ok": True, "message": "Match already finished"}
 
-    # Winner is current_user (reached last box)
-    winner_idx = players.index(current_user.id) if current_user.id > 0 else 0
+    # ---- Free Play (no wallet ops) ----
+    if m.stake_amount == 0:
+        m.status = MatchStatus.FINISHED
+        m.finished_at = func.now()
 
-    m.status = MatchStatus.FINISHED
-    m.finished_at = _utcnow()
-    await _clear_state(m.id)
-    _roll_counts.pop(m.id, None)
+        winner_idx = payload.winner
+        if winner_idx is not None:
+            # map index → user_id if human, else None
+            winner_id = (
+                m.p1_user_id if winner_idx == 0 else
+                m.p2_user_id if winner_idx == 1 else
+                m.p3_user_id if winner_idx == 2 else None
+            )
+            m.winner_user_id = winner_id # will be None if bot won
 
-    # --- payout logic ---
-    if m.stake_amount > 0:
-        pot = m.stake_amount
-        company_share = 0
-        winner_amount = 0
-        if num_players == 2:
-            company_share = pot * 0.25
-            winner_amount = pot * 0.75
-        elif num_players == 3:
-            company_share = pot // 3
-            winner_amount = pot - company_share
-
-        winner_uid = players[winner_idx]
-        if winner_uid and winner_uid > 0:
-            u = db.get(User, winner_uid)
-            if u:
-                u.wallet_balance = (u.wallet_balance or 0) + winner_amount
-        # company_share → you can save this in a merchant/accounting table if needed
-
-    try:
         db.commit()
-        db.refresh(m)
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+        return {
+            "ok": True,
+            "message": "Free play finished",
+            "winner": payload.winner,
+            "stake": 0,
+        }
 
-    await _write_state(
-        m,
-        {
-            "positions": [0] * num_players,
-            "current_turn": m.current_turn,
-            "last_roll": m.last_roll,
-            "winner": winner_idx,
-        },
+    # ---- Paid Match (entry fee + payout) ----
+    stake = m.stake_amount
+    num_players = m.num_players or 2
+    entry_fee = stake // num_players
+
+    winner_idx = payload.winner
+    if winner_idx is None:
+        raise HTTPException(status_code=400, detail="Winner index required for paid match")
+
+    winner_id = (
+        m.p1_user_id if winner_idx == 0 else
+        m.p2_user_id if winner_idx == 1 else
+        m.p3_user_id if winner_idx == 2 else None
     )
+    if not winner_id:
+        raise HTTPException(status_code=400, detail="Invalid winner index")
 
-    return {"ok": True, "match_id": m.id, "winner": winner_idx, "finished": True}
+    winner_user = db.query(User).filter(User.id == winner_id).first()
+    if not winner_user:
+        raise HTTPException(status_code=404, detail="Winner not found")
+
+    # 💰 credit payout
+    winner_user.wallet_balance += stake
+
+    m.winner_user_id = winner_id
+    m.status = MatchStatus.FINISHED
+    m.finished_at = func.now()
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Match finished",
+        "winner": _name_for_id(db, winner_id),
+        "stake": stake,
+    }

@@ -1,36 +1,30 @@
+"""
+One-off migration: Add profile_image column to users table if missing.
+Usage: python scripts/one_off_fix_add_profile_image.py
+"""
 import os
-from sqlalchemy import create_engine, text
+import sys
+from sqlalchemy import create_engine, inspect, text
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-engine = create_engine(DATABASE_URL, echo=True, future=True)
-with engine.begin() as conn:
-    # --- 1. Add p3_user_id and num_players columns if missing ---
-    try:
-        conn.execute(text("""
-            ALTER TABLE matches ADD COLUMN IF NOT EXISTS p3_user_id INTEGER REFERENCES users(id)
-        """))
-        conn.execute(text("""
-            ALTER TABLE matches ADD COLUMN IF NOT EXISTS num_players INTEGER NOT NULL DEFAULT 2
-        """))
-        print(":white_check_mark: Added p3_user_id and num_players columns (if not existing).")
-    except Exception as e:
-        print(f":warning: Skipped adding columns: {e}")
-    # --- 2. Reset stakes table to defaults ---
-    try:
-        conn.execute(text("DELETE FROM stakes"))
-        conn.execute(text("""
-            INSERT INTO stakes (stake_amount, entry_fee, winner_payout, label)
-            VALUES
-              (0, 0, 0, 'Free Play'),
-              (4, 2, 4, '₹4 Stage'),
-              (8, 4, 8, '₹8 Stage'),
-              (12, 6, 12, '₹12 Stage')
-        """))
-        print(":white_check_mark: Reset stakes table with default values.")
-    except Exception as e:
-        print(f":warning: Skipped resetting stakes: {e}")
-print(":tada: One-off migration completed successfully.")
+    print(":x: DATABASE_URL not set")
+    sys.exit(1)
+engine = create_engine(DATABASE_URL)
+def main():
+    with engine.connect() as conn:
+        inspector = inspect(conn)
+        cols = [col["name"] for col in inspector.get_columns("users")]
+        if "profile_image" not in cols:
+            print(":zap: Adding profile_image column to users...")
+            conn.execute(
+                text("ALTER TABLE users ADD COLUMN profile_image VARCHAR DEFAULT 'assets/default.png'")
+            )
+            conn.commit()
+            print(":white_check_mark: profile_image column added successfully.")
+        else:
+            print(":information_source: profile_image column already exists — skipping.")
+if __name__ == "__main__":
+    main()
 
 
 

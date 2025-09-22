@@ -243,7 +243,7 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 # -------------------------
 from pydantic import BaseModel, conint, Field
 
-# ✅ Bot user IDs (must be consistent with users.py BOT_PROFILES)
+# ✅ Bot IDs kept for paid/bot modes if you ever need them later
 BOT_USER_ID = -1000 # Sharp (Bot)
 BOT_USER_ID2 = -1001 # Crazy Boy (Bot)
 
@@ -263,43 +263,28 @@ async def create_or_wait_match(
         num_players = int(payload.num_players or 2)
         entry_fee = stake_amount // num_players if stake_amount > 0 else 0
 
-        # Paid mode → ensure balance
-        if stake_amount > 0 and (current_user.wallet_balance or 0) < entry_fee:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-
-        # -------- Free Play (bots allowed) --------
+        # -------- Free Play (NO server-side bots; front end decides after 10s) --------
         if stake_amount == 0:
-            if num_players == 2:
-                new_match = GameMatch(
-                    stake_amount=0,
-                    status=MatchStatus.ACTIVE,
-                    p1_user_id=current_user.id,
-                    p2_user_id=BOT_USER_ID,
-                    current_turn=random.choice([0, 1]),
-                    last_roll=None,
-                    num_players=2,
-                )
-            else: # 3-player free play
-                new_match = GameMatch(
-                    stake_amount=0,
-                    status=MatchStatus.ACTIVE,
-                    p1_user_id=current_user.id,
-                    p2_user_id=BOT_USER_ID,
-                    p3_user_id=BOT_USER_ID2,
-                    current_turn=random.choice([0, 1, 2]),
-                    last_roll=None,
-                    num_players=3,
-                )
-
+            new_match = GameMatch(
+                stake_amount=0,
+                status=MatchStatus.WAITING, # 👈 keep waiting; don't start yet
+                p1_user_id=current_user.id,
+                p2_user_id=None,
+                p3_user_id=None if num_players == 3 else None,
+                last_roll=None,
+                current_turn=0, # any seed is fine
+                num_players=num_players,
+            )
             db.add(new_match)
             db.commit()
             db.refresh(new_match)
 
+            # initialize ephemeral state
             await _write_state(
                 new_match,
                 {
                     "positions": [0] * num_players,
-                    "current_turn": new_match.current_turn,
+                    "current_turn": new_match.current_turn or 0,
                     "last_roll": None,
                     "winner": None,
                 },
@@ -312,14 +297,18 @@ async def create_or_wait_match(
                 "stake": 0,
                 "num_players": num_players,
                 "p1": _name_for_id(db, new_match.p1_user_id),
-                "p2": _name_for_id(db, new_match.p2_user_id),
-                "p3": _name_for_id(db, new_match.p3_user_id) if num_players == 3 else None,
-                "turn": new_match.current_turn,
+                "p2": None, # 👈 don't expose bots here
+                "p3": None,
+                "turn": new_match.current_turn or 0,
             }
 
         # -------- Paid Matches --------
+        # balance check + deduction happens here
+        if (current_user.wallet_balance or 0) < entry_fee:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
         current_user.wallet_balance -= entry_fee
 
+        # Try to join a waiting match with same config
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -374,7 +363,7 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
-        # Otherwise create new waiting match
+        # Otherwise create a new waiting paid match
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -404,14 +393,15 @@ async def create_or_wait_match(
             "stake": new_match.stake_amount,
             "num_players": num_players,
             "p1": _name_for_id(db, new_match.p1_user_id),
-            "p2": _name_for_id(db, new_match.p2_user_id),
-            "p3": _name_for_id(db, new_match.p3_user_id) if num_players == 3 else None,
+            "p2": _name_for_id(db, new_match.p2_user_id) if new_match.p2_user_id else None,
+            "p3": _name_for_id(db, new_match.p3_user_id) if (num_players == 3 and new_match.p3_user_id) else None,
             "turn": new_match.current_turn,
         }
 
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
 
 
 # -------------------------

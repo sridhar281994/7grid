@@ -17,17 +17,17 @@ from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 from routers.wallet_utils import distribute_prize
-from utils.redis_client import redis_client # ✅ use shared redis instance
+from utils.redis_client import redis_client # ✅ shared redis instance
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
-# Track roll counts per match to occasionally force a 1
+# Track roll counts per match
 _roll_counts: dict[int, dict[str, int]] = {}
 
-# --------- BOT IDs (pseudo users for free play) ---------
-BOT_USER_ID = -1000 # Sharp (Bot)
-BOT_USER_ID_ALT = -1001 # Crazy Boy (Bot)
+# --------- BOT IDs ---------
+BOT_USER_ID = -1000
+BOT_USER_ID_ALT = -1001
 
 # -------------------------
 # Helpers
@@ -83,7 +83,6 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int, num_players:
 # Redis state helpers
 # -------------------------
 async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datetime] = None):
-    """Persist state to Redis and publish."""
     num_players = 3 if m.p3_user_id else 2
     payload = {
         "ready": m.status == MatchStatus.ACTIVE
@@ -155,7 +154,6 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     if _utcnow() - last_ts < timedelta(seconds=timeout_secs):
         return
 
-    # Autoroll
     roll = random.randint(1, 6)
     positions = st.get("positions", [0] * num_players)
     curr = st.get("current_turn", 0)
@@ -182,13 +180,22 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 
 
 # -------------------------
-# Create or wait for match
+# Request bodies
 # -------------------------
 class CreateIn(BaseModel):
-    stake_amount: conint(ge=0) # 0 = free play
+    stake_amount: conint(ge=0)
     num_players: conint(ge=2, le=3) = Field(default=2, description="2 or 3 players")
 
+class RollIn(BaseModel):
+    match_id: int
 
+class ForfeitIn(BaseModel): # ✅ FIXED missing model
+    match_id: int
+
+
+# -------------------------
+# Create or wait for match
+# -------------------------
 @router.post("/create")
 async def create_or_wait_match(
     payload: CreateIn,
@@ -365,10 +372,6 @@ async def check_match_ready(
 # -------------------------
 # Roll Dice
 # -------------------------
-class RollIn(BaseModel):
-    match_id: int
-
-
 @router.post("/roll")
 async def roll_dice(
     payload: RollIn,
@@ -444,38 +447,23 @@ async def forfeit_match(
     if expected_players == 3:
         players.append(m.p3_user_id)
 
-    # Must be in match
     if current_user.id not in players:
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = players.index(current_user.id)
 
-    # Winner = first other player still present
     winner_idx = None
     for i, uid in enumerate(players):
         if i != loser_idx and uid is not None:
             winner_idx = i
             break
 
-    if winner_idx is None:
-        # no one else in match → just finish
-        m.status = MatchStatus.FINISHED
-        db.commit()
-        return {"ok": True, "message": "Match ended — no opponents left"}
-
-    # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
-    # If paid, distribute prize
-    try:
-        if m.stake_amount > 0:
-            await distribute_prize(db, m, winner_idx)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
+    if winner_idx is not None and m.stake_amount > 0:
+        await distribute_prize(db, m, winner_idx)
 
-    # Commit + cleanup
     try:
         db.commit()
         db.refresh(m)
@@ -491,13 +479,12 @@ async def forfeit_match(
         "forfeit": True,
         "loser": loser_idx,
         "winner": winner_idx,
-        "winner_name": _name_for_id(db, players[winner_idx]),
+        "winner_name": _name_for_id(db, players[winner_idx]) if winner_idx is not None else None,
     }
 
 
-
 # -------------------------
-# Abandon
+# Abandon (for free-play or waiting matches)
 # -------------------------
 @router.post("/abandon")
 async def abandon_match(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -526,7 +513,6 @@ async def abandon_match(db: Session = Depends(get_db), current_user: User = Depe
 @router.websocket("/ws/{match_id}")
 async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Depends(get_current_user_ws)):
     await websocket.accept()
-
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(f"match:{match_id}:events")
 
@@ -578,13 +564,8 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
 
 
 # -------------------------
-# Finish Match
+# Finish Match (manual override)
 # -------------------------
-class FinishIn(BaseModel):
-    match_id: int
-    winner: Optional[int] = None
-
-
 @router.post("/finish")
 async def finish_match(payload: FinishIn, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
@@ -641,60 +622,3 @@ async def _cleanup_stale_matches():
         finally:
             db.close()
         await asyncio.sleep(30)
-
-
-
-@router.post("/giveup")
-async def giveup_match(
-    payload: ForfeitIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> Dict:
-    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
-    if not m:
-        raise HTTPException(status_code=404, detail="Match not found")
-
-    expected_players = m.num_players or 2
-    players = [m.p1_user_id, m.p2_user_id]
-    if expected_players == 3:
-        players.append(m.p3_user_id)
-
-    if current_user.id not in players:
-        raise HTTPException(status_code=403, detail="Not your match")
-
-    loser_idx = players.index(current_user.id)
-
-    # -------- Free Play (stake = 0) --------
-    if m.stake_amount == 0:
-        m.status = MatchStatus.FINISHED
-        db.delete(m) # optional: or just mark finished
-        db.commit()
-        await _clear_state(m.id)
-        return {
-            "ok": True,
-            "message": "Free play abandoned",
-            "winner": "🤖 Bot",
-            "forfeit": True,
-        }
-
-    # -------- Paid Match --------
-    winner_idx = (loser_idx + 1) % expected_players
-    m.status = MatchStatus.FINISHED
-    m.finished_at = _utcnow()
-
-    try:
-        await distribute_prize(db, m, winner_idx)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
-
-    db.commit()
-    await _clear_state(m.id)
-
-    return {
-        "ok": True,
-        "match_id": m.id,
-        "winner": winner_idx,
-        "winner_name": _name_for_id(db, players[winner_idx]),
-        "forfeit": True,
-    }

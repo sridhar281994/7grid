@@ -421,25 +421,20 @@ async def check_match_ready(
     if m.status == MatchStatus.ACTIVE:
         await _auto_advance_if_needed(m, db)
 
+    # Use configured player-count (defaults to 2 if column not set)
     expected_players = m.num_players or 2
+
+    # Build player list
     players = [m.p1_user_id, m.p2_user_id]
     if expected_players == 3:
         players.append(m.p3_user_id)
     present_players = [pid for pid in players if pid is not None]
 
-    # Read cached/ephemeral state
+    # Read ephemeral state
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
-    # ✅ Calculate waiting_time (seconds since created)
-    waiting_time = None
-    if hasattr(m, "created_at") and m.created_at:
-        from datetime import datetime, timezone
-        waiting_time = int((datetime.now(timezone.utc) - m.created_at).total_seconds())
-    else:
-        waiting_time = 0
-
-    # Optional prize info (informational only)
+    # Prize info (optional)
     prize_info = None
     if winner_idx is not None:
         if expected_players == 2:
@@ -457,13 +452,17 @@ async def check_match_ready(
                 "rule": "3-player",
             }
 
+    # ✅ Fix: free play never auto-ready, let frontend popup decide
+    ready_flag = (
+        m.status == MatchStatus.ACTIVE
+        and m.stake_amount > 0 # 👈 Only mark ready for paid matches
+        and m.p1_user_id is not None
+        and m.p2_user_id is not None
+        and (expected_players == 2 or m.p3_user_id is not None)
+    )
+
     return {
-        "ready": (
-            m.status == MatchStatus.ACTIVE
-            and m.p1_user_id is not None
-            and m.p2_user_id is not None
-            and (expected_players == 2 or m.p3_user_id is not None)
-        ),
+        "ready": ready_flag,
         "finished": m.status == MatchStatus.FINISHED,
         "match_id": m.id,
         "status": _status_value(m),
@@ -477,9 +476,7 @@ async def check_match_ready(
         "positions": st.get("positions", [0] * expected_players),
         "winner": winner_idx,
         "prize_info": prize_info,
-        "waiting_time": waiting_time, # 👈 added here
     }
-
 
 # -------------------------
 # Roll Dice
@@ -644,7 +641,7 @@ async def forfeit_match(
 
 
 # -------------------------
-# Abandon match (do not auto-fill free play)
+# Abandon match (delete free play immediately)
 # -------------------------
 @router.post("/abandon")
 async def abandon_match(
@@ -663,20 +660,21 @@ async def abandon_match(
     if not m:
         return {"ok": True, "message": "No active matches"}
 
-    # If free play still WAITING, just delete it (no bots forced here)
+    # ✅ Free play still waiting → delete right away
     if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
         db.delete(m)
         db.commit()
         return {"ok": True, "message": "Free play abandoned"}
 
-    # Otherwise mark as finished
+    # ✅ Paid matches or active ones → mark finished
     m.status = MatchStatus.FINISHED
     db.commit()
     return {"ok": True, "message": "Match abandoned"}
 
 
+
 # -------------------------
-# WebSocket endpoint (no bot auto-fill, free play safeguard)
+# WebSocket endpoint (no bot auto-fill, no auto-ready for free play)
 # -------------------------
 @router.websocket("/ws/{match_id}")
 async def match_ws(
@@ -719,32 +717,10 @@ async def match_ws(
                         await websocket.send_text(json.dumps({"error": "Match not found"}))
                         break
 
-                    expected_players = m.num_players or 2
-
-                    # 🚫 Free play safeguard: never send "ready": True until frontend chooses bots
-                    if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
-                        snapshot = {
-                            "ready": False,
-                            "finished": False,
-                            "match_id": m.id,
-                            "status": _status_value(m),
-                            "stake": 0,
-                            "p1": _name_for_id(db, m.p1_user_id),
-                            "p2": None,
-                            "p3": None,
-                            "last_roll": None,
-                            "turn": 0,
-                            "positions": [0] * expected_players,
-                            "winner": None,
-                            "num_players": expected_players,
-                        }
-                        await websocket.send_text(json.dumps(snapshot))
-                        await asyncio.sleep(0.3)
-                        continue
-
                     if m.status == MatchStatus.ACTIVE:
                         await _auto_advance_if_needed(m, db)
 
+                    expected_players = m.num_players or 2
                     st = await _read_state(match_id) or {
                         "positions": [0] * expected_players,
                         "current_turn": m.current_turn or 0,
@@ -752,13 +728,17 @@ async def match_ws(
                         "winner": None,
                     }
 
+                    # ✅ only mark ready for PAID matches
+                    ready_flag = (
+                        m.status == MatchStatus.ACTIVE
+                        and m.stake_amount > 0
+                        and m.p1_user_id is not None
+                        and m.p2_user_id is not None
+                        and (expected_players == 2 or m.p3_user_id is not None)
+                    )
+
                     snapshot = {
-                        "ready": (
-                            m.status == MatchStatus.ACTIVE
-                            and m.p1_user_id is not None
-                            and m.p2_user_id is not None
-                            and (expected_players == 2 or m.p3_user_id is not None)
-                        ),
+                        "ready": ready_flag,
                         "finished": m.status == MatchStatus.FINISHED,
                         "match_id": m.id,
                         "status": _status_value(m),

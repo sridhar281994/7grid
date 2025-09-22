@@ -417,24 +417,38 @@ async def check_match_ready(
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    # If active, keep the game moving (timeouts etc.)
+    expected_players = m.num_players or 2
+
+    # 🚫 Free play safeguard: never mark as ready until frontend decides
+    if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
+        return {
+            "ready": False,
+            "finished": False,
+            "match_id": m.id,
+            "status": _status_value(m),
+            "stake": 0,
+            "num_players": expected_players,
+            "p1": _name_for_id(db, m.p1_user_id),
+            "p2": None,
+            "p3": None,
+            "last_roll": None,
+            "turn": 0,
+            "positions": [0] * expected_players,
+            "winner": None,
+            "prize_info": None,
+        }
+
+    # Normal path for active matches
     if m.status == MatchStatus.ACTIVE:
         await _auto_advance_if_needed(m, db)
 
-    # Use configured player-count (defaults to 2 if column not set)
-    expected_players = m.num_players or 2
-
-    # Build player list without mutating match
     players = [m.p1_user_id, m.p2_user_id]
     if expected_players == 3:
         players.append(m.p3_user_id)
-    present_players = [pid for pid in players if pid is not None]
 
-    # Read cached/ephemeral state
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
-    # Optional prize info (informational only)
     prize_info = None
     if winner_idx is not None:
         if expected_players == 2:
@@ -670,7 +684,7 @@ async def abandon_match(
 
 
 # -------------------------
-# WebSocket endpoint (no bot auto-fill)
+# WebSocket endpoint (no bot auto-fill, free play safeguard)
 # -------------------------
 @router.websocket("/ws/{match_id}")
 async def match_ws(
@@ -713,10 +727,32 @@ async def match_ws(
                         await websocket.send_text(json.dumps({"error": "Match not found"}))
                         break
 
+                    expected_players = m.num_players or 2
+
+                    # 🚫 Free play safeguard: never send "ready": True until frontend chooses bots
+                    if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
+                        snapshot = {
+                            "ready": False,
+                            "finished": False,
+                            "match_id": m.id,
+                            "status": _status_value(m),
+                            "stake": 0,
+                            "p1": _name_for_id(db, m.p1_user_id),
+                            "p2": None,
+                            "p3": None,
+                            "last_roll": None,
+                            "turn": 0,
+                            "positions": [0] * expected_players,
+                            "winner": None,
+                            "num_players": expected_players,
+                        }
+                        await websocket.send_text(json.dumps(snapshot))
+                        await asyncio.sleep(0.3)
+                        continue
+
                     if m.status == MatchStatus.ACTIVE:
                         await _auto_advance_if_needed(m, db)
 
-                    expected_players = m.num_players or 2
                     st = await _read_state(match_id) or {
                         "positions": [0] * expected_players,
                         "current_turn": m.current_turn or 0,

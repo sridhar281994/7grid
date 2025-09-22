@@ -11,11 +11,16 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from pydantic import BaseModel, conint, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+import asyncio, json, random, time
 
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 from routers.wallet_utils import distribute_prize, refund_stake
+from deps import get_db, get_current_user, get_current_user_ws
+from utils.redis_client import _get_redis
+from utils.state import _read_state, _write_state, _status_value
+from utils.turns import _auto_advance_if_needed
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -241,15 +246,9 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 # -------------------------
 # Create or wait for match
 # -------------------------
-from pydantic import BaseModel, conint, Field
-
-# ✅ Bot IDs kept for paid/bot modes if you ever need them later
-BOT_USER_ID = -1000 # Sharp (Bot)
-BOT_USER_ID2 = -1001 # Crazy Boy (Bot)
-
 class CreateIn(BaseModel):
     stake_amount: conint(ge=0) # 0 = free play
-    num_players: conint(ge=2, le=3) = Field(default=2, description="2-player or 3-player mode")
+    num_players: conint(ge=2, le=3) = Field(default=2, description="2 or 3 players")
 
 
 @router.post("/create")
@@ -263,23 +262,23 @@ async def create_or_wait_match(
         num_players = int(payload.num_players or 2)
         entry_fee = stake_amount // num_players if stake_amount > 0 else 0
 
-        # -------- Free Play (NO server-side bots; front end decides after 10s) --------
+        # -------- Free Play (NO server-side bots; front end decides after 12s) --------
         if stake_amount == 0:
             new_match = GameMatch(
                 stake_amount=0,
-                status=MatchStatus.WAITING, # 👈 keep waiting; don't start yet
+                status=MatchStatus.WAITING, # keep WAITING; do not mark ACTIVE
                 p1_user_id=current_user.id,
                 p2_user_id=None,
-                p3_user_id=None if num_players == 3 else None,
+                p3_user_id=None,
                 last_roll=None,
-                current_turn=0, # any seed is fine
+                current_turn=0, # seed
                 num_players=num_players,
+                created_ts=int(time.time()), # for waiting_time calculation (int column recommended)
             )
             db.add(new_match)
             db.commit()
             db.refresh(new_match)
 
-            # initialize ephemeral state
             await _write_state(
                 new_match,
                 {
@@ -297,18 +296,17 @@ async def create_or_wait_match(
                 "stake": 0,
                 "num_players": num_players,
                 "p1": _name_for_id(db, new_match.p1_user_id),
-                "p2": None, # 👈 don't expose bots here
+                "p2": None, # do not fill with bots here
                 "p3": None,
                 "turn": new_match.current_turn or 0,
             }
 
         # -------- Paid Matches --------
-        # balance check + deduction happens here
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
+
         current_user.wallet_balance -= entry_fee
 
-        # Try to join a waiting match with same config
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -371,6 +369,7 @@ async def create_or_wait_match(
             num_players=num_players,
             last_roll=None,
             current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
+            created_ts=int(time.time()),
         )
         db.add(new_match)
         db.commit()
@@ -403,6 +402,15 @@ async def create_or_wait_match(
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 
+def _name_for_id(db: Session, uid):
+    if uid is None:
+        return None
+    if uid < 0:
+        # If you later add bots again, handle bot names here.
+        return None
+    u = db.query(User).filter(User.id == uid).first()
+    return u.name if u else None
+
 
 # -------------------------
 # Poll match readiness / state
@@ -421,20 +429,15 @@ async def check_match_ready(
     if m.status == MatchStatus.ACTIVE:
         await _auto_advance_if_needed(m, db)
 
-    # Use configured player-count (defaults to 2 if column not set)
     expected_players = m.num_players or 2
 
-    # Build player list
-    players = [m.p1_user_id, m.p2_user_id]
-    if expected_players == 3:
-        players.append(m.p3_user_id)
-    present_players = [pid for pid in players if pid is not None]
+    # Waiting time (for popup timing on frontend)
+    now = int(time.time())
+    waiting_time = max(0, now - (m.created_ts or now))
 
-    # Read ephemeral state
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
-    # Prize info (optional)
     prize_info = None
     if winner_idx is not None:
         if expected_players == 2:
@@ -452,10 +455,9 @@ async def check_match_ready(
                 "rule": "3-player",
             }
 
-    # ✅ Fix: free play never auto-ready, let frontend popup decide
+    # ✅ READY only when ACTIVE and all seats filled
     ready_flag = (
         m.status == MatchStatus.ACTIVE
-        and m.stake_amount > 0 # 👈 Only mark ready for paid matches
         and m.p1_user_id is not None
         and m.p2_user_id is not None
         and (expected_players == 2 or m.p3_user_id is not None)
@@ -476,6 +478,7 @@ async def check_match_ready(
         "positions": st.get("positions", [0] * expected_players),
         "winner": winner_idx,
         "prize_info": prize_info,
+        "waiting_time": waiting_time, # <-- frontend uses this to time popup
     }
 
 # -------------------------
@@ -641,7 +644,7 @@ async def forfeit_match(
 
 
 # -------------------------
-# Abandon match (delete free play immediately)
+# Abandon match (no auto-fill)
 # -------------------------
 @router.post("/abandon")
 async def abandon_match(
@@ -660,21 +663,18 @@ async def abandon_match(
     if not m:
         return {"ok": True, "message": "No active matches"}
 
-    # ✅ Free play still waiting → delete right away
     if m.stake_amount == 0 and m.status == MatchStatus.WAITING:
         db.delete(m)
         db.commit()
         return {"ok": True, "message": "Free play abandoned"}
 
-    # ✅ Paid matches or active ones → mark finished
     m.status = MatchStatus.FINISHED
     db.commit()
     return {"ok": True, "message": "Match abandoned"}
 
 
-
 # -------------------------
-# WebSocket endpoint (no bot auto-fill, no auto-ready for free play)
+# WebSocket endpoint (no bot auto-fill)
 # -------------------------
 @router.websocket("/ws/{match_id}")
 async def match_ws(
@@ -728,10 +728,8 @@ async def match_ws(
                         "winner": None,
                     }
 
-                    # ✅ only mark ready for PAID matches
                     ready_flag = (
                         m.status == MatchStatus.ACTIVE
-                        and m.stake_amount > 0
                         and m.p1_user_id is not None
                         and m.p2_user_id is not None
                         and (expected_players == 2 or m.p3_user_id is not None)
@@ -751,6 +749,7 @@ async def match_ws(
                         "positions": st.get("positions", [0] * expected_players),
                         "winner": st.get("winner"),
                         "num_players": expected_players,
+                        "waiting_time": max(0, int(time.time()) - (m.created_ts or int(time.time()))),
                     }
                     await websocket.send_text(json.dumps(snapshot))
                 finally:

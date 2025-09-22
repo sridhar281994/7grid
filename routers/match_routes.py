@@ -30,6 +30,20 @@ BOT_USER_ID = -1000
 BOT_USER_ID_ALT = -1001
 
 # -------------------------
+# Pydantic Schemas
+# -------------------------
+class CreateIn(BaseModel):
+    stake_amount: conint(ge=0)  # 0 = free play
+    num_players: conint(ge=2, le=3) = Field(default=2, description="2 or 3 players")
+class RollIn(BaseModel):
+    match_id: int
+class ForfeitIn(BaseModel):
+    match_id: int
+class FinishIn(BaseModel):
+    match_id: int
+    winner: Optional[int] = None
+
+# -------------------------
 # Helpers
 # -------------------------
 def _utcnow() -> datetime:

@@ -17,8 +17,7 @@ from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 from routers.wallet_utils import distribute_prize, refund_stake
-from utils.state import _read_state, _write_state, _status_value
-from utils.turns import _auto_advance_if_needed
+
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])

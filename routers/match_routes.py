@@ -425,47 +425,75 @@ async def roll_dice(
 
 
 # -------------------------
-# Forfeit
+# Forfeit / Give Up
 # -------------------------
-class ForfeitIn(BaseModel):
-    match_id: int
-
-
 @router.post("/forfeit")
 async def forfeit_match(
     payload: ForfeitIn,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-):
+) -> Dict:
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    expected_players = m.num_players or 2
     players = [m.p1_user_id, m.p2_user_id]
-    if m.num_players == 3:
+    if expected_players == 3:
         players.append(m.p3_user_id)
 
+    # Must be in match
     if current_user.id not in players:
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = players.index(current_user.id)
-    winner_idx = (loser_idx + 1) % len(players)
 
+    # Winner = first other player still present
+    winner_idx = None
+    for i, uid in enumerate(players):
+        if i != loser_idx and uid is not None:
+            winner_idx = i
+            break
+
+    if winner_idx is None:
+        # no one else in match → just finish
+        m.status = MatchStatus.FINISHED
+        db.commit()
+        return {"ok": True, "message": "Match ended — no opponents left"}
+
+    # Mark finished
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
+    # If paid, distribute prize
     try:
-        await distribute_prize(db, m, winner_idx)
-        db.commit()
+        if m.stake_amount > 0:
+            await distribute_prize(db, m, winner_idx)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
 
+    # Commit + cleanup
+    try:
+        db.commit()
+        db.refresh(m)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
     await _clear_state(m.id)
 
-    return {"ok": True, "match_id": m.id, "winner": winner_idx, "forfeit": True}
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "forfeit": True,
+        "loser": loser_idx,
+        "winner": winner_idx,
+        "winner_name": _name_for_id(db, players[winner_idx]),
+    }
+
 
 
 # -------------------------
@@ -613,3 +641,60 @@ async def _cleanup_stale_matches():
         finally:
             db.close()
         await asyncio.sleep(30)
+
+
+
+@router.post("/giveup")
+async def giveup_match(
+    payload: ForfeitIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    expected_players = m.num_players or 2
+    players = [m.p1_user_id, m.p2_user_id]
+    if expected_players == 3:
+        players.append(m.p3_user_id)
+
+    if current_user.id not in players:
+        raise HTTPException(status_code=403, detail="Not your match")
+
+    loser_idx = players.index(current_user.id)
+
+    # -------- Free Play (stake = 0) --------
+    if m.stake_amount == 0:
+        m.status = MatchStatus.FINISHED
+        db.delete(m) # optional: or just mark finished
+        db.commit()
+        await _clear_state(m.id)
+        return {
+            "ok": True,
+            "message": "Free play abandoned",
+            "winner": "🤖 Bot",
+            "forfeit": True,
+        }
+
+    # -------- Paid Match --------
+    winner_idx = (loser_idx + 1) % expected_players
+    m.status = MatchStatus.FINISHED
+    m.finished_at = _utcnow()
+
+    try:
+        await distribute_prize(db, m, winner_idx)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
+
+    db.commit()
+    await _clear_state(m.id)
+
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "winner": winner_idx,
+        "winner_name": _name_for_id(db, players[winner_idx]),
+        "forfeit": True,
+    }

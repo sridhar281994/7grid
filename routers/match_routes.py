@@ -17,7 +17,9 @@ from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 from routers.wallet_utils import distribute_prize, refund_stake
-
+from utils.redis_client import _get_redis
+from utils.state import _read_state, _write_state, _status_value
+from utils.turns import _auto_advance_if_needed
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -44,7 +46,7 @@ BOT_USER_ID_ALT = -1001 # Crazy Boy (Bot)
 class CreateIn(BaseModel):
     stake_amount: conint(ge=0) # 0 = free play
     num_players: conint(ge=2, le=3) = 2 # allow 2-player or 3-player
-    
+   
 
 async def _get_redis():
     """Lazy connect to Redis."""

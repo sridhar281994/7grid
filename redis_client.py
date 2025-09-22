@@ -8,9 +8,3 @@ import redis.asyncio as redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 # Single shared Redis connection
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-async def _get_redis():
-    """
-    Compatibility helper for code that imports `_get_redis`.
-    Returns the shared Redis client.
-    """
-    return redis_client

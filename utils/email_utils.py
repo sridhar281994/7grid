@@ -1,59 +1,33 @@
 import os
 import smtplib
 from email.message import EmailMessage
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))  # Zoho SSL
+SMTP_USER = os.getenv("SMTP_USER", "info@srtech.co.in")
+SMTP_PASS = os.getenv("SMTP_PASS", "")  # 12-char app password
 EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
-
-
 def send_email(to_email: str, subject: str, body_text: str) -> None:
-    """Send a plain-text email via SMTP (TLS for 587, SSL for 465)."""
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and EMAIL_FROM):
-        raise RuntimeError("SMTP env vars not configured (SMTP_HOST/PORT/USER/PASS/EMAIL_FROM).")
-
+        raise RuntimeError("SMTP env vars not configured.")
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = to_email
     msg.set_content(body_text)
-
-    if SMTP_PORT == 465:
-        # SSL (Zoho)
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-    else:
-        # STARTTLS (Gmail 587 or Zoho 587)
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-
-
+    # :white_check_mark: SSL instead of STARTTLS
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+    print(f"[INFO] Sent mail to {to_email}")
 def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
     subject = "Your One-Time Password (OTP)"
     body = (
         f"Hello,\n\n"
         f"Your login OTP is: {otp}\n\n"
-        f"This code is valid for {minutes_valid} minute(s). "
+        f"This code is valid for {minutes_valid} minute(s).\n"
         f"Do not share it with anyone.\n\n"
         f"Thanks,\nSRTech"
     )
     send_email(to_email, subject, body)
 
 
-def mask_email(e: str) -> str:
-    """Mask user email for safe logs (e.g., j****e@gmail.com)."""
-    try:
-        local, domain = e.split("@", 1)
-        if len(local) <= 2:
-            masked_local = local[0] + "*"
-        else:
-            masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
-        return f"{masked_local}@{domain}"
-    except Exception:
-        return "***"

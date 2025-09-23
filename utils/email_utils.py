@@ -1,25 +1,39 @@
 import os
 import smtplib
 from email.message import EmailMessage
+
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")          # your Gmail address
-SMTP_PASS = os.getenv("SMTP_PASS", "")          # Gmail App Password (not your login)
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER) # e.g., "SRTech <you@gmail.com>"
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
+
+
 def send_email(to_email: str, subject: str, body_text: str) -> None:
-    """Send a plain-text email via Gmail SMTP (TLS)."""
+    """Send a plain-text email via SMTP (TLS for 587, SSL for 465)."""
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and EMAIL_FROM):
         raise RuntimeError("SMTP env vars not configured (SMTP_HOST/PORT/USER/PASS/EMAIL_FROM).")
+
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = to_email
     msg.set_content(body_text)
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-        s.ehlo()
-        s.starttls()
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
+
+    if SMTP_PORT == 465:
+        # SSL (Zoho)
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+    else:
+        # STARTTLS (Gmail 587 or Zoho 587)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+
+
 def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
     subject = "Your One-Time Password (OTP)"
     body = (
@@ -30,8 +44,10 @@ def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
         f"Thanks,\nSRTech"
     )
     send_email(to_email, subject, body)
+
+
 def mask_email(e: str) -> str:
-    """Optional helper: mask user email for safe UI logs (e.g., j****e@gmail.com)."""
+    """Mask user email for safe logs (e.g., j****e@gmail.com)."""
     try:
         local, domain = e.split("@", 1)
         if len(local) <= 2:

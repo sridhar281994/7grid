@@ -1,47 +1,35 @@
 import os
-import smtplib
-import ssl
-from email.message import EmailMessage
-# -------------------------
-# SMTP Config from Environment
-# -------------------------
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")   # smtp.zoho.in for Zoho
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))         # 587 (TLS) or 465 (SSL)
-SMTP_USER = os.getenv("SMTP_USER", "")                 # your email address
-SMTP_PASS = os.getenv("SMTP_PASS", "")                 # app password
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)        # "SRTech <you@domain.com>"
-# -------------------------
-# Core Email Sender
-# -------------------------
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+
+# Load from environment
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "no-reply@srtech.co.in") # Use your verified sender/domain
+
+
 def send_email(to_email: str, subject: str, body_text: str) -> None:
-    """Send a plain-text email via SMTP (handles TLS on 587 or SSL on 465)."""
-    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and EMAIL_FROM):
-        raise RuntimeError("SMTP env vars not configured (SMTP_HOST/PORT/USER/PASS/EMAIL_FROM).")
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = to_email
-    msg.set_content(body_text)
+    """Send plain text email using SendGrid API."""
+    if not (SENDGRID_API_KEY and EMAIL_FROM):
+        raise RuntimeError("SendGrid env vars not configured (SENDGRID_API_KEY / EMAIL_FROM).")
+
+    message = Mail(
+        from_email=EMAIL_FROM,
+        to_emails=to_email,
+        subject=subject,
+        plain_text_content=body_text
+    )
+
     try:
-        if SMTP_PORT == 465:
-            # SSL mode (Zoho, some providers)
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=15) as s:
-                s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
-        else:
-            # TLS mode (Gmail, Zoho TLS on 587)
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo()
-                s.starttls(context=ssl.create_default_context())
-                s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"[INFO] Email sent to {to_email} | Status: {response.status_code}")
     except Exception as e:
-        raise RuntimeError(f"Failed to send email: {e}")
-# -------------------------
-# OTP Helper
-# -------------------------
+        print(f"[ERROR] Failed to send email: {e}")
+        raise
+
+
 def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
+    """Send OTP via email."""
     subject = "Your One-Time Password (OTP)"
     body = (
         f"Hello,\n\n"
@@ -51,11 +39,10 @@ def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
         f"Thanks,\nSRTech"
     )
     send_email(to_email, subject, body)
-# -------------------------
-# Mask Email for Logs
-# -------------------------
+
+
 def mask_email(e: str) -> str:
-    """Mask an email for safe UI logs (e.g., j****e@domain.com)."""
+    """Mask email for safe logs (e.g., j****e@gmail.com)."""
     try:
         local, domain = e.split("@", 1)
         if len(local) <= 2:
@@ -65,8 +52,3 @@ def mask_email(e: str) -> str:
         return f"{masked_local}@{domain}"
     except Exception:
         return "***"
-
-
-
-
-

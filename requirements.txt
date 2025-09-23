@@ -12,4 +12,4 @@ passlib[bcrypt]
 websockets==12.0
 redis>=5.0
 setuptools
-
+sendgrid==6.11.0

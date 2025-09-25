@@ -39,7 +39,7 @@ class UserUpdate(BaseModel):
 BOT_PROFILES = [
     {
         "id": -1000,
-        "name": "Sharp (Bot)",
+        "name": "Sharp",
         "wallet_balance": 0,
         "description": "AI Opponent",
         "email": None,
@@ -49,7 +49,7 @@ BOT_PROFILES = [
     },
     {
         "id": -1001,
-        "name": "Crazy Boy (Bot)",
+        "name": "Crazy Boy",
         "wallet_balance": 0,
         "description": "AI Opponent",
         "email": None,
@@ -59,7 +59,7 @@ BOT_PROFILES = [
     },
     {
         "id": -1002,
-        "name": "SRTech Bot",
+        "name": "Kurfi",
         "wallet_balance": 0,
         "description": "AI Opponent",
         "email": None,

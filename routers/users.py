@@ -65,7 +65,7 @@ BOT_PROFILES = [
         "email": None,
         "upi_id": None,
         "created_at": None,
-        "profile_image": "assets/bot_generic.png",
+        "profile_image": "assets/bot_kurfi.png",
     },
 ]
 

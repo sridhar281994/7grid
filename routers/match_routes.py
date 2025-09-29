@@ -73,24 +73,49 @@ def _status_value(m: GameMatch) -> str:
 
 
 def _apply_roll(positions: list[int], current_turn: int, roll: int, num_players: int = 2):
-    """Apply dice roll to board state with danger and exact win condition."""
+    """
+    Apply dice roll to board state with updated rules:
+    - Roll of 1 always sends player back to start (0).
+    - Landing on danger box (3) sends player back to start (0).
+    - If landing on an occupied box, opponent is sent back to start (0).
+    - Must land exactly on 7 to win.
+    - Overshoot (>7) means player stays in place.
+    """
     p = current_turn
     old = positions[p]
     new_pos = old + roll
     winner = None
 
-    if new_pos == 3: # danger zone
+    # --- Rule 1: roll = 1 → reset to start ---
+    if roll == 1:
         positions[p] = 0
-    elif new_pos == 7: # exact win
+
+    # --- Rule 2: danger zone at 3 ---
+    elif new_pos == 3:
+        positions[p] = 0
+
+    # --- Rule 3: exact win at 7 ---
+    elif new_pos == 7:
         positions[p] = 7
         winner = p
-    elif new_pos > 7: # overshoot → stay
+
+    # --- Rule 4: overshoot ---
+    elif new_pos > 7:
         positions[p] = old
+
+    # --- Rule 5: normal move ---
     else:
         positions[p] = new_pos
 
+        # Check if landed on another player → send them back to start
+        for i in range(num_players):
+            if i != p and positions[i] == positions[p]:
+                positions[i] = 0
+
+    # --- Next turn ---
     next_turn = (p + 1) % num_players if winner is None else p
     return positions, next_turn, winner
+
 
 
 # -------------------------

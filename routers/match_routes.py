@@ -87,12 +87,18 @@ def _apply_roll(
     4. Overshoot → stay
     5. Normal forward otherwise
     Includes reverse flag for frontend animation.
+    Ensures roll=1 is forced on 6th–8th turn if not yet rolled.
     """
     p = current_turn
     old = positions[p]
     new_pos = old + roll
     winner = None
     reverse = False
+
+    # --- Force "1" at least once during turns 6–8 ---
+    if turn_count in (6, 7, 8) and roll != 1:
+        roll = 1
+        new_pos = old + roll
 
     # --- Rule 1: Roll=1 at start (stay at 0th) ---
     if roll == 1 and old == 0:
@@ -119,6 +125,7 @@ def _apply_roll(
     # --- Rule 5: Normal move ---
     positions[p] = new_pos
     return positions, (p + 1) % num_players, None, {"reverse": False}
+
 
 
 
@@ -443,9 +450,11 @@ async def roll_dice(
     roll = random.randint(1, 6)
 
     # load current board state
-    st = await _read_state(m.id) or {"positions": [0] * expected_players}
+    st = await _read_state(m.id) or {"positions": [0] * expected_players, "turn_count": 0}
+    turn_count = st.get("turn_count", 0) + 1
+
     positions, next_turn, winner, extra = _apply_roll(
-        st["positions"], curr, roll, expected_players
+        st["positions"], curr, roll, expected_players, turn_count
     )
 
     m.last_roll = roll
@@ -470,6 +479,7 @@ async def roll_dice(
             "last_roll": roll,
             "winner": winner,
             "reverse": extra.get("reverse", False),
+            "turn_count": turn_count,
         },
     )
 
@@ -481,6 +491,7 @@ async def roll_dice(
         "positions": positions,
         "winner": winner,
         "reverse": extra.get("reverse", False), # ✅ frontend uses this for animation
+        "turn_count": turn_count,
     }
 
 

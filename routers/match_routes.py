@@ -74,39 +74,44 @@ def _status_value(m: GameMatch) -> str:
 
 def _apply_roll(positions: list[int], current_turn: int, roll: int, num_players: int = 2):
     """
-    Apply dice roll to board state with updated rules:
-    - Roll of 1 always sends player back to start (0).
-    - Landing on danger box (3) sends player back to start (0).
-    - Must land exactly on 7 to win.
-    - Overshoot (>7) means player stays in place.
+    Apply dice roll to board state with entry gate, danger, and exact win condition.
+
+    Rules:
+    - A player must roll 1 to enter the board (move to box 1).
+    - Landing on box 3 (danger) bounces back to 0.
+    - Landing exactly on 7 wins the game.
+    - Overshoot (>7) means no movement.
     """
     p = current_turn
     old = positions[p]
-    new_pos = old + roll
     winner = None
 
-    # --- Rule 1: roll = 1 → reset to start ---
-    if roll == 1:
+    # --- entry gate ---
+    if old == 0 and all(pos != 0 for i, pos in enumerate(positions) if i == p or pos != 0) and roll != 1:
+        # still off the board and didn't roll a 1 → stay at 0
         positions[p] = 0
+        next_turn = (p + 1) % num_players
+        return positions, next_turn, None
 
-    # --- Rule 2: danger zone at 3 ---
-    elif new_pos == 3:
-        positions[p] = 0
+    if old == 0 and roll == 1:
+        # first time entry
+        positions[p] = 1
+        next_turn = (p + 1) % num_players
+        return positions, next_turn, None
 
-    # --- Rule 3: exact win at 7 ---
+    # --- normal progression ---
+    new_pos = old + roll
+
+    if new_pos == 3:
+        positions[p] = 0 # bounce back
     elif new_pos == 7:
         positions[p] = 7
         winner = p
-
-    # --- Rule 4: overshoot ---
     elif new_pos > 7:
-        positions[p] = old
-
-    # --- Rule 5: normal move ---
+        positions[p] = old # stay
     else:
         positions[p] = new_pos
 
-    # --- Next turn ---
     next_turn = (p + 1) % num_players if winner is None else p
     return positions, next_turn, winner
 
@@ -429,15 +434,22 @@ async def roll_dice(
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
+    # 🎲 roll the dice
     roll = random.randint(1, 6)
-    st = await _read_state(m.id) or {"positions": [0] * expected_players}
-    positions, next_turn, winner = _apply_roll(st["positions"], curr, roll, expected_players)
 
+    # 🔄 load state
+    st = await _read_state(m.id) or {"positions": [0] * expected_players}
+    positions, next_turn, winner = _apply_roll(
+        st["positions"], curr, roll, expected_players
+    )
+
+    # update match object
     m.last_roll = roll
     m.current_turn = next_turn
 
     if winner is not None:
         m.status = MatchStatus.FINISHED
+        m.finished_at = _utcnow()
         await _clear_state(m.id)
 
     try:
@@ -447,7 +459,16 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
-    await _write_state(m, {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner})
+    # persist new state
+    await _write_state(
+        m,
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+        },
+    )
 
     return {
         "ok": True,

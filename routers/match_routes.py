@@ -72,94 +72,59 @@ def _status_value(m: GameMatch) -> str:
         return str(m.status)
 
 
-def _apply_roll(positions: list[int], current_turn: int, roll: int, num_players: int = 2):
+def _apply_roll(
+    positions: list[int],
+    current_turn: int,
+    roll: int,
+    num_players: int = 2,
+    turn_count: int = 1
+):
     """
-    Apply dice roll with special rules:
-
-    1) roll == 1 -> reset to 0
-    2) land on 3 -> forward to 3, then bounce back to 0
-    3) exact 7 -> win
-    4) overshoot -> stay
-    6) start rule -> covered by (1): if first roll is 1, stays at 0
-    Otherwise -> normal forward move
-
-    Returns: (positions, next_turn, winner, anim)
-      anim is a dict UI can use:
-        - type: "reset_on_one" | "danger_bounce" | "forward" | "overshoot" | "win"
-        - path: list[int] positions in sequence to animate
-        - extra fields for clarity: {"from": old, "to": new}
+    Apply dice roll with full rules:
+    1. Roll=1 at start → must stay at 0th
+    2. Guaranteed roll=1 on 6th/7th/8th turn (if still at 0)
+    3. Box 3 → forward then reverse to 0
+    4. Exact 7 → win
+    5. Overshoot → stay
+    6. Normal forward otherwise
+    Returns: (positions, next_turn, winner, extra_info)
     """
     p = current_turn
     old = positions[p]
-    winner = None
-    anim = {"type": "forward", "path": [], "from": old, "to": old}
-
-    # --- Rule 1: roll == 1 -> reset to 0 (no extra turn) ---
-    if roll == 1:
-        positions[p] = 0
-        # animate reverse from old down to 0 (if old > 0)
-        path = list(range(old - 1, -1, -1)) if old > 0 else []
-        anim = {
-            "type": "reset_on_one",
-            "path": path, # e.g., [old-1, old-2, ..., 0]
-            "from": old,
-            "to": 0,
-        }
-        next_turn = (p + 1) % num_players
-        return positions, next_turn, winner, anim
-
-    # --- Otherwise: candidate new position ---
     new_pos = old + roll
+    winner = None
+    reverse = False
 
-    # --- Rule 2: land on 3 -> forward then bounce back to 0 ---
+    # --- Force Rule: ensure roll=1 at 6th/7th/8th turn if stuck ---
+    if old == 0 and turn_count in (6, 7, 8):
+        roll = 1
+        new_pos = old + roll
+
+    # --- Rule 1: Roll=1 at start → coin stays at 0th (no free move) ---
+    if roll == 1 and old == 0:
+        positions[p] = 0
+        return positions, (p + 1) % num_players, None, {"reverse": False, "special": "start_one"}
+
+    # --- Rule 2: Land on 3 → reverse to 0 (with animation flag) ---
     if new_pos == 3:
         positions[p] = 0
-        forward_path = list(range(old + 1, 4)) if new_pos > old else [3]
-        back_path = [2, 1, 0]
-        anim = {
-            "type": "danger_bounce",
-            "path": forward_path + back_path, # UI: go to 3, then back to 0
-            "from": old,
-            "to": 0,
-        }
-        next_turn = (p + 1) % num_players
-        return positions, next_turn, winner, anim
+        reverse = True
+        return positions, (p + 1) % num_players, None, {"reverse": True, "from": 3}
 
-    # --- Rule 3: exact 7 -> win ---
+    # --- Rule 3: Exact 7 → win ---
     if new_pos == 7:
         positions[p] = 7
-        anim = {
-            "type": "win",
-            "path": list(range(old + 1, 8)), # walk to 7
-            "from": old,
-            "to": 7,
-        }
         winner = p
-        next_turn = p # winner keeps turn but game ends
-        return positions, next_turn, winner, anim
+        return positions, p, winner, {"reverse": False}
 
-    # --- Rule 4: overshoot -> stay ---
+    # --- Rule 4: Overshoot >7 → stay in place ---
     if new_pos > 7:
         positions[p] = old
-        anim = {
-            "type": "overshoot",
-            "path": [], # UI may shake coin or show 'no move'
-            "from": old,
-            "to": old,
-        }
-        next_turn = (p + 1) % num_players
-        return positions, next_turn, winner, anim
+        return positions, (p + 1) % num_players, None, {"reverse": False}
 
-    # --- Normal forward move ---
+    # --- Rule 5: Normal move ---
     positions[p] = new_pos
-    anim = {
-        "type": "forward",
-        "path": list(range(old + 1, new_pos + 1)),
-        "from": old,
-        "to": new_pos,
-    }
-    next_turn = (p + 1) % num_players
-    return positions, next_turn, winner, anim
+    return positions, (p + 1) % num_players, None, {"reverse": False}
 
 
 # -------------------------
@@ -455,6 +420,8 @@ async def check_match_ready(
 # -------------------------
 # Roll Dice (patched)
 # -------------------------
+_turn_counter = {} # ✅ Track per match turn count
+
 @router.post("/roll")
 async def roll_dice(
     payload: RollIn,
@@ -480,81 +447,67 @@ async def roll_dice(
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
-    # ------------------------
-    # Load state
-    # ------------------------
-    st = await _read_state(m.id) or {"positions": [0] * expected_players}
-    positions = st.get("positions", [0] * expected_players)
-
-    # Track turn count + forced 1 scheduling
-    turn_count = int(st.get("turn_count", 0)) + 1
-    st["turn_count"] = turn_count
-
-    if "force_one_turn" not in st:
-        st["force_one_turn"] = random.choice([6, 7, 8])
-    if "forced_one_applied" not in st:
-        st["forced_one_applied"] = False
-
-    # Dice roll logic
-    if not st["forced_one_applied"] and turn_count == st["force_one_turn"]:
-        roll = 1
-        st["forced_one_applied"] = True
+    # ✅ Track turn count per match
+    if m.id not in _turn_counter:
+        _turn_counter[m.id] = 1
     else:
-        roll = random.randint(2, 6)
+        _turn_counter[m.id] += 1
 
-    # ------------------------
-    # Apply roll
-    # ------------------------
-    def _apply_roll_backend(positions, current_turn, roll, num_players):
-        p = current_turn
-        old = positions[p]
-        new_pos = old + roll
-        winner = None
-        anim = {"player": p, "from": old, "to": old, "type": "stay"}
+    # --- Dice roll ---
+    roll = random.randint(1, 6)
 
-        # Rule 1: start only with 1 → go to 0 (start box, no extra turn)
-        if old == 0 and roll != 1:
-            return positions, (p + 1) % num_players, None, anim
-        if old == 0 and roll == 1:
-            positions[p] = 0
-            anim = {"player": p, "from": old, "to": 0, "type": "start"}
-            return positions, (p + 1) % num_players, None, anim
+    # ✅ Force a "1" on turn 6, 7, or 8
+    if 6 <= _turn_counter[m.id] <= 8:
+        roll = 1
 
-        # Rule 2: danger zone at 3 → move then reverse to 0
-        if new_pos == 3:
-            positions[p] = 0
-            anim = {"player": p, "from": old, "to": 0, "type": "danger"}
-            return positions, (p + 1) % num_players, None, anim
+    # --- Load current board state ---
+    st = await _read_state(m.id) or {"positions": [0] * expected_players}
+    positions = st["positions"]
 
-        # Rule 3: exact 7 = win
-        if new_pos == 7:
-            positions[p] = 7
-            winner = p
-            anim = {"player": p, "from": old, "to": 7, "type": "win"}
-            return positions, p, winner, anim
+    p = curr
+    old = positions[p]
+    new_pos = old + roll
+    winner = None
+    reverse = False
 
-        # Rule 4: overshoot → stay
-        if new_pos > 7:
-            positions[p] = old
-            anim = {"player": p, "from": old, "to": old, "type": "overshoot"}
-            return positions, (p + 1) % num_players, None, anim
+    # --- Rule 1: Roll = 1 at start → stay at 0th
+    if roll == 1 and old == 0:
+        positions[p] = 0
+        next_turn = (p + 1) % expected_players
+        reverse = True
 
-        # Normal forward move
+    # --- Rule 2: Land on 3 → reverse to 0
+    elif new_pos == 3:
+        positions[p] = 0
+        next_turn = (p + 1) % expected_players
+        reverse = True
+
+    # --- Rule 3: Exact 7 → win
+    elif new_pos == 7:
+        positions[p] = 7
+        winner = p
+        next_turn = p # winner keeps turn
+
+    # --- Rule 4: Overshoot beyond 7 → stay
+    elif new_pos > 7:
+        positions[p] = old
+        next_turn = (p + 1) % expected_players
+
+    # --- Rule 5: Normal forward move
+    else:
         positions[p] = new_pos
-        anim = {"player": p, "from": old, "to": new_pos, "type": "move"}
-        return positions, (p + 1) % num_players, None, anim
+        next_turn = (p + 1) % expected_players
 
-    positions, next_turn, winner, anim = _apply_roll_backend(
-        positions, curr, roll, expected_players
-    )
-
-    # Update DB
+    # --- Save to DB ---
     m.last_roll = roll
     m.current_turn = next_turn
 
     if winner is not None:
         m.status = MatchStatus.FINISHED
         await _clear_state(m.id)
+        # ✅ reset turn counter for next match
+        if m.id in _turn_counter:
+            del _turn_counter[m.id]
 
     try:
         db.commit()
@@ -563,18 +516,14 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
-    await _write_state(
-        m,
-        {
-            "positions": positions,
-            "current_turn": m.current_turn,
-            "last_roll": roll,
-            "winner": winner,
-            "turn_count": st["turn_count"],
-            "force_one_turn": st["force_one_turn"],
-            "forced_one_applied": st["forced_one_applied"],
-        },
-    )
+    await _write_state(m, {
+        "positions": positions,
+        "current_turn": m.current_turn,
+        "last_roll": roll,
+        "winner": winner,
+        "reverse": reverse,
+        "turn_count": _turn_counter[m.id],
+    })
 
     return {
         "ok": True,
@@ -583,9 +532,9 @@ async def roll_dice(
         "turn": m.current_turn,
         "positions": positions,
         "winner": winner,
-        "move": anim,
+        "reverse": reverse,
+        "turn_count": _turn_counter[m.id],
     }
-
 
 
 # -------------------------

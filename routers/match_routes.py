@@ -77,7 +77,6 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int, num_players:
     Apply dice roll to board state with updated rules:
     - Roll of 1 always sends player back to start (0).
     - Landing on danger box (3) sends player back to start (0).
-    - If landing on an occupied box, opponent is sent back to start (0).
     - Must land exactly on 7 to win.
     - Overshoot (>7) means player stays in place.
     """
@@ -107,15 +106,9 @@ def _apply_roll(positions: list[int], current_turn: int, roll: int, num_players:
     else:
         positions[p] = new_pos
 
-        # Check if landed on another player → send them back to start
-        for i in range(num_players):
-            if i != p and positions[i] == positions[p]:
-                positions[i] = 0
-
     # --- Next turn ---
     next_turn = (p + 1) % num_players if winner is None else p
     return positions, next_turn, winner
-
 
 
 # -------------------------

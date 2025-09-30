@@ -68,7 +68,9 @@ def request_match(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Request to join/create a 3-player match with DB-driven rules."""
+    """Request to join/create a 3-player match with DB-driven rules.
+    Deducts wallet immediately, refunds instantly if no match is available.
+    """
     rule = get_stake_rule(db, payload.stake_amount)
     if not rule:
         raise HTTPException(400, "Invalid stake selected")
@@ -79,7 +81,13 @@ def request_match(
     if entry_fee > 0 and (user.wallet_balance or 0) < entry_fee:
         raise HTTPException(400, "Insufficient wallet for entry fee")
 
-    # Try to join waiting match
+    # Deduct entry fee first (escrow style)
+    if entry_fee > 0:
+        user.wallet_balance = (user.wallet_balance or 0) - entry_fee
+        db.commit()
+        db.refresh(user)
+
+    # Try to join existing waiting match
     waiting = db.execute(
         select(GameMatch).where(
             and_(
@@ -90,28 +98,24 @@ def request_match(
     ).scalars().first()
 
     if waiting and waiting.p1_user_id != user.id and waiting.p2_user_id and not waiting.p3_user_id:
-        if entry_fee > 0:
-            user.wallet_balance = (user.wallet_balance or 0) - entry_fee
         waiting.p3_user_id = user.id
         waiting.status = MatchStatus.ACTIVE
         db.commit()
         return {"ok": True, "match_id": waiting.id, "status": waiting.status.value}
 
     if waiting and waiting.p1_user_id != user.id and not waiting.p2_user_id:
-        if entry_fee > 0:
-            user.wallet_balance = (user.wallet_balance or 0) - entry_fee
         waiting.p2_user_id = user.id
+        # still WAITING, but deduction holds until a 3rd joins
         db.commit()
         return {"ok": True, "match_id": waiting.id, "status": waiting.status.value}
 
-    # Else create a new match as p1
+    # No match found → refund immediately
     if entry_fee > 0:
-        user.wallet_balance = (user.wallet_balance or 0) - entry_fee
-    m = GameMatch(stake_amount=payload.stake_amount, p1_user_id=user.id, status=MatchStatus.WAITING)
-    db.add(m)
-    db.commit()
-    db.refresh(m)
-    return {"ok": True, "match_id": m.id, "status": m.status.value}
+        user.wallet_balance = (user.wallet_balance or 0) + entry_fee
+        db.commit()
+        db.refresh(user)
+
+    return {"ok": False, "refund": True, "msg": "No opponent found. Entry fee refunded."}
 
 
 @router.post("/complete")

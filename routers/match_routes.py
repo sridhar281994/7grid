@@ -270,6 +270,7 @@ async def create_or_wait_match(
                 current_turn=0,
                 num_players=num_players,
                 created_at=_utcnow(),
+                refundable=True, # free play is safe to cancel
             )
             db.add(new_match)
             db.commit()
@@ -293,6 +294,7 @@ async def create_or_wait_match(
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
+        # Deduct entry fee immediately (escrow)
         current_user.wallet_balance -= entry_fee
 
         waiting = (
@@ -312,6 +314,7 @@ async def create_or_wait_match(
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
                 waiting.current_turn = random.choice([0, 1])
+                waiting.refundable = False # ✅ match is now locked
             else:
                 if not waiting.p2_user_id:
                     waiting.p2_user_id = current_user.id
@@ -319,6 +322,7 @@ async def create_or_wait_match(
                     waiting.p3_user_id = current_user.id
                     waiting.status = MatchStatus.ACTIVE
                     waiting.current_turn = random.choice([0, 1, 2])
+                    waiting.refundable = False
                 else:
                     raise HTTPException(status_code=400, detail="Match already full")
 
@@ -348,6 +352,7 @@ async def create_or_wait_match(
             last_roll=None,
             current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
             created_at=_utcnow(),
+            refundable=True, # ✅ can be refunded if no opponent
         )
         db.add(new_match)
         db.commit()
@@ -370,6 +375,7 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
 
 
 # -------------------------
@@ -395,6 +401,32 @@ async def check_match_ready(
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
+    # -------------------------
+    # Refund logic: if still WAITING too long
+    # -------------------------
+    refund_applied = False
+    if m.status == MatchStatus.WAITING:
+        # Auto-cancel after 30 seconds of waiting
+        if waiting_time > 30:
+            # Refund whoever has joined
+            joined_players = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+            entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
+
+            for pid in joined_players:
+                if pid:
+                    u = db.query(User).filter(User.id == pid).first()
+                    if u and entry_fee > 0:
+                        u.wallet_balance = (u.wallet_balance or 0) + entry_fee
+                        refund_applied = True
+
+            m.status = MatchStatus.CANCELLED
+            try:
+                db.commit()
+                db.refresh(m)
+            except:
+                db.rollback()
+                raise HTTPException(status_code=500, detail="DB Error during refund")
+
     ready_flag = (
         m.status == MatchStatus.ACTIVE
         and m.p1_user_id is not None
@@ -405,6 +437,8 @@ async def check_match_ready(
     return {
         "ready": ready_flag,
         "finished": m.status == MatchStatus.FINISHED,
+        "cancelled": m.status == MatchStatus.CANCELLED,
+        "refund": refund_applied,
         "match_id": m.id,
         "status": _status_value(m),
         "stake": m.stake_amount,

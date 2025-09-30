@@ -127,8 +127,6 @@ def _apply_roll(
     return positions, (p + 1) % num_players, None, {"reverse": False}
 
 
-
-
 # -------------------------
 # Redis state helpers
 # -------------------------

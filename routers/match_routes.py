@@ -107,8 +107,9 @@ def _apply_roll(
 
     # --- Rule 2: Land on 3 → go to 3, then reverse to 0 ---
     if new_pos == 3:
-        positions[p] = 3 # ✅ first step into 3
-        reverse = True # ✅ frontend will bounce back to 0
+        # IMPORTANT: persist final state as 0 so UI won't snap back to 3 on next sync
+        positions[p] = 0
+        reverse = True # frontend will animate 3 -> 0
         return positions, (p + 1) % num_players, None, {"reverse": reverse}
 
     # --- Rule 3: Exact win at 7 ---
@@ -125,6 +126,7 @@ def _apply_roll(
     # --- Rule 5: Normal move ---
     positions[p] = new_pos
     return positions, (p + 1) % num_players, None, {"reverse": False}
+
 
 
 

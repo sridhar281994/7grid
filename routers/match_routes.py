@@ -72,59 +72,65 @@ def _status_value(m: GameMatch) -> str:
         return str(m.status)
 
 
-def _apply_roll(
-    positions: list[int],
-    current_turn: int,
-    roll: int,
-    num_players: int = 2,
-    turn_count: int = 1
-):
-    """
-    Apply dice roll with full rules:
-    1. Roll=1 at start → stay at 0th, next turn
-    2. Box 3 → reverse to 0
-    3. Exact 7 → win
-    4. Overshoot → stay
-    5. Normal forward otherwise
-    Includes reverse flag for frontend animation.
-    Ensures roll=1 is forced on 6th–8th turn if not yet rolled.
-    """
-    p = current_turn
-    old = positions[p]
+def _apply_roll(self, roll: int, reverse: bool = False):
+    """Apply roll result from backend and animate coin movement."""
+    p = self._current_player
+    old = self._positions[p]
+
+    # Rule 1: Off-board → must roll 1 to enter (but 1 at start stays in 0th, no second chance)
+    if old == 0 and not self._spawned_on_board[p]:
+        if roll == 1:
+            # ✅ mark as spawned (entered the game), but remain in 0th this turn
+            self._spawned_on_board[p] = True
+            self._positions[p] = 0
+            self._move_coin_to_box(p, 0, reverse=True) # small bounce at 0
+        else:
+            # stay at 0
+            self._positions[p] = 0
+        self._end_turn_and_highlight()
+        return
+
+    # Rule 2: Reverse flag from backend
+    # - If old+roll == 3: step into 3 then animate back to 0
+    # - Else (safety), bounce at 0
+    if reverse:
+        if old + roll == 3:
+            # step into 3rd box first, then go back to 0
+            self._positions[p] = 3
+            self._move_coin_to_box(p, 3)
+
+            def _finish_reverse(dt):
+                self._positions[p] = 0
+                self._move_coin_to_box(p, 0, reverse=True)
+                self._end_turn_and_highlight()
+
+            Clock.schedule_once(_finish_reverse, 0.6)
+        else:
+            # fallback bounce at 0 (covers start=0, roll=1 reverse from server, or any edge)
+            self._positions[p] = 0
+            self._move_coin_to_box(p, 0, reverse=True)
+            self._end_turn_and_highlight()
+        return
+
+    # Rule 3: Normal move / overshoot / win
     new_pos = old + roll
     winner = None
-    reverse = False
 
-    # --- Force "1" at least once during turns 6–8 ---
-    if turn_count in (6, 7, 8) and roll != 1:
-        roll = 1
-        new_pos = old + roll
-
-    # --- Rule 1: Roll=1 at start (must stay at 0th) ---
-    if roll == 1 and old == 0:
-        positions[p] = 0
-        return positions, (p + 1) % num_players, None, {"reverse": True}
-
-    # --- Rule 2: Land on 3 → reverse back to 0 ---
-    if new_pos == 3:
-        positions[p] = 0
-        reverse = True
-        return positions, (p + 1) % num_players, None, {"reverse": reverse}
-
-    # --- Rule 3: Exact win at 7 ---
-    if new_pos == 7:
-        positions[p] = 7
+    if new_pos == 7: # exact win
+        self._positions[p] = 7
         winner = p
-        return positions, p, winner, {"reverse": False}
+        self._move_coin_to_box(p, 7)
+    elif new_pos > 7: # overshoot → stay
+        self._positions[p] = old
+        self._move_coin_to_box(p, old)
+    else:
+        self._positions[p] = new_pos
+        self._move_coin_to_box(p, new_pos)
 
-    # --- Rule 4: Overshoot beyond 7 → stay ---
-    if new_pos > 7:
-        positions[p] = old
-        return positions, (p + 1) % num_players, None, {"reverse": False}
-
-    # --- Rule 5: Normal move ---
-    positions[p] = new_pos
-    return positions, (p + 1) % num_players, None, {"reverse": False}
+    if winner is not None:
+        self._declare_winner(winner)
+    else:
+        self._end_turn_and_highlight()
 
 
 # -------------------------

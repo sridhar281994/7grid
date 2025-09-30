@@ -100,7 +100,7 @@ def _apply_roll(
         roll = 1
         new_pos = old + roll
 
-    # --- Rule 1: Roll=1 at start (stay at 0th) ---
+    # --- Rule 1: Roll=1 at start (must stay at 0th) ---
     if roll == 1 and old == 0:
         positions[p] = 0
         return positions, (p + 1) % num_players, None, {"reverse": True}

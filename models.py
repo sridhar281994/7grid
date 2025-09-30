@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum
+    Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum, text as sa_text
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -82,7 +82,7 @@ class GameMatch(Base):
     id = Column(Integer, primary_key=True, index=True)
     stake_amount = Column(Integer, nullable=False)
 
-    # 👥 Player slots
+    # :busts_in_silhouette: Player slots
     p1_user_id = Column(Integer, ForeignKey("users.id"))
     p2_user_id = Column(Integer, ForeignKey("users.id"))
     p3_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -97,8 +97,11 @@ class GameMatch(Base):
     last_roll = Column(Integer, nullable=True)
     current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2, 2 = P3
 
-    # 🔥 NEW → track whether this match is 2-player or 3-player
+    # :fire: NEW → track whether this match is 2-player or 3-player
     num_players = Column(Integer, nullable=False, default=2)
+
+    # :moneybag: NEW → mark whether entry fee is refundable (waiting only)
+    refundable = Column(Boolean, nullable=False, server_default=text("true"))
 
     # Relationships
     player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")

@@ -22,11 +22,15 @@ from utils.redis_client import redis_client # ✅ shared redis instance
 import logging
 
 
-from sqlalchemy import or_, text
+from sqlalchemy import or_, and_, text
 from sqlalchemy.exc import SQLAlchemyError, DataError
 
 
+router = APIRouter()
 log = logging.getLogger("matches")
+log.setLevel(logging.DEBUG)
+
+BOT_FALLBACK_SECONDS = 10
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -253,190 +257,103 @@ class ForfeitIn(BaseModel): # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or wait for match (transaction-safe for 2P & 3P)
+# Create or Join Match
 # -------------------------
-@router.post("/create")
-async def create_or_wait_match(
-    payload: CreateIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> Dict:
-    stake_amount = int(payload.stake_amount)
-    num_players = int(payload.num_players or 2)
-    entry_fee = stake_amount // num_players if stake_amount > 0 else 0
-
-    log.debug(f"[CREATE] uid={current_user.id} stake={stake_amount} players={num_players} entry_fee={entry_fee}")
-
-    try:
-        # -------- Free Play (stake=0) --------
-        if stake_amount == 0:
-            new_match = GameMatch(
-                stake_amount=0,
-                status=MatchStatus.WAITING,
-                p1_user_id=current_user.id,
-                p2_user_id=None,
-                p3_user_id=None,
-                last_roll=None,
-                current_turn=0,
-                num_players=num_players,
-                created_at=_utcnow(),
-            )
-            db.add(new_match)
-            db.commit()
-            db.refresh(new_match)
-
-            await _write_state(new_match, {"positions": [0] * num_players})
-            log.debug(f"[CREATE] FREE-PLAY created match_id={new_match.id} by uid={current_user.id}")
-
-            return {
-                "ok": True,
-                "match_id": new_match.id,
-                "status": _status_value(new_match),
-                "stake": 0,
-                "num_players": num_players,
-                "p1": _name_for_id(db, new_match.p1_user_id),
-                "p2": None,
-                "p3": None,
-                "turn": new_match.current_turn or 0,
-                "p1_id": new_match.p1_user_id,
-                "p2_id": new_match.p2_user_id,
-                "p3_id": new_match.p3_user_id,
-            }
-
-        # -------- Paid Matches --------
-        if (current_user.wallet_balance or 0) < entry_fee:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-
-        # -------- Try to join waiting match --------
-        waiting = (
-            db.query(GameMatch)
-            .filter(
-                GameMatch.status == MatchStatus.WAITING,
-                GameMatch.stake_amount == stake_amount,
-                GameMatch.num_players == num_players,
-                GameMatch.p1_user_id != current_user.id,
-                or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None)
-            )
-            .with_for_update(skip_locked=True)
-            .order_by(GameMatch.id.asc())
-            .first()
-        )
-        log.debug(f"[CREATE] join_attempt waiting_match={waiting.id if waiting else None}")
-
-        if waiting:
-            if num_players == 2:
-                current_user.wallet_balance -= entry_fee
-                waiting.p2_user_id = current_user.id
-                waiting.status = MatchStatus.ACTIVE
-                waiting.current_turn = random.choice([0, 1])
-                log.debug(f"[CREATE] uid={current_user.id} JOINED match_id={waiting.id} as P2")
-
-            else: # 3-player
-                if not waiting.p2_user_id:
-                    current_user.wallet_balance -= entry_fee
-                    waiting.p2_user_id = current_user.id
-                    log.debug(f"[CREATE] uid={current_user.id} JOINED match_id={waiting.id} as P2")
-                elif not waiting.p3_user_id:
-                    current_user.wallet_balance -= entry_fee
-                    waiting.p3_user_id = current_user.id
-                    waiting.status = MatchStatus.ACTIVE
-                    waiting.current_turn = random.choice([0, 1, 2])
-                    log.debug(f"[CREATE] uid={current_user.id} JOINED match_id={waiting.id} as P3 -> match ACTIVE")
-
-            db.commit()
-            db.refresh(waiting)
-
-            await _write_state(waiting, {"positions": [0] * num_players})
-
-            return {
-                "ok": True,
-                "match_id": waiting.id,
-                "status": _status_value(waiting),
-                "stake": waiting.stake_amount,
-                "num_players": num_players,
-                "p1": _name_for_id(db, waiting.p1_user_id),
-                "p2": _name_for_id(db, waiting.p2_user_id),
-                "p3": _name_for_id(db, waiting.p3_user_id) if num_players == 3 else None,
-                "turn": waiting.current_turn,
-                "p1_id": waiting.p1_user_id,
-                "p2_id": waiting.p2_user_id,
-                "p3_id": waiting.p3_user_id,
-            }
-
-        # -------- Otherwise create new waiting match --------
-        new_match = GameMatch(
-            stake_amount=stake_amount,
-            status=MatchStatus.WAITING,
-            p1_user_id=current_user.id,
-            num_players=num_players,
-            last_roll=None,
-            current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
-            created_at=_utcnow(),
-        )
-        db.add(new_match)
-        db.commit()
-        db.refresh(new_match)
-
-        await _write_state(new_match, {"positions": [0] * num_players})
-        log.debug(f"[CREATE] CREATED new paid match_id={new_match.id} by uid={current_user.id}")
-
-        return {
-            "ok": True,
-            "match_id": new_match.id,
-            "status": _status_value(new_match),
-            "stake": new_match.stake_amount,
-            "num_players": num_players,
-            "p1": _name_for_id(db, new_match.p1_user_id),
-            "p2": None,
-            "p3": None,
-            "turn": new_match.current_turn,
-            "p1_id": new_match.p1_user_id,
-            "p2_id": new_match.p2_user_id,
-            "p3_id": new_match.p3_user_id,
-        }
-
-    except SQLAlchemyError as e:
-        db.rollback()
-        log.error(f"[CREATE][DB ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
-
-@router.get("/check")
-async def check_match_ready(
-    match_id: int,
+@router.post("/matches/create")
+def create_or_wait_match(
+    stake_amount: int,
+    num_players: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
-    if not m:
-        log.debug(f"[CHECK] match_id={match_id} NOT FOUND")
+    """Create new match or join existing WAITING match"""
+
+    entry_fee = 0 if stake_amount == 0 else stake_amount
+    log.debug(f"[CREATE] uid={current_user.id} stake={stake_amount} players={num_players} entry_fee={entry_fee}")
+
+    # 1. Look for existing WAITING match
+    existing_match = (
+        db.query(GameMatch)
+        .filter(
+            GameMatch.stake_amount == stake_amount,
+            GameMatch.num_players == num_players,
+            GameMatch.status == MatchStatus.WAITING,
+            GameMatch.p1_user_id != current_user.id,
+        )
+        .first()
+    )
+
+    if existing_match:
+        log.debug(f"[CREATE] Found existing match_id={existing_match.id}, attempting to join")
+        if not existing_match.p2_user_id:
+            existing_match.p2_user_id = current_user.id
+        elif num_players == 3 and not existing_match.p3_user_id:
+            existing_match.p3_user_id = current_user.id
+        else:
+            raise HTTPException(status_code=400, detail="Match already full")
+
+        # Activate if full
+        players = [existing_match.p1_user_id, existing_match.p2_user_id, existing_match.p3_user_id]
+        if sum(p is not None for p in players) == num_players:
+            existing_match.status = MatchStatus.ACTIVE
+            existing_match.current_turn = existing_match.p1_user_id
+            log.debug(f"[CREATE] Match {existing_match.id} is now ACTIVE")
+
+        db.commit()
+        db.refresh(existing_match)
+        return {"match_id": existing_match.id, "status": existing_match.status, "joined": True}
+
+    # 2. Otherwise, create new match
+    new_match = GameMatch(
+        stake_amount=stake_amount,
+        p1_user_id=current_user.id,
+        status=MatchStatus.WAITING,
+        system_fee=0,
+        created_at=datetime.utcnow(),
+        num_players=num_players,
+    )
+    db.add(new_match)
+    db.commit()
+    db.refresh(new_match)
+
+    log.debug(f"[CREATE] New match_id={new_match.id} created by uid={current_user.id}")
+    return {"match_id": new_match.id, "status": new_match.status, "joined": False}
+
+
+# -------------------------
+# Check Match Status
+# -------------------------
+@router.get("/matches/check")
+def check_match_ready(match_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Check if match is ready; if too long, offer bot fallback"""
+    match = db.query(GameMatch).filter(GameMatch.id == match_id).first()
+    if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    log.debug(f"[CHECK] uid={current_user.id} match_id={m.id} status={m.status} stake={m.stake_amount} "
-              f"players={m.num_players} p1={m.p1_user_id} p2={m.p2_user_id} p3={m.p3_user_id}")
+    log.debug(
+        f"[CHECK] uid={current_user.id} match_id={match.id} status={match.status} "
+        f"stake={match.stake_amount} players={match.num_players} "
+        f"p1={match.p1_user_id} p2={match.p2_user_id} p3={match.p3_user_id}"
+    )
 
-    ready = False
-    if m.num_players == 2 and m.p1_user_id and m.p2_user_id:
-        ready = True
-    elif m.num_players == 3 and m.p1_user_id and m.p2_user_id and m.p3_user_id:
-        ready = True
+    # Case 1: already active
+    if match.status == MatchStatus.ACTIVE:
+        return {"ready": True, "match_id": match.id, "status": "ACTIVE"}
 
-    log.debug(f"[CHECK] match_id={m.id} ready={ready} status={m.status}")
+    # Case 2: still waiting
+    waiting_seconds = (datetime.utcnow() - match.created_at).total_seconds()
+    if match.status == MatchStatus.WAITING:
+        if waiting_seconds >= BOT_FALLBACK_SECONDS:
+            log.debug(f"[CHECK] Bot fallback offered for match_id={match.id}, waited {waiting_seconds:.1f}s")
+            return {"ready": False, "match_id": match.id, "status": "WAITING", "offer_bot": True}
+        else:
+            return {"ready": False, "match_id": match.id, "status": "WAITING", "offer_bot": False}
 
-    return {
-        "match_id": m.id,
-        "ready": ready,
-        "status": _status_value(m),
-        "stake": m.stake_amount,
-        "num_players": m.num_players,
-        "p1": _name_for_id(db, m.p1_user_id),
-        "p2": _name_for_id(db, m.p2_user_id),
-        "p3": _name_for_id(db, m.p3_user_id) if m.num_players == 3 else None,
-        "turn": m.current_turn or 0,
-        "p1_id": m.p1_user_id,
-        "p2_id": m.p2_user_id,
-        "p3_id": m.p3_user_id,
-    }
+    # Case 3: finished or abandoned
+    if match.status in [MatchStatus.FINISHED, MatchStatus.ABANDONED]:
+        return {"ready": False, "match_id": match.id, "status": str(match.status)}
+
+    return {"ready": False, "match_id": match.id, "status": str(match.status)}
 
 
 # -------------------------

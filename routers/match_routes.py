@@ -293,7 +293,7 @@ async def create_or_wait_match(
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # Try to join waiting match
+        # 🔒 Try to join waiting match safely with row lock
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -303,12 +303,13 @@ async def create_or_wait_match(
                 GameMatch.p1_user_id != current_user.id,
             )
             .order_by(GameMatch.id.asc())
+            .with_for_update(skip_locked=True) # ✅ Prevent duplicate claims
             .first()
         )
 
         if waiting:
             if num_players == 2:
-                # deduct now only when match becomes active
+                # Deduct now only when match becomes active
                 current_user.wallet_balance -= entry_fee
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE

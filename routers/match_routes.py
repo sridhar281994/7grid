@@ -245,7 +245,7 @@ class ForfeitIn(BaseModel): # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or wait for match (transaction-safe for 2P & 3P)
+# Create or wait for match (transaction-safe, popup flow)
 # -------------------------
 @router.post("/create")
 async def create_or_wait_match(
@@ -301,15 +301,16 @@ async def create_or_wait_match(
                 GameMatch.stake_amount == stake_amount,
                 GameMatch.num_players == num_players,
                 GameMatch.p1_user_id != current_user.id,
-                or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None)
+                or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None),
             )
-            .with_for_update(skip_locked=True)
+            .with_for_update(skip_locked=True) # prevent race conditions
             .order_by(GameMatch.id.asc())
             .first()
         )
 
         if waiting:
             if num_players == 2:
+                # Deduct entry fee only when joining succeeds
                 current_user.wallet_balance -= entry_fee
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
@@ -376,8 +377,9 @@ async def create_or_wait_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
+
 # -------------------------
-# Check readiness
+# Check readiness (popup flow restored)
 # -------------------------
 @router.get("/check")
 async def check_match_ready(
@@ -397,10 +399,10 @@ async def check_match_ready(
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
-    # ✅ If waiting >= 12s → offer bot option
+    # ✅ If waiting >= 12s → prompt popup
     if m.status == MatchStatus.WAITING and waiting_time >= 12:
         if accept_bot:
-            # Deduct entry fee now if needed
+            # Deduct entry fee only now (not at create)
             entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
             if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
                 raise HTTPException(status_code=400, detail="Insufficient balance for bot match")
@@ -408,9 +410,9 @@ async def check_match_ready(
             if entry_fee > 0:
                 current_user.wallet_balance -= entry_fee
 
-            # Fill missing slots with bots
+            # Fill missing slots with bot placeholders
             if not m.p2_user_id:
-                m.p2_user_id = -1000  # bot placeholder
+                m.p2_user_id = -1000
             if expected_players == 3 and not m.p3_user_id:
                 m.p3_user_id = -1001
 
@@ -423,7 +425,7 @@ async def check_match_ready(
             await _write_state(m, {"positions": [0] * expected_players})
 
         else:
-            # tell frontend: show popup
+            # Just tell frontend → show popup
             return {
                 "ready": False,
                 "finished": False,
@@ -438,10 +440,10 @@ async def check_match_ready(
                 "positions": st.get("positions", [0] * expected_players),
                 "winner": winner_idx,
                 "waiting_time": waiting_time,
-                "prompt_bot": True,   # ✅ trigger popup
+                "prompt_bot": True, # ✅ trigger popup in frontend
             }
 
-    # If active, keep auto-advance logic
+    # If already active → apply auto-advance if needed
     if m.status == MatchStatus.ACTIVE:
         await _auto_advance_if_needed(m, db)
 
@@ -467,7 +469,7 @@ async def check_match_ready(
         "positions": st.get("positions", [0] * expected_players),
         "winner": winner_idx,
         "waiting_time": waiting_time,
-        "prompt_bot": False,  # default
+        "prompt_bot": False, # default → only True when above branch
     }
 
 

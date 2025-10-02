@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 
@@ -18,6 +19,11 @@ from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 from routers.wallet_utils import distribute_prize
 from utils.redis_client import redis_client # ✅ shared redis instance
+import logging
+
+
+from sqlalchemy import or_, text
+from sqlalchemy.exc import SQLAlchemyError, DataError
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -245,7 +251,7 @@ class ForfeitIn(BaseModel): # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or wait for match (transaction-safe + per-queue advisory lock)
+# Create or wait for match (transaction-safe for 2P & 3P)
 # -------------------------
 @router.post("/create")
 async def create_or_wait_match(
@@ -258,7 +264,9 @@ async def create_or_wait_match(
         num_players = int(payload.num_players or 2)
         entry_fee = stake_amount // num_players if stake_amount > 0 else 0
 
-        # -------- Free Play --------
+        log.debug(f"[CREATE] uid={current_user.id} stake={stake_amount} players={num_players} entry_fee={entry_fee}")
+
+        # -------- Free Play (always create a WAITING row) --------
         if stake_amount == 0:
             new_match = GameMatch(
                 stake_amount=0,
@@ -277,6 +285,8 @@ async def create_or_wait_match(
 
             await _write_state(new_match, {"positions": [0] * num_players})
 
+            log.debug(f"[CREATE] FREE-PLAY created match_id={new_match.id} by uid={current_user.id}")
+
             return {
                 "ok": True,
                 "match_id": new_match.id,
@@ -286,37 +296,41 @@ async def create_or_wait_match(
                 "p1": _name_for_id(db, new_match.p1_user_id),
                 "p2": None,
                 "p3": None,
+                "p1_id": new_match.p1_user_id,
+                "p2_id": new_match.p2_user_id,
+                "p3_id": new_match.p3_user_id,
                 "turn": new_match.current_turn or 0,
             }
 
         # -------- Paid Matches --------
         if (current_user.wallet_balance or 0) < entry_fee:
+            log.debug(f"[CREATE] uid={current_user.id} insufficient balance {current_user.wallet_balance} < {entry_fee}")
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # -------- Per-queue advisory lock (prevents dual-creation races) --------
-        # One lock per (stake_amount, num_players)
-        # NOTE: requires PostgreSQL. For MySQL, use GET_LOCK/RELEASE_LOCK equivalents.
-        lock_key = (int(stake_amount) * 10_000) + int(num_players)
+        # -------- Serialize matchmaking with advisory lock --------
+        # Same key for same (stake_amount, num_players) so 2 callers can't create simultaneously.
+        lock_key = (stake_amount * 10) + num_players
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": lock_key})
+        log.debug(f"[CREATE] uid={current_user.id} acquired advisory lock key={lock_key}")
 
-        # After acquiring the lock, do the normal "find waiting" inside the same transaction
-        waiting = (
+        # Try to join a waiting match (must still be WAITING and have a free slot)
+        waiting_q = (
             db.query(GameMatch)
             .filter(
                 GameMatch.status == MatchStatus.WAITING,
                 GameMatch.stake_amount == stake_amount,
                 GameMatch.num_players == num_players,
                 GameMatch.p1_user_id != current_user.id,
-                or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None),
+                (GameMatch.p2_user_id == None) if num_players == 2 else or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None),
             )
-            .with_for_update(skip_locked=True) # safe if multiple lockers queue up
             .order_by(GameMatch.id.asc())
-            .first()
         )
+        waiting = waiting_q.first()
 
         if waiting:
+            log.debug(f"[CREATE] uid={current_user.id} joining match_id={waiting.id} created_by={waiting.p1_user_id}")
+
             if num_players == 2:
-                # Join as Player 2; deduct only when match becomes active
                 current_user.wallet_balance -= entry_fee
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
@@ -332,12 +346,15 @@ async def create_or_wait_match(
                     waiting.status = MatchStatus.ACTIVE
                     waiting.current_turn = random.choice([0, 1, 2])
                 else:
+                    log.debug(f"[CREATE] uid={current_user.id} race: match {waiting.id} already full")
                     raise HTTPException(status_code=400, detail="Match already full")
 
             db.commit()
             db.refresh(waiting)
 
             await _write_state(waiting, {"positions": [0] * num_players})
+
+            log.debug(f"[CREATE] uid={current_user.id} joined match_id={waiting.id} status={waiting.status}")
 
             return {
                 "ok": True,
@@ -348,10 +365,13 @@ async def create_or_wait_match(
                 "p1": _name_for_id(db, waiting.p1_user_id),
                 "p2": _name_for_id(db, waiting.p2_user_id),
                 "p3": _name_for_id(db, waiting.p3_user_id) if num_players == 3 else None,
+                "p1_id": waiting.p1_user_id,
+                "p2_id": waiting.p2_user_id,
+                "p3_id": waiting.p3_user_id,
                 "turn": waiting.current_turn,
             }
 
-        # -------- Otherwise create new waiting match (no deduction yet) --------
+        # No waiting match → create new one
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -369,6 +389,8 @@ async def create_or_wait_match(
 
         await _write_state(new_match, {"positions": [0] * num_players})
 
+        log.debug(f"[CREATE] uid={current_user.id} created waiting match_id={new_match.id}")
+
         return {
             "ok": True,
             "match_id": new_match.id,
@@ -378,12 +400,17 @@ async def create_or_wait_match(
             "p1": _name_for_id(db, new_match.p1_user_id),
             "p2": None,
             "p3": None,
+            "p1_id": new_match.p1_user_id,
+            "p2_id": new_match.p2_user_id,
+            "p3_id": new_match.p3_user_id,
             "turn": new_match.current_turn,
         }
 
-    except SQLAlchemyError as e:
+    except (SQLAlchemyError, DataError) as e:
         db.rollback()
+        log.exception(f"[CREATE][ERROR] uid={current_user.id} DB error: {e}")
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+
 
 # -------------------------
 # Check readiness
@@ -397,25 +424,51 @@ async def check_match_ready(
 ) -> Dict:
     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
+        log.debug(f"[CHECK] uid={current_user.id} match_id={match_id} -> 404 not found")
         raise HTTPException(status_code=404, detail="Match not found")
 
     expected_players = m.num_players or 2
     now = int(time.time())
-    waiting_time = max(0, now - int(m.created_at.timestamp()) if m.created_at else 0)
+    created_ts = int(m.created_at.timestamp()) if m.created_at else now
+    waiting_time = max(0, now - created_ts)
 
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
-    # ✅ If still waiting & >12s, either bot or refund
-    if m.status == MatchStatus.WAITING and waiting_time >= 12:
-        if accept_bot:
-            entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
-            if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
-                raise HTTPException(status_code=400, detail="Insufficient balance for bot match")
+    log.debug(
+        "[CHECK] uid=%s match_id=%s status=%s stake=%s players=%s p1=%s p2=%s p3=%s waiting=%ss accept_bot=%s",
+        current_user.id, m.id, m.status, m.stake_amount, expected_players,
+        m.p1_user_id, m.p2_user_id, m.p3_user_id, waiting_time, accept_bot
+    )
 
-            if entry_fee > 0:
+    # ---------- Free-play stale handling (no enum write) ----------
+    if m.stake_amount == 0 and m.status == MatchStatus.WAITING and waiting_time >= 12:
+        log.debug(f"[CHECK] FREE-PLAY stale -> delete match_id={m.id}")
+        try:
+            db.delete(m)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log.exception(f"[CHECK][FREE-PLAY][DELETE][ERROR] match_id={m.id} {e}")
+        return {
+            "ready": False,
+            "finished": False,
+            "refunded": True,
+            "message": "Free play expired",
+        }
+
+    # ---------- Paid: 12s bot offer ----------
+    if m.stake_amount > 0 and m.status == MatchStatus.WAITING and waiting_time >= 12:
+        if accept_bot:
+            entry_fee = m.stake_amount // expected_players
+            # ensure caller has balance (if they are the missing slot)
+            if current_user.id not in (m.p1_user_id, m.p2_user_id, m.p3_user_id):
+                if (current_user.wallet_balance or 0) < entry_fee:
+                    log.debug(f"[CHECK] uid={current_user.id} insufficient balance for bot fill")
+                    raise HTTPException(status_code=400, detail="Insufficient balance for bot match")
                 current_user.wallet_balance -= entry_fee
 
+            # fill missing slots with bot placeholders
             if not m.p2_user_id:
                 m.p2_user_id = -1000
             if expected_players == 3 and not m.p3_user_id:
@@ -424,22 +477,41 @@ async def check_match_ready(
             m.status = MatchStatus.ACTIVE
             m.current_turn = random.choice([0, 1] if expected_players == 2 else [0, 1, 2])
 
-            db.commit()
-            db.refresh(m)
+            try:
+                db.commit()
+                db.refresh(m)
+            except Exception as e:
+                db.rollback()
+                log.exception(f"[CHECK][BOT][ERROR] match_id={m.id} {e}")
+                raise HTTPException(status_code=500, detail="Failed to activate bot match")
 
             await _write_state(m, {"positions": [0] * expected_players})
 
+            log.debug(f"[CHECK] BOT accepted -> ACTIVE match_id={m.id}")
         else:
-            # auto-refund + abandon
-            if m.stake_amount > 0:
-                entry_fee = m.stake_amount // expected_players
-                if m.p1_user_id == current_user.id:
-                    current_user.wallet_balance += entry_fee
-            m.status = MatchStatus.ABANDONED
-            db.commit()
-            return {"ok": True, "refunded": True, "message": "Match refunded"}
+            # signal frontend to show popup
+            log.debug(f"[CHECK] prompt_bot=True match_id={m.id}")
+            return {
+                "ready": False,
+                "finished": False,
+                "match_id": m.id,
+                "status": _status_value(m),
+                "stake": m.stake_amount,
+                "num_players": expected_players,
+                "p1": _name_for_id(db, m.p1_user_id),
+                "p2": _name_for_id(db, m.p2_user_id),
+                "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
+                "p1_id": m.p1_user_id,
+                "p2_id": m.p2_user_id,
+                "p3_id": m.p3_user_id,
+                "turn": m.current_turn or 0,
+                "positions": st.get("positions", [0] * expected_players),
+                "winner": winner_idx,
+                "waiting_time": waiting_time,
+                "prompt_bot": True,
+            }
 
-    # ✅ If active
+    # active: keep auto-advance logic
     if m.status == MatchStatus.ACTIVE:
         await _auto_advance_if_needed(m, db)
 
@@ -449,6 +521,8 @@ async def check_match_ready(
         and m.p2_user_id is not None
         and (expected_players == 2 or m.p3_user_id is not None)
     )
+
+    log.debug(f"[CHECK] match_id={m.id} ready={ready_flag} status={m.status}")
 
     return {
         "ready": ready_flag,
@@ -460,13 +534,16 @@ async def check_match_ready(
         "p1": _name_for_id(db, m.p1_user_id),
         "p2": _name_for_id(db, m.p2_user_id),
         "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
+        "p1_id": m.p1_user_id,
+        "p2_id": m.p2_user_id,
+        "p3_id": m.p3_user_id,
         "last_roll": st.get("last_roll", m.last_roll),
         "turn": st.get("current_turn", m.current_turn or 0),
         "positions": st.get("positions", [0] * expected_players),
         "winner": winner_idx,
         "waiting_time": waiting_time,
+        "prompt_bot": False,
     }
-
 
 # -------------------------
 # Roll Dice

@@ -245,7 +245,7 @@ class ForfeitIn(BaseModel): # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or wait for match (transaction-safe, popup flow)
+# Create or wait for match (transaction-safe for 2P & 3P)
 # -------------------------
 @router.post("/create")
 async def create_or_wait_match(
@@ -301,6 +301,7 @@ async def create_or_wait_match(
                 GameMatch.stake_amount == stake_amount,
                 GameMatch.num_players == num_players,
                 GameMatch.p1_user_id != current_user.id,
+                # ✅ ensure at least one slot available
                 or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None),
             )
             .with_for_update(skip_locked=True) # prevent race conditions
@@ -310,7 +311,7 @@ async def create_or_wait_match(
 
         if waiting:
             if num_players == 2:
-                # Deduct entry fee only when joining succeeds
+                # Join as Player 2
                 current_user.wallet_balance -= entry_fee
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
@@ -378,8 +379,14 @@ async def create_or_wait_match(
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 
+---
+
+✅ Full Corrected /check
+
+This matches the above logic: handles waiting, refunds, bot fallback, active play.
+
 # -------------------------
-# Check readiness (popup flow restored)
+# Check readiness
 # -------------------------
 @router.get("/check")
 async def check_match_ready(
@@ -399,10 +406,9 @@ async def check_match_ready(
     st = await _read_state(m.id) or {}
     winner_idx = st.get("winner")
 
-    # ✅ If waiting >= 12s → prompt popup
+    # ✅ If still waiting & >12s, either bot or refund
     if m.status == MatchStatus.WAITING and waiting_time >= 12:
         if accept_bot:
-            # Deduct entry fee only now (not at create)
             entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
             if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
                 raise HTTPException(status_code=400, detail="Insufficient balance for bot match")
@@ -410,7 +416,6 @@ async def check_match_ready(
             if entry_fee > 0:
                 current_user.wallet_balance -= entry_fee
 
-            # Fill missing slots with bot placeholders
             if not m.p2_user_id:
                 m.p2_user_id = -1000
             if expected_players == 3 and not m.p3_user_id:
@@ -425,25 +430,16 @@ async def check_match_ready(
             await _write_state(m, {"positions": [0] * expected_players})
 
         else:
-            # Just tell frontend → show popup
-            return {
-                "ready": False,
-                "finished": False,
-                "match_id": m.id,
-                "status": _status_value(m),
-                "stake": m.stake_amount,
-                "num_players": expected_players,
-                "p1": _name_for_id(db, m.p1_user_id),
-                "p2": _name_for_id(db, m.p2_user_id),
-                "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
-                "turn": m.current_turn or 0,
-                "positions": st.get("positions", [0] * expected_players),
-                "winner": winner_idx,
-                "waiting_time": waiting_time,
-                "prompt_bot": True, # ✅ trigger popup in frontend
-            }
+            # auto-refund + abandon
+            if m.stake_amount > 0:
+                entry_fee = m.stake_amount // expected_players
+                if m.p1_user_id == current_user.id:
+                    current_user.wallet_balance += entry_fee
+            m.status = MatchStatus.ABANDONED
+            db.commit()
+            return {"ok": True, "refunded": True, "message": "Match refunded"}
 
-    # If already active → apply auto-advance if needed
+    # ✅ If active
     if m.status == MatchStatus.ACTIVE:
         await _auto_advance_if_needed(m, db)
 
@@ -469,7 +465,6 @@ async def check_match_ready(
         "positions": st.get("positions", [0] * expected_players),
         "winner": winner_idx,
         "waiting_time": waiting_time,
-        "prompt_bot": False, # default → only True when above branch
     }
 
 

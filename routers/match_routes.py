@@ -259,7 +259,7 @@ class ForfeitIn(BaseModel): # ✅ FIXED missing model
 # -------------------------
 # Create or wait for match (JOIN first for free & paid)
 # -------------------------
-@router.post("/matches/create")
+@router.post("/create")
 async def create_or_wait_match(
     payload: CreateIn,
     db: Session = Depends(get_db),
@@ -388,7 +388,7 @@ STALE_TIMEOUT_SECS = 12 # for bot prompt timing
 # -------------------------
 # Check readiness (+ bot fallback offer/accept)
 # -------------------------
-@router.get("/matches/check")
+@router.get("/check")
 async def check_match_ready(
     match_id: int,
     accept_bot: bool = False,

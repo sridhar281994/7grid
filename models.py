@@ -101,7 +101,7 @@ class GameMatch(Base):
     num_players = Column(Integer, nullable=False, default=2)
 
     # :moneybag: NEW → mark whether entry fee is refundable (waiting only)
-    refundable = Column(Boolean, nullable=False, server_default=text("true"))
+    refundable = Column(Boolean, nullable=False, server_default=sa_text("true"))
 
     # Relationships
     player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")

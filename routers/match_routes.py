@@ -657,8 +657,20 @@ async def abandon_match(db: Session = Depends(get_db), current_user: User = Depe
 @router.websocket("/ws/{match_id}")
 async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Depends(get_current_user_ws)):
     await websocket.accept()
+    print(f"[WS] New connection: user={current_user.id} match_id={match_id}")
+
+    # ✅ Ensure Redis client is alive before using pubsub
+    try:
+        await redis_client.ping()
+    except Exception as e:
+        print(f"[WS][ERROR] Redis not connected: {e}")
+        await websocket.send_text(json.dumps({"error": f"Redis not connected: {e}"}))
+        await websocket.close()
+        return
+
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(f"match:{match_id}:events")
+    print(f"[WS] Subscribed to Redis channel match:{match_id}:events")
 
     try:
         while True:
@@ -666,15 +678,17 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
             if msg and msg.get("type") == "message":
                 try:
                     event = json.loads(msg["data"]) # ✅ ensure valid JSON
+                    print(f"[WS][EVENT] Redis → {event}")
                     await websocket.send_text(json.dumps(event))
-                except Exception:
-                    # fallback in case msg["data"] is already JSON string
+                except Exception as e:
+                    print(f"[WS][WARN] Raw Redis msg (not JSON): {msg['data']} ({e})")
                     await websocket.send_text(msg["data"])
             else:
                 db = SessionLocal()
                 try:
                     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
                     if not m:
+                        print(f"[WS][ERROR] Match not found: {match_id}")
                         await websocket.send_text(json.dumps({"error": "Match not found"}))
                         break
 
@@ -700,18 +714,22 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "turn": st.get("current_turn", m.current_turn or 0),
                         "positions": st.get("positions", [0] * expected_players),
                         "winner": st.get("winner"),
-                        "turn_count": st.get("turn_count", 0), # ✅ include
+                        "turn_count": st.get("turn_count", 0),
                     }
+                    print(f"[WS][SNAPSHOT] {snapshot}")
                     await websocket.send_text(json.dumps(snapshot))
                 finally:
                     db.close()
 
             await asyncio.sleep(0.3)
+
     except WebSocketDisconnect:
-        print(f"[WS] Closed for match {match_id}")
+        print(f"[WS] Closed for match {match_id} (user={current_user.id})")
     finally:
         await pubsub.unsubscribe(f"match:{match_id}:events")
         await pubsub.close()
+        print(f"[WS] Unsubscribed + closed Redis pubsub for match {match_id}")
+
 
 
 

@@ -293,7 +293,7 @@ async def create_or_wait_match(
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # Try to join a waiting match (transaction-safe)
+        # -------- Transaction-safe join attempt --------
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -301,8 +301,9 @@ async def create_or_wait_match(
                 GameMatch.stake_amount == stake_amount,
                 GameMatch.num_players == num_players,
                 GameMatch.p1_user_id != current_user.id,
+                or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None)
             )
-            .with_for_update(skip_locked=True) # ✅ prevents two users grabbing same row
+            .with_for_update(skip_locked=True)
             .order_by(GameMatch.id.asc())
             .first()
         )
@@ -313,7 +314,8 @@ async def create_or_wait_match(
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
                 waiting.current_turn = random.choice([0, 1])
-            else:
+
+            else: # 3-player mode
                 if not waiting.p2_user_id:
                     current_user.wallet_balance -= entry_fee
                     waiting.p2_user_id = current_user.id
@@ -342,7 +344,7 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn,
             }
 
-        # Otherwise create new waiting match (❌ no deduction yet)
+        # -------- Otherwise create new waiting match (no deduction yet) --------
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -373,7 +375,6 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
 
 # -------------------------
 # Check readiness

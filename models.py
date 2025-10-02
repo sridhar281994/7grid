@@ -15,6 +15,7 @@ class MatchStatus(enum.Enum):
     WAITING = "waiting"
     ACTIVE = "active"
     FINISHED = "finished"
+    ABANDONED = "abandoned"
 
 
 class TxType(enum.Enum):

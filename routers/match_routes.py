@@ -163,10 +163,12 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "current_turn": state.get("current_turn", 0),
         "last_roll": state.get("last_roll"),
         "winner": state.get("winner"),
+        "turn_count": state.get("turn_count", 0), # ✅ always publish turn count
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
     }
     try:
         if redis_client:
+            # persist + notify all subscribers
             await redis_client.set(f"match:{m.id}:state", json.dumps(payload), ex=24 * 60 * 60)
             await redis_client.publish(f"match:{m.id}:events", json.dumps(payload))
     except Exception as e:
@@ -662,7 +664,12 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
         while True:
             msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
             if msg and msg.get("type") == "message":
-                await websocket.send_text(msg["data"])
+                try:
+                    event = json.loads(msg["data"]) # ✅ ensure valid JSON
+                    await websocket.send_text(json.dumps(event))
+                except Exception:
+                    # fallback in case msg["data"] is already JSON string
+                    await websocket.send_text(msg["data"])
             else:
                 db = SessionLocal()
                 try:
@@ -677,6 +684,7 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "current_turn": m.current_turn or 0,
                         "last_roll": m.last_roll,
                         "winner": None,
+                        "turn_count": 0,
                     }
 
                     snapshot = {
@@ -692,6 +700,7 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "turn": st.get("current_turn", m.current_turn or 0),
                         "positions": st.get("positions", [0] * expected_players),
                         "winner": st.get("winner"),
+                        "turn_count": st.get("turn_count", 0), # ✅ include
                     }
                     await websocket.send_text(json.dumps(snapshot))
                 finally:
@@ -703,6 +712,7 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
     finally:
         await pubsub.unsubscribe(f"match:{match_id}:events")
         await pubsub.close()
+
 
 
 # -------------------------
@@ -735,32 +745,3 @@ async def finish_match(payload: FinishIn, db: Session = Depends(get_db), current
     db.commit()
 
     return {"ok": True, "message": "Match finished", "winner": payload.winner, "stake": m.stake_amount}
-
-
-# -------------------------
-# Cleanup Task
-# -------------------------
-STALE_TIMEOUT = timedelta(seconds=12)
-
-
-async def _cleanup_stale_matches():
-    """Delete free-play matches older than timeout"""
-    while True:
-        try:
-            db = SessionLocal()
-            cutoff = datetime.utcnow() - STALE_TIMEOUT
-            stale = (
-                db.query(GameMatch)
-                .filter(GameMatch.status == MatchStatus.WAITING, GameMatch.stake_amount == 0, GameMatch.created_at < cutoff)
-                .all()
-            )
-            for m in stale:
-                db.delete(m)
-            if stale:
-                db.commit()
-                print(f"[CLEANUP] Removed {len(stale)} stale free-play matches")
-        except Exception as e:
-            print(f"[CLEANUP ERROR] {e}")
-        finally:
-            db.close()
-        await asyncio.sleep(30)

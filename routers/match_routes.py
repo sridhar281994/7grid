@@ -245,7 +245,7 @@ class ForfeitIn(BaseModel): # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or wait for match (transaction-safe for 2P & 3P)
+# Create or wait for match (transaction-safe + per-queue advisory lock)
 # -------------------------
 @router.post("/create")
 async def create_or_wait_match(
@@ -293,7 +293,13 @@ async def create_or_wait_match(
         if (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # -------- Transaction-safe join attempt --------
+        # -------- Per-queue advisory lock (prevents dual-creation races) --------
+        # One lock per (stake_amount, num_players)
+        # NOTE: requires PostgreSQL. For MySQL, use GET_LOCK/RELEASE_LOCK equivalents.
+        lock_key = (int(stake_amount) * 10_000) + int(num_players)
+        db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": lock_key})
+
+        # After acquiring the lock, do the normal "find waiting" inside the same transaction
         waiting = (
             db.query(GameMatch)
             .filter(
@@ -301,17 +307,16 @@ async def create_or_wait_match(
                 GameMatch.stake_amount == stake_amount,
                 GameMatch.num_players == num_players,
                 GameMatch.p1_user_id != current_user.id,
-                # ✅ ensure at least one slot available
                 or_(GameMatch.p2_user_id == None, GameMatch.p3_user_id == None),
             )
-            .with_for_update(skip_locked=True) # prevent race conditions
+            .with_for_update(skip_locked=True) # safe if multiple lockers queue up
             .order_by(GameMatch.id.asc())
             .first()
         )
 
         if waiting:
             if num_players == 2:
-                # Join as Player 2
+                # Join as Player 2; deduct only when match becomes active
                 current_user.wallet_balance -= entry_fee
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
@@ -351,9 +356,11 @@ async def create_or_wait_match(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
             p1_user_id=current_user.id,
-            num_players=num_players,
+            p2_user_id=None,
+            p3_user_id=None,
             last_roll=None,
             current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
+            num_players=num_players,
             created_at=_utcnow(),
         )
         db.add(new_match)
@@ -377,13 +384,6 @@ async def create_or_wait_match(
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
-
----
-
-✅ Full Corrected /check
-
-This matches the above logic: handles waiting, refunds, bot fallback, active play.
 
 # -------------------------
 # Check readiness

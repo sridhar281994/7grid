@@ -382,11 +382,6 @@ async def create_or_wait_match(
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 
----
-
-/check (always offers bot after 12s; no ABANDONED writes)
-
-import time
 
 STALE_TIMEOUT_SECS = 12 # for bot prompt timing
 

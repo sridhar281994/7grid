@@ -64,8 +64,6 @@ async def on_startup():
     # Redis warm-up
     from utils.redis_client import init_redis_with_retry
     await init_redis_with_retry(max_retries=5, delay=2.0)
-    # Background cleanup loop
-    asyncio.create_task(match_routes._cleanup_stale_matches())
 # -------------------------
 # Routes
 # -------------------------

@@ -25,6 +25,8 @@ import logging
 from sqlalchemy import or_, text
 from sqlalchemy.exc import SQLAlchemyError, DataError
 
+
+log = logging.getLogger("matches")
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 

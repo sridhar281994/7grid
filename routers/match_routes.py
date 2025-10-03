@@ -659,16 +659,17 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
     await websocket.accept()
     print(f"[WS] New connection: user={current_user.id} match_id={match_id}")
 
-    # ✅ Ensure Redis client is alive before using pubsub
-    try:
-        await redis_client.ping()
-    except Exception as e:
-        print(f"[WS][ERROR] Redis not connected: {e}")
-        await websocket.send_text(json.dumps({"error": f"Redis not connected: {e}"}))
+    # ✅ Always fetch a live Redis client
+    r = await _get_redis()
+    if not r:
+        err = "Redis unavailable - closing socket"
+        print(f"[WS][ERROR] {err}")
+        await websocket.send_text(json.dumps({"error": err}))
         await websocket.close()
         return
 
-    pubsub = redis_client.pubsub()
+    # ✅ PubSub subscription
+    pubsub = r.pubsub()
     await pubsub.subscribe(f"match:{match_id}:events")
     print(f"[WS] Subscribed to Redis channel match:{match_id}:events")
 
@@ -681,9 +682,10 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                     print(f"[WS][EVENT] Redis → {event}")
                     await websocket.send_text(json.dumps(event))
                 except Exception as e:
-                    print(f"[WS][WARN] Raw Redis msg (not JSON): {msg['data']} ({e})")
+                    print(f"[WS][WARN] Raw Redis msg: {msg['data']} ({e})")
                     await websocket.send_text(msg["data"])
             else:
+                # --- Fallback: snapshot sync from DB ---
                 db = SessionLocal()
                 try:
                     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
@@ -726,11 +728,12 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
     except WebSocketDisconnect:
         print(f"[WS] Closed for match {match_id} (user={current_user.id})")
     finally:
-        await pubsub.unsubscribe(f"match:{match_id}:events")
-        await pubsub.close()
+        try:
+            await pubsub.unsubscribe(f"match:{match_id}:events")
+            await pubsub.close()
+        except Exception as e:
+            print(f"[WS][WARN] PubSub cleanup failed: {e}")
         print(f"[WS] Unsubscribed + closed Redis pubsub for match {match_id}")
-
-
 
 
 # -------------------------

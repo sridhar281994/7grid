@@ -89,12 +89,16 @@ def _apply_roll(
     current_turn: int,
     roll: int,
     num_players: int = 2,
-    turn_count: int = 1
+    turn_count: int = 1,
+    spawned: list[bool] = None
 ):
     """
     Apply dice roll with spawn rules, reverse at 3, overshoot,
     forced roll=1 at turn 6–8, and always return actor+spawn flags.
     """
+    if spawned is None:
+        spawned = [False] * num_players
+
     p = current_turn
     old = positions[p]
     new_pos = old + roll
@@ -102,32 +106,25 @@ def _apply_roll(
     reverse = False
     spawn_flag = False
 
-    # --- Rule X: Force "1" at 6th–8th turn if not yet rolled ---
-    if turn_count in (6, 7, 8) and old == 0 and roll != 1:
+    # --- Force "1" at 6th–8th turn ---
+    if turn_count in (6, 7, 8) and not spawned[p] and roll != 1:
         roll = 1
         new_pos = old + roll
 
     # --- Rule 1: Spawn enforcement ---
-    if old == 0:
+    if not spawned[p]:
         if roll == 1:
-            # Player enters board at box 0
+            spawned[p] = True
             positions[p] = 0
             spawn_flag = True
-            return positions, (p + 1) % num_players, None, {
-                "reverse": False,
-                "spawn": True,
-                "actor": p,
-                "last_roll": roll
-            }
         else:
-            # Stay outside until 1 is rolled
             positions[p] = 0
-            return positions, (p + 1) % num_players, None, {
-                "reverse": False,
-                "spawn": False,
-                "actor": p,
-                "last_roll": roll
-            }
+        return positions, (p + 1) % num_players, None, {
+            "reverse": False,
+            "spawn": spawn_flag,
+            "actor": p,
+            "last_roll": roll
+        }
 
     # --- Rule 4: Overshoot (stay in place if >7) ---
     if new_pos > 7:
@@ -139,7 +136,7 @@ def _apply_roll(
             "last_roll": roll
         }
 
-    # --- Rule 2: Land on 3 → reverse to 0 ---
+    # --- Rule 2: Land on 3 → reverse ---
     if new_pos == 3:
         positions[p] = 0
         reverse = True
@@ -150,7 +147,7 @@ def _apply_roll(
             "last_roll": roll
         }
 
-    # --- Rule 3: Exact win at 7 ---
+    # --- Rule 3: Exact win ---
     if new_pos == 7:
         positions[p] = 7
         winner = p

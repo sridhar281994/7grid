@@ -92,13 +92,15 @@ def _apply_roll(
     turn_count: int = 1
 ):
     """
-    Apply dice roll with spawn rules, reverse at 3, overshoot, and forced roll=1 at turn 6-8.
+    Apply dice roll with spawn rules, reverse at 3, overshoot,
+    forced roll=1 at turn 6–8, and always return actor+spawn flags.
     """
     p = current_turn
     old = positions[p]
     new_pos = old + roll
     winner = None
     reverse = False
+    spawn_flag = False
 
     # --- Rule X: Force "1" at 6th–8th turn if not yet rolled ---
     if turn_count in (6, 7, 8) and old == 0 and roll != 1:
@@ -108,37 +110,65 @@ def _apply_roll(
     # --- Rule 1: Spawn enforcement ---
     if old == 0:
         if roll == 1:
-            # Player enters box 0 (spawn)
+            # Player enters board at box 0
             positions[p] = 0
+            spawn_flag = True
             return positions, (p + 1) % num_players, None, {
                 "reverse": False,
-                "spawn": True
+                "spawn": True,
+                "actor": p,
+                "last_roll": roll
             }
         else:
             # Stay outside until 1 is rolled
             positions[p] = 0
-            return positions, (p + 1) % num_players, None, {"reverse": False}
+            return positions, (p + 1) % num_players, None, {
+                "reverse": False,
+                "spawn": False,
+                "actor": p,
+                "last_roll": roll
+            }
 
     # --- Rule 4: Overshoot (stay in place if >7) ---
     if new_pos > 7:
         positions[p] = old
-        return positions, (p + 1) % num_players, None, {"reverse": False}
+        return positions, (p + 1) % num_players, None, {
+            "reverse": False,
+            "spawn": False,
+            "actor": p,
+            "last_roll": roll
+        }
 
     # --- Rule 2: Land on 3 → reverse to 0 ---
     if new_pos == 3:
         positions[p] = 0
         reverse = True
-        return positions, (p + 1) % num_players, None, {"reverse": True}
+        return positions, (p + 1) % num_players, None, {
+            "reverse": True,
+            "spawn": False,
+            "actor": p,
+            "last_roll": roll
+        }
 
     # --- Rule 3: Exact win at 7 ---
     if new_pos == 7:
         positions[p] = 7
         winner = p
-        return positions, p, winner, {"reverse": False}
+        return positions, p, winner, {
+            "reverse": False,
+            "spawn": False,
+            "actor": p,
+            "last_roll": roll
+        }
 
     # --- Rule 5: Normal move ---
     positions[p] = new_pos
-    return positions, (p + 1) % num_players, None, {"reverse": False}
+    return positions, (p + 1) % num_players, None, {
+        "reverse": False,
+        "spawn": False,
+        "actor": p,
+        "last_roll": roll
+    }
 
 
 # -------------------------

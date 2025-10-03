@@ -92,7 +92,7 @@ def _apply_roll(
     turn_count: int = 1
 ):
     """
-    Apply dice roll with spawn rules and board rules.
+    Apply dice roll with spawn rules, reverse at 3, overshoot, and forced roll=1 at turn 6-8.
     """
     p = current_turn
     old = positions[p]
@@ -100,35 +100,43 @@ def _apply_roll(
     winner = None
     reverse = False
 
+    # --- Rule X: Force "1" at 6th–8th turn if not yet rolled ---
+    if turn_count in (6, 7, 8) and old == 0 and roll != 1:
+        roll = 1
+        new_pos = old + roll
+
     # --- Rule 1: Spawn enforcement ---
     if old == 0:
         if roll == 1:
-            # Stay at 0 to "spawn"
+            # Player enters box 0 (spawn)
             positions[p] = 0
-            return positions, (p + 1) % num_players, None, {"reverse": False}
+            return positions, (p + 1) % num_players, None, {
+                "reverse": False,
+                "spawn": True
+            }
         else:
-            # Ignore roll until a 1 is rolled
+            # Stay outside until 1 is rolled
             positions[p] = 0
             return positions, (p + 1) % num_players, None, {"reverse": False}
 
-    # --- Rule 4: Overshoot ---
+    # --- Rule 4: Overshoot (stay in place if >7) ---
     if new_pos > 7:
         positions[p] = old
         return positions, (p + 1) % num_players, None, {"reverse": False}
 
-    # --- Rule 2: Land on 3 → reverse ---
+    # --- Rule 2: Land on 3 → reverse to 0 ---
     if new_pos == 3:
         positions[p] = 0
         reverse = True
         return positions, (p + 1) % num_players, None, {"reverse": True}
 
-    # --- Rule 3: Exact win ---
+    # --- Rule 3: Exact win at 7 ---
     if new_pos == 7:
         positions[p] = 7
         winner = p
         return positions, p, winner, {"reverse": False}
 
-    # --- Normal move ---
+    # --- Rule 5: Normal move ---
     positions[p] = new_pos
     return positions, (p + 1) % num_players, None, {"reverse": False}
 

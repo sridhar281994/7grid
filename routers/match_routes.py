@@ -18,13 +18,11 @@ from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
 from routers.wallet_utils import distribute_prize
-from redis_client import redis_client, _get_redis # ✅ shared redis instance
+from redis_client import redis_client, _get_redis  # ✅ shared redis instance
 import logging
-
 
 from sqlalchemy import or_, and_, text
 from sqlalchemy.exc import SQLAlchemyError, DataError
-
 
 router = APIRouter()
 log = logging.getLogger("matches")
@@ -187,9 +185,13 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "p3": None,
         "positions": state.get("positions", [0] * num_players),
         "current_turn": state.get("current_turn", 0),
+        "turn": state.get("current_turn", 0),                # ✅ add alias for frontend
         "last_roll": state.get("last_roll"),
         "winner": state.get("winner"),
-        "turn_count": state.get("turn_count", 0), # ✅ always publish turn count
+        "turn_count": state.get("turn_count", 0),            # ✅ always publish turn count
+        "reverse": state.get("reverse", False),              # ✅ pass through anim flags
+        "spawn": state.get("spawn", False),                  # ✅ pass through anim flags
+        "actor": state.get("actor"),                         # ✅ who moved
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
     }
     try:
@@ -229,6 +231,7 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
         "current_turn": m.current_turn or 0,
         "last_roll": m.last_roll,
         "winner": None,
+        "turn_count": 0,
         "last_turn_ts": _utcnow().isoformat(),
     }
 
@@ -248,7 +251,12 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
     roll = random.randint(1, 6)
     positions = st.get("positions", [0] * num_players)
     curr = st.get("current_turn", 0)
-    positions, next_turn, winner = _apply_roll(positions, curr, roll, num_players)
+    turn_count = st.get("turn_count", 0) + 1
+
+    # ✅ correct unpack (4-tuple)
+    positions, next_turn, winner, extra = _apply_roll(
+        positions, curr, roll, num_players, turn_count
+    )
 
     m.last_roll = roll
     m.current_turn = next_turn
@@ -266,7 +274,16 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs: int =
 
     await _write_state(
         m,
-        {"positions": positions, "current_turn": m.current_turn, "last_roll": roll, "winner": winner},
+        {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+            "reverse": extra.get("reverse", False),  # ✅ flags to frontend
+            "spawn": extra.get("spawn", False),      # ✅ flags to frontend
+            "actor": extra.get("actor"),
+            "turn_count": turn_count,
+        },
     )
 
 
@@ -280,7 +297,7 @@ class CreateIn(BaseModel):
 class RollIn(BaseModel):
     match_id: int
 
-class ForfeitIn(BaseModel): # ✅ FIXED missing model
+class ForfeitIn(BaseModel):  # ✅ FIXED missing model
     match_id: int
 
 
@@ -410,8 +427,7 @@ async def create_or_wait_match(
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 
-
-STALE_TIMEOUT_SECS = 12 # for bot prompt timing
+STALE_TIMEOUT_SECS = 12  # for bot prompt timing
 
 # -------------------------
 # Check readiness (+ bot fallback offer/accept)
@@ -452,7 +468,7 @@ async def check_match_ready(
 
             # Fill missing slots with bots
             if not m.p2_user_id:
-                m.p2_user_id = -1000 # bot placeholder
+                m.p2_user_id = -1000  # bot placeholder
             if expected_players == 3 and not m.p3_user_id:
                 m.p3_user_id = -1001
 
@@ -483,7 +499,7 @@ async def check_match_ready(
                 "positions": st.get("positions", [0] * expected_players),
                 "winner": winner_idx,
                 "waiting_time": waiting_time,
-                "prompt_bot": True, # ✅ trigger popup
+                "prompt_bot": True,  # ✅ trigger popup
             }
 
     # If ACTIVE, keep any auto-advance logic
@@ -573,6 +589,7 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
+    # ✅ include anim flags + actor in state so WS can broadcast them
     await _write_state(
         m,
         {
@@ -581,6 +598,8 @@ async def roll_dice(
             "last_roll": roll,
             "winner": winner,
             "reverse": extra.get("reverse", False),
+            "spawn": extra.get("spawn", False),
+            "actor": extra.get("actor"),
             "turn_count": turn_count,
         },
     )
@@ -592,7 +611,9 @@ async def roll_dice(
         "turn": m.current_turn,
         "positions": positions,
         "winner": winner,
-        "reverse": extra.get("reverse", False), # ✅ frontend uses this for animation
+        "reverse": extra.get("reverse", False),  # ✅ frontend uses this for animation
+        "spawn": extra.get("spawn", False),      # ✅ tell client if spawn occurred
+        "actor": extra.get("actor"),             # ✅ who moved
         "turn_count": turn_count,
     }
 
@@ -704,7 +725,7 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
             msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
             if msg and msg.get("type") == "message":
                 try:
-                    event = json.loads(msg["data"]) # ✅ ensure valid JSON
+                    event = json.loads(msg["data"])  # ✅ ensure valid JSON
                     print(f"[WS][EVENT] Redis → {event}")
                     await websocket.send_text(json.dumps(event))
                 except Exception as e:
@@ -743,6 +764,9 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "positions": st.get("positions", [0] * expected_players),
                         "winner": st.get("winner"),
                         "turn_count": st.get("turn_count", 0),
+                        "reverse": st.get("reverse", False),  # ✅ include flags in snapshots too
+                        "spawn": st.get("spawn", False),
+                        "actor": st.get("actor"),
                     }
                     print(f"[WS][SNAPSHOT] {snapshot}")
                     await websocket.send_text(json.dumps(snapshot))

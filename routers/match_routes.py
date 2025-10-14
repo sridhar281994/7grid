@@ -716,11 +716,7 @@ async def forfeit_match(
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = players.index(current_user.id)
-    winner_idx = None
-    for i, uid in enumerate(players):
-        if i != loser_idx and uid is not None:
-            winner_idx = i
-            break
+    winner_idx = next((i for i, uid in enumerate(players) if i != loser_idx and uid is not None), None)
 
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
@@ -735,7 +731,7 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # ✅ NEW: broadcast forfeit event so opponent’s app can detect and exit
+    # ✅ Broadcast before clearing (so opponent sees "forfeit")
     await _write_state(
         m,
         {
@@ -750,7 +746,8 @@ async def forfeit_match(
         },
     )
 
-    # ✅ Still clear after broadcast to avoid stale auto-advance
+    # ✅ Wait a bit before clearing Redis
+    await asyncio.sleep(1.0)
     await _clear_state(m.id)
 
     return {
@@ -761,6 +758,7 @@ async def forfeit_match(
         "winner": winner_idx,
         "winner_name": _name_for_id(db, players[winner_idx]) if winner_idx is not None else None,
     }
+
 # -------------------------
 # Abandon (for free-play or waiting matches)
 # -------------------------

@@ -568,14 +568,20 @@ async def roll_dice(
 
     roll = random.randint(1, 6)
 
-    # --- Load and sanitize current board state ---
-    st = await _read_state(m.id) or {"positions": [0] * expected_players, "turn_count": 0}
-    positions = [int(x) for x in st.get("positions", [0] * expected_players)]
-    turn_count = st.get("turn_count", 0) + 1
+    # --- Load existing board state (include spawned flag)
+    st = await _read_state(m.id) or {
+        "positions": [0] * expected_players,
+        "turn_count": 0,
+        "spawned": [False] * expected_players
+    }
 
-    # --- Apply backend roll logic ---
+    positions = [int(x) for x in st.get("positions", [0] * expected_players)]
+    spawned = st.get("spawned", [False] * expected_players)
+    turn_count = int(st.get("turn_count", 0)) + 1
+
+    # --- Apply roll logic (preserve spawn status)
     positions, next_turn, winner, extra = _apply_roll(
-        copy.deepcopy(positions), curr, roll, expected_players, turn_count
+        copy.deepcopy(positions), curr, roll, expected_players, turn_count, spawned
     )
 
     m.last_roll = roll
@@ -592,20 +598,20 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
-    # --- Broadcast to Redis subscribers (frontend sync) ---
-    await _write_state(
-        m,
-        {
-            "positions": positions,
-            "current_turn": m.current_turn,
-            "last_roll": roll,
-            "winner": winner,
-            "reverse": extra.get("reverse", False),
-            "spawn": extra.get("spawn", False),
-            "actor": extra.get("actor"),
-            "turn_count": turn_count,
-        },
-    )
+    # --- Persist & broadcast new state ---
+    new_state = {
+        "positions": positions,
+        "current_turn": m.current_turn,
+        "last_roll": roll,
+        "winner": winner,
+        "reverse": extra.get("reverse", False),
+        "spawn": extra.get("spawn", False),
+        "actor": extra.get("actor"),
+        "turn_count": turn_count,
+        "spawned": extra.get("spawned", spawned),
+    }
+
+    await _write_state(m, new_state)
 
     return {
         "ok": True,
@@ -614,11 +620,12 @@ async def roll_dice(
         "turn": m.current_turn,
         "positions": positions,
         "winner": winner,
-        "reverse": extra.get("reverse", False),  # ✅ frontend uses this for animation
-        "spawn": extra.get("spawn", False),      # ✅ tell client if spawn occurred
-        "actor": extra.get("actor"),             # ✅ who moved
+        "reverse": extra.get("reverse", False),
+        "spawn": extra.get("spawn", False),
+        "actor": extra.get("actor"),
         "turn_count": turn_count,
     }
+
 
 
 # -------------------------

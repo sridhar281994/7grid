@@ -456,7 +456,7 @@ async def create_or_wait_match(
 STALE_TIMEOUT_SECS = 12  # for bot prompt timing
 
 # -------------------------
-# Check Match Readiness / Poll Sync
+# Check Match Readiness / Poll Sync (Updated for forfeit detection)
 # -------------------------
 @router.get("/check")
 async def check_match_ready(
@@ -548,6 +548,16 @@ async def check_match_ready(
         except Exception:
             log.exception("[CHECK] auto-advance failed")
 
+    # ✅ Detect if a forfeit happened (match finished but not yet shown to players)
+    if m.status == MatchStatus.FINISHED and winner_idx is None:
+        # Fetch winner info from DB directly
+        winner_idx = 0
+        for i, uid in enumerate([m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]):
+            if uid == m.winner_user_id:
+                winner_idx = i
+                break
+        log.debug(f"[FORFEIT DETECTED] winner_idx={winner_idx} winner_user_id={m.winner_user_id}")
+
     ready_flag = (
         m.status == MatchStatus.ACTIVE
         and m.p1_user_id is not None
@@ -571,8 +581,8 @@ async def check_match_ready(
         "last_roll": last_roll,
         "turn": turn,
         "positions": positions,
-        "spawned": spawned,                      # ✅ preserve per-player spawn status
-        "reverse": st.get("reverse", False),     # ✅ consistent flags for frontend
+        "spawned": spawned,
+        "reverse": st.get("reverse", False),
         "spawn": st.get("spawn", False),
         "actor": st.get("actor"),
         "winner": winner_idx,
@@ -580,7 +590,6 @@ async def check_match_ready(
         "waiting_time": waiting_time,
         "prompt_bot": (m.status == MatchStatus.WAITING and waiting_time >= STALE_TIMEOUT_SECS),
     }
-
 
 # -------------------------
 # Roll Dice
@@ -707,7 +716,6 @@ async def forfeit_match(
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = players.index(current_user.id)
-
     winner_idx = None
     for i, uid in enumerate(players):
         if i != loser_idx and uid is not None:
@@ -727,6 +735,22 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
+    # ✅ NEW: broadcast forfeit event so opponent’s app can detect and exit
+    await _write_state(
+        m,
+        {
+            "positions": [0] * expected_players,
+            "current_turn": 0,
+            "last_roll": None,
+            "winner": winner_idx,
+            "forfeit": True,
+            "finished": True,
+            "status": "FINISHED",
+            "actor": None,
+        },
+    )
+
+    # ✅ Still clear after broadcast to avoid stale auto-advance
     await _clear_state(m.id)
 
     return {
@@ -737,8 +761,6 @@ async def forfeit_match(
         "winner": winner_idx,
         "winner_name": _name_for_id(db, players[winner_idx]) if winner_idx is not None else None,
     }
-
-
 # -------------------------
 # Abandon (for free-play or waiting matches)
 # -------------------------

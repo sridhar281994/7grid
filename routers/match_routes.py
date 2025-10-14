@@ -88,12 +88,9 @@ def _apply_roll(
     roll: int,
     num_players: int = 2,
     turn_count: int = 1,
-    spawned: list[bool] = None
+    spawned: list[bool] | None = None,
 ):
-    """
-    Apply dice roll with spawn rules, reverse at 3, overshoot,
-    forced roll=1 at turn 6–8, and always return actor+spawn flags.
-    """
+    """Apply dice roll: spawn, reverse at 3, overshoot >7, win at 7."""
     if spawned is None:
         spawned = [False] * num_players
 
@@ -103,38 +100,26 @@ def _apply_roll(
     winner = None
     reverse = False
     spawn_flag = False
+    BOARD_MAX = 7
 
-    # --- Force "1" at 6th–8th turn ---
-    if turn_count in (6, 7, 8) and not spawned[p] and roll != 1:
-        roll = 1
-        new_pos = old + roll
-
-    # --- Rule 1: Spawn enforcement ---
+    # --- Spawn logic ---
     if not spawned[p]:
         if roll == 1:
             spawned[p] = True
             positions[p] = 0
             spawn_flag = True
         else:
+            # stay unspawned at 0
             positions[p] = 0
         return positions, (p + 1) % num_players, None, {
             "reverse": False,
             "spawn": spawn_flag,
             "actor": p,
-            "last_roll": roll
+            "last_roll": roll,
+            "spawned": spawned
         }
 
-    # --- Rule 4: Overshoot (stay in place if >7) ---
-    if new_pos > 7:
-        positions[p] = old
-        return positions, (p + 1) % num_players, None, {
-            "reverse": False,
-            "spawn": False,
-            "actor": p,
-            "last_roll": roll
-        }
-
-    # --- Rule 2: Land on 3 → reverse ---
+    # --- Reverse at 3 ---
     if new_pos == 3:
         positions[p] = 0
         reverse = True
@@ -142,27 +127,41 @@ def _apply_roll(
             "reverse": True,
             "spawn": False,
             "actor": p,
-            "last_roll": roll
+            "last_roll": roll,
+            "spawned": spawned
         }
 
-    # --- Rule 3: Exact win ---
-    if new_pos == 7:
-        positions[p] = 7
+    # --- Overshoot (>7) → stay ---
+    if new_pos > BOARD_MAX:
+        positions[p] = old
+        return positions, (p + 1) % num_players, None, {
+            "reverse": False,
+            "spawn": False,
+            "actor": p,
+            "last_roll": roll,
+            "spawned": spawned
+        }
+
+    # --- Exact win (==7) ---
+    if new_pos == BOARD_MAX:
+        positions[p] = new_pos
         winner = p
         return positions, p, winner, {
             "reverse": False,
             "spawn": False,
             "actor": p,
-            "last_roll": roll
+            "last_roll": roll,
+            "spawned": spawned
         }
 
-    # --- Rule 5: Normal move ---
+    # --- Normal move ---
     positions[p] = new_pos
     return positions, (p + 1) % num_players, None, {
         "reverse": False,
         "spawn": False,
         "actor": p,
-        "last_roll": roll
+        "last_roll": roll,
+        "spawned": spawned
     }
 
 

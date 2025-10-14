@@ -546,6 +546,8 @@ async def roll_dice(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    import copy
+
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -567,12 +569,14 @@ async def roll_dice(
 
     roll = random.randint(1, 6)
 
-    # load current board state
+    # --- Load and sanitize current board state ---
     st = await _read_state(m.id) or {"positions": [0] * expected_players, "turn_count": 0}
+    positions = [int(x) for x in st.get("positions", [0] * expected_players)]
     turn_count = st.get("turn_count", 0) + 1
 
+    # --- Apply backend roll logic ---
     positions, next_turn, winner, extra = _apply_roll(
-        st["positions"], curr, roll, expected_players, turn_count
+        copy.deepcopy(positions), curr, roll, expected_players, turn_count
     )
 
     m.last_roll = roll
@@ -589,7 +593,7 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
-    # ✅ include anim flags + actor in state so WS can broadcast them
+    # --- Broadcast to Redis subscribers (frontend sync) ---
     await _write_state(
         m,
         {

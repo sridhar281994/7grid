@@ -43,28 +43,25 @@ def deduct_entry_fee(db: Session, user: User, entry_fee: int):
 
 
 # -------------------------
-# Prize Distribution (Points-Based)
+# Prize Distribution (with merchant logging)
 # -------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
     Distribute winnings when a match finishes.
-
-    2 Player Game:
-      - ₹4 game: each pays 2, winner gets 3, merchant gets 1
-      - ₹8 game: each pays 4, winner gets 6, merchant gets 2
-      - ₹12 game: each pays 6, winner gets 9, merchant gets 3
-
-    3 Player Game:
-      - ₹4 game: each pays 2, winner gets 4, merchant gets 2
-      - ₹8 game: each pays 4, winner gets 8, merchant gets 4
-      - ₹12 game: each pays 6, winner gets 12, merchant gets 6
+    - 2 Player Game:
+        4rs: winner 3, merchant 1
+        8rs: winner 6, merchant 2
+        12rs: winner 9, merchant 3
+    - 3 Player Game:
+        4rs: winner 4, merchant 2
+        8rs: winner 8, merchant 4
+        12rs: winner 12, merchant 6
     """
-    stake = match.stake_amount
-    expected_players = match.num_players or 2
-    merchant_user_id = 1  # 🔹 System/Merchant user for audit logs (no real wallet used)
+    stake = match.stake_amount or 0
+    num_players = match.num_players or 2
 
-    # --- Default logic ---
-    if expected_players == 2:
+    # Determine prize & fee logic
+    if num_players == 2:
         if stake == 4:
             winner_prize, system_fee = 3, 1
         elif stake == 8:
@@ -74,8 +71,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         else:
             winner_prize = (stake * 3) // 4
             system_fee = stake // 4
-
-    elif expected_players == 3:
+    else:  # 3-player game
         if stake == 4:
             winner_prize, system_fee = 4, 2
         elif stake == 8:
@@ -85,45 +81,49 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         else:
             winner_prize = stake
             system_fee = stake // 2
+
+    # --- Resolve merchant account ---
+    merchant_user = None
+    if getattr(match, "merchant_user_id", None):
+        merchant_user = _lock_user(db, match.merchant_user_id)
     else:
-        # fallback
-        winner_prize = (stake * 3) // 4
-        system_fee = stake // 4
+        # fallback: pick first admin/merchant user (id=1 usually)
+        merchant_user = _lock_user(db, 1)
 
-    # --- Identify Winner ---
-    winner_id = None
-    if winner_idx == 0 and match.p1_user_id:
-        winner_id = match.p1_user_id
-    elif winner_idx == 1 and match.p2_user_id:
-        winner_id = match.p2_user_id
-    elif winner_idx == 2 and match.p3_user_id:
-        winner_id = match.p3_user_id
+    # --- Identify players ---
+    players = [match.p1_user_id, match.p2_user_id, match.p3_user_id]
+    winner_uid = players[winner_idx] if winner_idx is not None else None
+    winner = _lock_user(db, winner_uid) if winner_uid else None
 
-    if not winner_id:
-        print(f"[ERROR] distribute_prize: Invalid winner index {winner_idx} for match {match.id}")
-        return
-
-    # --- Simulate point addition for winner ---
-    winner = _lock_user(db, winner_id)
+    # --- Credit Winner ---
     if winner:
         old_balance = float(winner.wallet_balance or 0)
-        new_balance = old_balance + winner_prize
-        winner.wallet_balance = new_balance
-        _log_transaction(db, winner.id, winner_prize, TxType.RECHARGE, TxStatus.SUCCESS, note="Match Win (Points)")
-        print(f"[DEBUG] Winner Points Added: user_id={winner.id}, old={old_balance}, prize={winner_prize}, new={new_balance}")
+        winner.wallet_balance = old_balance + winner_prize
+        _log_transaction(db, winner.id, winner_prize, TxType.WIN, TxStatus.SUCCESS, note="Match Win")
+        print(f"[PRIZE] Winner credited: user={winner.id}, +{winner_prize}, old={old_balance}")
 
-    # --- Log Merchant Cut for auditing ---
-    _log_transaction(db, merchant_user_id, system_fee, TxType.RECHARGE, TxStatus.SUCCESS, note=f"System Fee (Match {match.id})")
-    print(f"[AUDIT] Merchant Fee Logged: match_id={match.id}, fee={system_fee}, merchant_user={merchant_user_id}")
+    # --- Credit Merchant (System Fee) ---
+    if merchant_user:
+        old_balance = float(merchant_user.wallet_balance or 0)
+        merchant_user.wallet_balance = old_balance + system_fee
+        _log_transaction(db, merchant_user.id, system_fee, TxType.FEE, TxStatus.SUCCESS, note=f"System Fee (Match {match.id})")
+        print(f"[PRIZE] Merchant credited: user={merchant_user.id}, +{system_fee}, old={old_balance}")
+        match.merchant_user_id = merchant_user.id
 
-    # --- Update Match Record ---
+    # --- Audit: Log entry fees for transparency ---
+    entry_each = stake // num_players if num_players > 0 else 0
+    for uid in players:
+        if uid:
+            _log_transaction(db, uid, -entry_each, TxType.ENTRY, TxStatus.SUCCESS, note=f"Match {match.id} Entry Fee")
+
+    # --- Save & Commit ---
     match.system_fee = system_fee
     match.winner_user_id = winner.id if winner else None
     match.finished_at = datetime.utcnow()
 
     db.commit()
     db.refresh(match)
-    print(f"[DEBUG] Prize distribution complete: match_id={match.id}, players={expected_players}, fee={system_fee}")
+    print(f"[PRIZE] Distribution complete → Match={match.id}, Winner={winner_uid}, Fee={system_fee}, Players={num_players}")
 
 
 # -------------------------

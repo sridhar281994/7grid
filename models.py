@@ -88,7 +88,10 @@ class GameMatch(Base):
     p2_user_id = Column(Integer, ForeignKey("users.id"))
     p3_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+    # 🏆 Winner & Merchant
     winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    merchant_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # ✅ new column
+
     status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
     system_fee = Column(Numeric(10, 2), default=0)
 
@@ -96,7 +99,7 @@ class GameMatch(Base):
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
     last_roll = Column(Integer, nullable=True)
-    current_turn = Column(Integer, nullable=True) # 0 = P1, 1 = P2, 2 = P3
+    current_turn = Column(Integer, nullable=True)  # 0 = P1, 1 = P2, 2 = P3
 
     # :fire: NEW → track whether this match is 2-player or 3-player
     num_players = Column(Integer, nullable=False, default=2)
@@ -109,6 +112,7 @@ class GameMatch(Base):
     player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
     player3 = relationship("User", foreign_keys=[p3_user_id], back_populates="matches_as_p3")
     winner = relationship("User", foreign_keys=[winner_user_id])
+    merchant = relationship("User", foreign_keys=[merchant_user_id])  # ✅ linked relationship
 
 
 # -----------------------

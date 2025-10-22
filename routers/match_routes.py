@@ -702,6 +702,7 @@ async def forfeit_match(
     current_user: User = Depends(get_current_user),
 ) -> Dict:
     """Handle player giving up (forfeit) — assigns winner, triggers prize distribution, and notifies opponent(s)."""
+    # --- Fetch match ---
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -717,15 +718,16 @@ async def forfeit_match(
     if current_user.id not in players:
         raise HTTPException(status_code=403, detail="Not your match")
 
-    # --- Determine loser/winner ---
+    # --- Determine loser / winner ---
     loser_idx = players.index(current_user.id)
+    # pick first available opponent (non-loser)
     winner_idx = next((i for i, uid in enumerate(players) if i != loser_idx and uid is not None), None)
 
-    # --- Update match state ---
+    # --- Update match ---
     m.status = MatchStatus.FINISHED
-    m.finished_at = _utcnow()
+    m.finished_at = datetime.now(timezone.utc)
 
-    # --- Prize Distribution (with merchant logging) ---
+    # --- Prize distribution with merchant fee logging ---
     if winner_idx is not None and m.stake_amount > 0:
         await distribute_prize(db, m, winner_idx)
 
@@ -736,7 +738,7 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # ✅ Broadcast before clearing (so opponent sees "forfeit")
+    # --- Notify all clients via Redis before clearing ---
     await _write_state(
         m,
         {
@@ -751,11 +753,11 @@ async def forfeit_match(
         },
     )
 
-    # ✅ Wait a bit before clearing Redis
+    # ✅ Let Redis event reach all clients before deletion
     await asyncio.sleep(1.0)
     await _clear_state(m.id)
 
-    # ✅ Include merchant info for auditing
+    # --- Merchant info (for auditing) ---
     merchant_info = {
         "merchant_user_id": getattr(m, "merchant_user_id", None),
         "system_fee": float(m.system_fee or 0),
@@ -771,6 +773,7 @@ async def forfeit_match(
         "num_players": expected_players,
         **merchant_info,
     }
+
 
 # -------------------------
 # Abandon (for free-play or waiting matches)

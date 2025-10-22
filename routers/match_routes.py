@@ -701,12 +701,14 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    """Handle player giving up (forfeit) — assigns winner, triggers prize distribution, and notifies opponent(s)."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # --- Resolve players ---
     expected_players = m.num_players or 2
     players = [m.p1_user_id, m.p2_user_id]
     if expected_players == 3:
@@ -715,12 +717,15 @@ async def forfeit_match(
     if current_user.id not in players:
         raise HTTPException(status_code=403, detail="Not your match")
 
+    # --- Determine loser/winner ---
     loser_idx = players.index(current_user.id)
     winner_idx = next((i for i, uid in enumerate(players) if i != loser_idx and uid is not None), None)
 
+    # --- Update match state ---
     m.status = MatchStatus.FINISHED
     m.finished_at = _utcnow()
 
+    # --- Prize Distribution (with merchant logging) ---
     if winner_idx is not None and m.stake_amount > 0:
         await distribute_prize(db, m, winner_idx)
 
@@ -750,6 +755,12 @@ async def forfeit_match(
     await asyncio.sleep(1.0)
     await _clear_state(m.id)
 
+    # ✅ Include merchant info for auditing
+    merchant_info = {
+        "merchant_user_id": getattr(m, "merchant_user_id", None),
+        "system_fee": float(m.system_fee or 0),
+    }
+
     return {
         "ok": True,
         "match_id": m.id,
@@ -757,6 +768,8 @@ async def forfeit_match(
         "loser": loser_idx,
         "winner": winner_idx,
         "winner_name": _name_for_id(db, players[winner_idx]) if winner_idx is not None else None,
+        "num_players": expected_players,
+        **merchant_info,
     }
 
 # -------------------------

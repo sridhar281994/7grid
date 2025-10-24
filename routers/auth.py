@@ -63,7 +63,7 @@ class RegisterIn(BaseModel):
 
 @router.post("/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
-    """Create a new user account with bcrypt-hashed password"""
+    """Create a new user account with bcrypt-hashed password."""
     phone = payload.phone.strip()
     email = payload.email.strip().lower()
     password = payload.password.strip()
@@ -83,15 +83,15 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         raise HTTPException(400, "Phone or Email already registered.")
 
     # ✅ bcrypt hash (ensure proper truncation)
-    password = password[:72]  # truncate if longer than bcrypt limit
+    password = password[:72]  # bcrypt limit
     hashed_pw = bcrypt.hash(password)
 
-    # ✅ include 'name' in creation
+    # ✅ Create user with full name — no auto-splitting from email
     user = User(
         phone=phone,
         email=email,
         password_hash=hashed_pw,
-        name=name or email.split("@")[0],
+        name=name if name else None,  # only use provided name
         upi_id=upi_id
     )
 
@@ -100,7 +100,6 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     db.refresh(user)
 
     return {"ok": True, "message": "Account created successfully. Please login using OTP."}
-
 
 
 @router.post("/send-otp")

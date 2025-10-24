@@ -66,7 +66,7 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     """Create a new user account with bcrypt-hashed password"""
     phone = payload.phone.strip()
     email = payload.email.strip().lower()
-    password = payload.password.strip()
+    password = payload.password.strip()[:72]  # ✅ bcrypt-safe limit
     upi_id = payload.upi_id.strip() if payload.upi_id else None
 
     if not (phone.isdigit() and len(phone) == 10):
@@ -81,8 +81,13 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(400, "Phone or Email already registered.")
 
-    # ✅ bcrypt hash
-    hashed_pw = bcrypt.hash(password)
+    # ✅ safer bcrypt hashing using passlib wrapper
+    try:
+        from passlib.hash import bcrypt_sha256  # handles long passwords internally
+        hashed_pw = bcrypt_sha256.hash(password)
+    except Exception:
+        from passlib.hash import bcrypt
+        hashed_pw = bcrypt.hash(password[:72])  # fallback
 
     user = User(phone=phone, email=email, password_hash=hashed_pw, upi_id=upi_id)
     db.add(user)

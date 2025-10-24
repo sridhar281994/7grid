@@ -173,13 +173,24 @@ def get_me(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # ✅ Always ensure a readable name
+    name = user.name
+    if not name or not name.strip():
+        if user.email:
+            name = user.email.split("@", 1)[0]
+        elif user.phone:
+            name = user.phone
+        else:
+            name = "Player"
+
     return {
         "id": user.id,
         "phone": user.phone,
         "email": user.email,
-        "name": user.name,
+        "name": name.strip(),
         "upi_id": user.upi_id,
         "wallet_balance": float(user.wallet_balance or 0),
         "created_at": user.created_at.isoformat() if user.created_at else None,
     }
+
 

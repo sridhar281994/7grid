@@ -66,8 +66,9 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     """Create a new user account with bcrypt-hashed password"""
     phone = payload.phone.strip()
     email = payload.email.strip().lower()
-    password = payload.password.strip()[:72]  # ✅ bcrypt-safe limit
+    password = payload.password.strip()
     upi_id = payload.upi_id.strip() if payload.upi_id else None
+    name = (payload.name or "").strip() if hasattr(payload, "name") else None
 
     if not (phone.isdigit() and len(phone) == 10):
         raise HTTPException(400, "Enter a valid 10-digit phone number.")
@@ -81,20 +82,25 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(400, "Phone or Email already registered.")
 
-    # ✅ safer bcrypt hashing using passlib wrapper
-    try:
-        from passlib.hash import bcrypt_sha256  # handles long passwords internally
-        hashed_pw = bcrypt_sha256.hash(password)
-    except Exception:
-        from passlib.hash import bcrypt
-        hashed_pw = bcrypt.hash(password[:72])  # fallback
+    # ✅ bcrypt hash (ensure proper truncation)
+    password = password[:72]  # truncate if longer than bcrypt limit
+    hashed_pw = bcrypt.hash(password)
 
-    user = User(phone=phone, email=email, password_hash=hashed_pw, upi_id=upi_id)
+    # ✅ include 'name' in creation
+    user = User(
+        phone=phone,
+        email=email,
+        password_hash=hashed_pw,
+        name=name or email.split("@")[0],
+        upi_id=upi_id
+    )
+
     db.add(user)
     db.commit()
     db.refresh(user)
 
     return {"ok": True, "message": "Account created successfully. Please login using OTP."}
+
 
 
 @router.post("/send-otp")

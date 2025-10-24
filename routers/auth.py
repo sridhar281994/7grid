@@ -55,7 +55,9 @@ class RegisterIn(BaseModel):
     phone: str
     email: str
     password: str
+    name: str         
     upi_id: Optional[str] = None
+
 
 # =====================
 # Routes
@@ -63,13 +65,15 @@ class RegisterIn(BaseModel):
 
 @router.post("/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
-    """Create a new user account with bcrypt-hashed password."""
+    """Create a new user account with bcrypt-hashed password"""
     phone = payload.phone.strip()
     email = payload.email.strip().lower()
     password = payload.password.strip()
     upi_id = payload.upi_id.strip() if payload.upi_id else None
-    name = (payload.name or "").strip() if hasattr(payload, "name") else None
+    name = payload.name.strip()
 
+    if not name:
+        raise HTTPException(400, "Name is required.")
     if not (phone.isdigit() and len(phone) == 10):
         raise HTTPException(400, "Enter a valid 10-digit phone number.")
     if not email:
@@ -77,21 +81,18 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     if len(password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters.")
 
-    # check if phone or email already exists
     existing = db.query(User).filter((User.phone == phone) | (User.email == email)).first()
     if existing:
         raise HTTPException(400, "Phone or Email already registered.")
 
-    # ✅ bcrypt hash (ensure proper truncation)
-    password = password[:72]  # bcrypt limit
+    password = password[:72]
     hashed_pw = bcrypt.hash(password)
 
-    # ✅ Create user with full name — no auto-splitting from email
     user = User(
         phone=phone,
         email=email,
         password_hash=hashed_pw,
-        name=name if name else None,  # only use provided name
+        name=name,               # ✅ full name saved as entered
         upi_id=upi_id
     )
 

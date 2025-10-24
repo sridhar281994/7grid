@@ -8,7 +8,8 @@ pydantic-settings==2.3.4
 python-jose==3.3.0
 email-validator==2.2.0
 requests==2.32.3
-passlib[bcrypt]
+bcrypt==3.2.2
+passlib[bcrypt]==1.7.4
 websockets==12.0
 redis>=5.0
 setuptools

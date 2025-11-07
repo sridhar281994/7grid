@@ -722,27 +722,25 @@ async def forfeit_match(
     # --- Mark forfeited player as None ---
     players[loser_idx] = None
     continuing_players = [uid for uid in players if uid is not None]
-
     continuing = False
     winner_idx = None
 
-    # --- 2-Player: forfeit ends match ---
+    # --- 2P: forfeit ends match ---
     if expected_players == 2 or len(continuing_players) <= 1:
         continuing = False
-        # Determine winner (remaining non-loser)
         winner_idx = next((i for i, uid in enumerate(players) if uid is not None), None)
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
         if winner_idx is not None and m.stake_amount > 0:
             await distribute_prize(db, m, winner_idx)
 
-    # --- 3-Player: allow continuation if 2 players remain ---
+    # --- 3P: continue with remaining players ---
     elif expected_players == 3 and len(continuing_players) == 2:
         continuing = True
         m.status = MatchStatus.ACTIVE
         m.finished_at = None
 
-        # Update DB fields to remove forfeited player
+        # Remove forfeited player from DB slots
         if loser_idx == 0:
             m.p1_user_id = None
         elif loser_idx == 1:
@@ -750,20 +748,26 @@ async def forfeit_match(
         elif loser_idx == 2:
             m.p3_user_id = None
 
-        # Keep current turn safe within remaining players
-        m.current_turn = 0
+        # ✅ Determine safe next turn among remaining players
+        active_indices = [i for i, uid in enumerate(players) if uid is not None]
+        current_turn = m.current_turn or 0
+        if current_turn == loser_idx or current_turn not in active_indices:
+            # rotate turn to the next active player
+            idx = active_indices.index(active_indices[0])
+            current_turn = active_indices[(idx + 1) % len(active_indices)]
+        m.current_turn = current_turn
 
         db.commit()
         db.refresh(m)
 
-        # Notify all clients (forfeit but continuing)
+        # ✅ Persist to Redis with corrected active turn
         await _write_state(
             m,
             {
                 "positions": [0] * len(players),
                 "current_turn": m.current_turn,
                 "forfeit": True,
-                "loser": loser_idx,
+                "forfeit_actor": loser_idx,
                 "continuing": True,
                 "status": "ACTIVE",
             },
@@ -773,12 +777,13 @@ async def forfeit_match(
             "ok": True,
             "match_id": m.id,
             "forfeit": True,
-            "loser": loser_idx,
+            "forfeit_actor": loser_idx,
             "continuing": True,
             "num_players": expected_players,
+            "current_turn": m.current_turn,
         }
 
-    # --- Commit finalization for ended matches ---
+    # --- 2P end commit ---
     try:
         db.commit()
         db.refresh(m)
@@ -786,42 +791,32 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # --- Notify all clients (forfeit ended) ---
+    # ✅ Notify all clients (finalized match)
     await _write_state(
         m,
         {
             "positions": [0] * expected_players,
             "current_turn": 0,
-            "last_roll": None,
             "winner": winner_idx,
             "forfeit": True,
             "finished": True,
             "status": "FINISHED",
-            "actor": None,
-            "loser": loser_idx,
+            "forfeit_actor": loser_idx,
             "continuing": continuing,
         },
     )
 
-    # ✅ Let Redis message propagate
     await asyncio.sleep(1.0)
     await _clear_state(m.id)
-
-    merchant_info = {
-        "merchant_user_id": getattr(m, "merchant_user_id", None),
-        "system_fee": float(m.system_fee or 0),
-    }
 
     return {
         "ok": True,
         "match_id": m.id,
         "forfeit": True,
-        "loser": loser_idx,
+        "forfeit_actor": loser_idx,
         "winner": winner_idx,
-        "winner_name": _name_for_id(db, players[winner_idx]) if winner_idx is not None else None,
         "num_players": expected_players,
         "continuing": continuing,
-        **merchant_info,
     }
 
 

@@ -701,7 +701,7 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Handle player giving up (forfeit) — supports 3-player continuation."""
+    """Handle player giving up (forfeit) — supports 3-player continuation with safe turn rotation."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -719,7 +719,7 @@ async def forfeit_match(
     loser_idx = players.index(current_user.id)
     log.debug(f"[FORFEIT] uid={current_user.id} (idx={loser_idx}) forfeiting match_id={m.id}")
 
-    # --- Mark forfeited player as None ---
+    # --- Mark forfeited player as None and determine active ones ---
     players[loser_idx] = None
     continuing_players = [uid for uid in players if uid is not None]
     continuing = False
@@ -740,7 +740,7 @@ async def forfeit_match(
         m.status = MatchStatus.ACTIVE
         m.finished_at = None
 
-        # Remove forfeited player from DB slots
+        # Remove forfeited player from DB fields
         if loser_idx == 0:
             m.p1_user_id = None
         elif loser_idx == 1:
@@ -748,28 +748,37 @@ async def forfeit_match(
         elif loser_idx == 2:
             m.p3_user_id = None
 
-        # ✅ Determine safe next turn among remaining players
+        # ✅ Compute active player indices
         active_indices = [i for i, uid in enumerate(players) if uid is not None]
         current_turn = m.current_turn or 0
+
+        # If current turn belongs to forfeited player, rotate to next active
         if current_turn == loser_idx or current_turn not in active_indices:
-            # rotate turn to the next active player
             idx = active_indices.index(active_indices[0])
             current_turn = active_indices[(idx + 1) % len(active_indices)]
+
         m.current_turn = current_turn
 
-        db.commit()
-        db.refresh(m)
+        try:
+            db.commit()
+            db.refresh(m)
+        except SQLAlchemyError:
+            db.rollback()
+            raise HTTPException(status_code=500, detail="DB commit failed in forfeit")
 
-        # ✅ Persist to Redis with corrected active turn
+        # ✅ Write reduced Redis state (exclude forfeited player)
+        active_positions = [0] * len(continuing_players)
         await _write_state(
             m,
             {
-                "positions": [0] * len(players),
+                "positions": active_positions,
                 "current_turn": m.current_turn,
                 "forfeit": True,
                 "forfeit_actor": loser_idx,
                 "continuing": True,
                 "status": "ACTIVE",
+                "active_players": continuing_players,
+                "num_players": len(continuing_players),
             },
         )
 
@@ -779,11 +788,11 @@ async def forfeit_match(
             "forfeit": True,
             "forfeit_actor": loser_idx,
             "continuing": True,
-            "num_players": expected_players,
+            "num_players": len(continuing_players),
             "current_turn": m.current_turn,
         }
 
-    # --- 2P end commit ---
+    # --- Finalize normal (2-player) forfeit ---
     try:
         db.commit()
         db.refresh(m)
@@ -791,7 +800,7 @@ async def forfeit_match(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # ✅ Notify all clients (finalized match)
+    # ✅ Broadcast match finished to Redis
     await _write_state(
         m,
         {
@@ -818,7 +827,6 @@ async def forfeit_match(
         "num_players": expected_players,
         "continuing": continuing,
     }
-
 
 # -------------------------
 # Abandon (for free-play or waiting matches)

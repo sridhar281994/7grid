@@ -701,11 +701,11 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Handle player giving up (forfeit) — supports 3-player continuation with safe turn rotation."""
+    """Handle player giving up (forfeit) — fully removes them from match and notifies all others."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
-    if m.status not in [MatchStatus.ACTIVE, MatchStatus.FINISHED]:
+    if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
     expected_players = m.num_players or 2
@@ -719,113 +719,86 @@ async def forfeit_match(
     loser_idx = players.index(current_user.id)
     log.debug(f"[FORFEIT] uid={current_user.id} (idx={loser_idx}) forfeiting match_id={m.id}")
 
-    # --- Mark forfeited player as None and determine active ones ---
-    players[loser_idx] = None
-    continuing_players = [uid for uid in players if uid is not None]
-    continuing = False
-    winner_idx = None
+    # --- Remove forfeited player from DB ---
+    if loser_idx == 0:
+        m.p1_user_id = None
+    elif loser_idx == 1:
+        m.p2_user_id = None
+    elif loser_idx == 2:
+        m.p3_user_id = None
 
-    # --- 2P: forfeit ends match ---
-    if expected_players == 2 or len(continuing_players) <= 1:
-        continuing = False
-        winner_idx = next((i for i, uid in enumerate(players) if uid is not None), None)
+    # --- Build new player list ---
+    new_players = [uid for uid in [m.p1_user_id, m.p2_user_id, m.p3_user_id] if uid]
+    remaining_count = len(new_players)
+
+    # --- Case 1: Only one player left → declare winner ---
+    if remaining_count <= 1:
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
+        winner_idx = 0 if new_players else None
         if winner_idx is not None and m.stake_amount > 0:
             await distribute_prize(db, m, winner_idx)
-
-    # --- 3P: continue with remaining players ---
-    elif expected_players == 3 and len(continuing_players) == 2:
-        continuing = True
-        m.status = MatchStatus.ACTIVE
-        m.finished_at = None
-
-        # Remove forfeited player from DB fields
-        if loser_idx == 0:
-            m.p1_user_id = None
-        elif loser_idx == 1:
-            m.p2_user_id = None
-        elif loser_idx == 2:
-            m.p3_user_id = None
-
-        # ✅ Compute active player indices
-        active_indices = [i for i, uid in enumerate(players) if uid is not None]
-        current_turn = m.current_turn or 0
-
-        # If current turn belongs to forfeited player, rotate to next active
-        if current_turn == loser_idx or current_turn not in active_indices:
-            idx = active_indices.index(active_indices[0])
-            current_turn = active_indices[(idx + 1) % len(active_indices)]
-
-        m.current_turn = current_turn
-
-        try:
-            db.commit()
-            db.refresh(m)
-        except SQLAlchemyError:
-            db.rollback()
-            raise HTTPException(status_code=500, detail="DB commit failed in forfeit")
-
-        # ✅ Write reduced Redis state (exclude forfeited player)
-        active_positions = [0] * len(continuing_players)
+        db.commit()
         await _write_state(
             m,
             {
-                "positions": active_positions,
-                "current_turn": m.current_turn,
+                "positions": [0] * expected_players,
                 "forfeit": True,
                 "forfeit_actor": loser_idx,
-                "continuing": True,
-                "status": "ACTIVE",
-                "active_players": continuing_players,
-                "num_players": len(continuing_players),
+                "finished": True,
+                "status": "FINISHED",
+                "winner": winner_idx,
+                "message": f"Player {loser_idx + 1} gave up. Match ended.",
             },
         )
-
+        await asyncio.sleep(1.0)
+        await _clear_state(m.id)
         return {
             "ok": True,
             "match_id": m.id,
             "forfeit": True,
             "forfeit_actor": loser_idx,
-            "continuing": True,
-            "num_players": len(continuing_players),
-            "current_turn": m.current_turn,
+            "winner": winner_idx,
+            "continuing": False,
         }
 
-    # --- Finalize normal (2-player) forfeit ---
-    try:
-        db.commit()
-        db.refresh(m)
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+    # --- Case 2: Two or more remain → continue game ---
+    m.status = MatchStatus.ACTIVE
+    m.finished_at = None
+    m.num_players = remaining_count
 
-    # ✅ Broadcast match finished to Redis
+    # --- Update current_turn if it was the forfeited player ---
+    current_turn = m.current_turn or 0
+    if current_turn == loser_idx or (current_turn >= remaining_count):
+        current_turn = 0
+    m.current_turn = current_turn
+
+    db.commit()
+    db.refresh(m)
+
+    # --- Broadcast reduced player list and remove forfeited player from Redis ---
     await _write_state(
         m,
         {
-            "positions": [0] * expected_players,
-            "current_turn": 0,
-            "winner": winner_idx,
+            "positions": [0] * remaining_count,
+            "current_turn": m.current_turn,
             "forfeit": True,
-            "finished": True,
-            "status": "FINISHED",
             "forfeit_actor": loser_idx,
-            "continuing": continuing,
+            "continuing": True,
+            "status": "ACTIVE",
+            "visible_players": new_players,
+            "message": f"Player {loser_idx + 1} gave up and left the game.",
         },
     )
-
-    await asyncio.sleep(1.0)
-    await _clear_state(m.id)
 
     return {
         "ok": True,
         "match_id": m.id,
         "forfeit": True,
         "forfeit_actor": loser_idx,
-        "winner": winner_idx,
-        "num_players": expected_players,
-        "continuing": continuing,
+        "continuing": True,
+        "remaining_players": remaining_count,
+        "current_turn": m.current_turn,
     }
 
 # -------------------------

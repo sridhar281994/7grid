@@ -601,62 +601,51 @@ async def roll_dice(
     current_user: User = Depends(get_current_user),
 ) -> Dict:
     import copy
-
-    # --- Get match from DB ---
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # --- Determine players dynamically ---
-    expected_players = m.num_players or 2
-    players = [m.p1_user_id, m.p2_user_id]
-    if expected_players == 3:
-        players.append(m.p3_user_id)
+    # --- keep original slot order for turn math ---
+    all_slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    expected_players = m.num_players or len([x for x in all_slots if x is not None])
 
-    # ✅ Filter out forfeited / empty slots
-    players = [p for p in players if p is not None]
-    if not players:
-        raise HTTPException(status_code=400, detail="No active players remain")
-
-    # --- Verify turn ownership ---
-    if current_user.id not in players:
+    if current_user.id not in all_slots:
         raise HTTPException(status_code=403, detail="Not your match")
 
     curr = m.current_turn or 0
-    if curr >= len(players):
-        curr = 0  # fallback if invalid index after forfeit
+    if curr >= expected_players:
+        curr = 0
 
-    me_turn = players.index(current_user.id)
+    me_turn = all_slots.index(current_user.id)
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
-    # --- Roll dice ---
     roll = random.randint(1, 6)
-
-    # --- Load previous board state ---
     st = await _read_state(m.id) or {
         "positions": [0] * expected_players,
         "turn_count": 0,
-        "spawned": [False] * expected_players
+        "spawned": [False] * expected_players,
     }
-
     positions = [int(x) for x in st.get("positions", [0] * expected_players)]
     spawned = st.get("spawned", [False] * expected_players)
     turn_count = int(st.get("turn_count", 0)) + 1
 
-    # --- Apply roll logic ---
     positions, next_turn, winner, extra = _apply_roll(
         copy.deepcopy(positions),
         curr,
         roll,
-        len(players),
+        expected_players,
         turn_count,
-        spawned
+        spawned,
     )
 
-    # --- Update match state ---
+    # --- skip forfeited/empty slots when rotating ---
+    active_indices = [i for i, uid in enumerate(all_slots) if uid]
+    while next_turn not in active_indices:
+        next_turn = (next_turn + 1) % len(all_slots)
+
     m.last_roll = roll
     m.current_turn = next_turn
 
@@ -671,7 +660,6 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
-    # --- Persist updated state ---
     new_state = {
         "positions": positions,
         "current_turn": m.current_turn,
@@ -683,132 +671,60 @@ async def roll_dice(
         "turn_count": turn_count,
         "spawned": extra.get("spawned", spawned),
     }
-
     await _write_state(m, new_state)
-
-    # --- Respond to client ---
-    return {
-        "ok": True,
-        "match_id": m.id,
-        "roll": roll,
-        "turn": m.current_turn,
-        "positions": positions,
-        "winner": winner,
-        "reverse": extra.get("reverse", False),
-        "spawn": extra.get("spawn", False),
-        "actor": extra.get("actor"),
-        "turn_count": turn_count,
-    }
+    return {"ok": True, "match_id": m.id, "roll": roll, **new_state}
 
 
-# -------------------------
-# Forfeit / Give Up (Supports 3-Player Continuation)
-# -------------------------
 @router.post("/forfeit")
 async def forfeit_match(
     payload: ForfeitIn,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Handle player giving up (forfeit) — fully removes them from match and notifies all others."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    expected_players = m.num_players or 2
-    players = [m.p1_user_id, m.p2_user_id]
-    if expected_players == 3:
-        players.append(m.p3_user_id)
-
-    if current_user.id not in players:
+    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    if current_user.id not in slots:
         raise HTTPException(status_code=403, detail="Not your match")
+    loser_idx = slots.index(current_user.id)
 
-    loser_idx = players.index(current_user.id)
-    log.debug(f"[FORFEIT] uid={current_user.id} (idx={loser_idx}) forfeiting match_id={m.id}")
+    # mark forfeited but keep placeholder for turn rotation
+    slots[loser_idx] = None
+    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
-    # --- Remove forfeited player from DB ---
-    if loser_idx == 0:
-        m.p1_user_id = None
-    elif loser_idx == 1:
-        m.p2_user_id = None
-    elif loser_idx == 2:
-        m.p3_user_id = None
-
-    # --- Build new player list ---
-    new_players = [uid for uid in [m.p1_user_id, m.p2_user_id, m.p3_user_id] if uid]
-    remaining_count = len(new_players)
-
-    # --- Case 1: Only one player left → declare winner ---
-    if remaining_count <= 1:
+    active_indices = [i for i, uid in enumerate(slots) if uid]
+    if len(active_indices) <= 1:
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
-        winner_idx = 0 if new_players else None
-        if winner_idx is not None and m.stake_amount > 0:
-            await distribute_prize(db, m, winner_idx)
+        winner_idx = active_indices[0] if active_indices else None
         db.commit()
         await _write_state(
             m,
-            {
-                "positions": [0] * expected_players,
-                "forfeit": True,
-                "forfeit_actor": loser_idx,
-                "finished": True,
-                "status": "FINISHED",
-                "winner": winner_idx,
-                "message": f"Player {loser_idx + 1} gave up. Match ended.",
-            },
+            {"forfeit": True, "forfeit_actor": loser_idx, "winner": winner_idx, "finished": True},
         )
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1)
         await _clear_state(m.id)
-        return {
-            "ok": True,
-            "match_id": m.id,
-            "forfeit": True,
-            "forfeit_actor": loser_idx,
-            "winner": winner_idx,
-            "continuing": False,
-        }
+        return {"ok": True, "forfeit": True, "continuing": False, "winner": winner_idx}
 
-    # --- Case 2: Two or more remain → continue game ---
-    m.status = MatchStatus.ACTIVE
-    m.finished_at = None
-    m.num_players = remaining_count
-
-    # --- Update current_turn if it was the forfeited player ---
-    current_turn = m.current_turn or 0
-    if current_turn == loser_idx or (current_turn >= remaining_count):
-        current_turn = 0
-    m.current_turn = current_turn
+    if m.current_turn == loser_idx or m.current_turn >= len(slots):
+        m.current_turn = active_indices[0]
 
     db.commit()
-    db.refresh(m)
-
-    # --- Broadcast reduced player list and remove forfeited player from Redis ---
     await _write_state(
         m,
         {
-            "positions": [0] * remaining_count,
-            "current_turn": m.current_turn,
             "forfeit": True,
             "forfeit_actor": loser_idx,
             "continuing": True,
-            "status": "ACTIVE",
-            "visible_players": new_players,
-            "message": f"Player {loser_idx + 1} gave up and left the game.",
+            "visible_players": active_indices,
+            "current_turn": m.current_turn,
         },
     )
-
-    return {
-        "ok": True,
-        "match_id": m.id,
-        "forfeit": True,
-        "forfeit_actor": loser_idx,
-        "continuing": True,
-        "remaining_players": remaining_count,
-        "current_turn": m.current_turn,
-    }
+    return {"ok": True, "forfeit": True, "continuing": True, "current_turn": m.current_turn}
 
 # -------------------------
 # Abandon (for free-play or waiting matches)

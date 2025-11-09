@@ -36,14 +36,16 @@ def _normalize_db_url(raw: str) -> str:
 DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", ""))
 
 # Disable SQLAlchemy engine logs
+import logging
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 engine = create_engine(
     DATABASE_URL,
-    poolclass=NullPool,  # No pooling → avoids stale Render connections
+    poolclass=NullPool,
+    echo=False,        # disable SQL echo
     future=True,
-    echo=False           # Disable SQL query echo
 )
+
 
 # -----------------------------
 # Session

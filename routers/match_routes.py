@@ -693,7 +693,7 @@ async def roll_dice(
 
 
 # -------------------------
-# Forfeit / Give Up
+# Forfeit / Give Up (fixed turn rotation)
 # -------------------------
 @router.post("/forfeit")
 async def forfeit_match(
@@ -701,33 +701,30 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Player gives up — remove from active slots, continue game if >1 remain."""
+    """Handle player giving up (forfeit) — skip forfeited turn and continue properly."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
-    if current_user.id not in slots:
+    all_slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    if current_user.id not in all_slots:
         raise HTTPException(status_code=403, detail="Not your match")
-    loser_idx = slots.index(current_user.id)
 
-    # Mark forfeited but keep array shape for coin positions
-    slots[loser_idx] = None
-    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
+    loser_idx = all_slots.index(current_user.id)
+    all_slots[loser_idx] = None
+    m.p1_user_id, m.p2_user_id, m.p3_user_id = all_slots
 
-    # Identify remaining active slots
-    active_indices = [i for i, uid in enumerate(slots) if uid]
+    # Determine active slots after forfeit
+    active_indices = [i for i, uid in enumerate(all_slots) if uid]
     remaining_count = len(active_indices)
 
-    # --- Only one player left → winner immediately ---
+    # --- Case 1: Only one player left — declare winner ---
     if remaining_count <= 1:
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
         winner_idx = active_indices[0] if active_indices else None
-        if winner_idx is not None and m.stake_amount > 0:
-            await distribute_prize(db, m, winner_idx)
         db.commit()
         await _write_state(
             m,
@@ -736,45 +733,55 @@ async def forfeit_match(
                 "forfeit_actor": loser_idx,
                 "winner": winner_idx,
                 "finished": True,
-                "message": f"Player {loser_idx+1} gave up. Match ended.",
+                "message": f"Player {loser_idx + 1} gave up. Match ended.",
             },
         )
         await asyncio.sleep(1)
         await _clear_state(m.id)
         return {
             "ok": True,
+            "match_id": m.id,
             "forfeit": True,
-            "continuing": False,
             "winner": winner_idx,
+            "continuing": False,
         }
 
-    # --- Continue with other players ---
+    # --- Case 2: Multiple players remain — continue ---
+    # If forfeited player had the turn, rotate to next available player
+    current_turn = m.current_turn or 0
+    if current_turn == loser_idx or current_turn not in active_indices:
+        next_turn = None
+        for i in range(1, 4):  # max 3 players
+            t = (loser_idx + i) % 3
+            if t in active_indices:
+                next_turn = t
+                break
+        m.current_turn = next_turn if next_turn is not None else active_indices[0]
+
+    # Keep status active and persist
     m.status = MatchStatus.ACTIVE
-    if m.current_turn == loser_idx or m.current_turn >= 3:
-        m.current_turn = active_indices[0]
     db.commit()
+    db.refresh(m)
 
-    # Retrieve existing board so coins stay intact
-    st = await _read_state(m.id) or {"positions": [0, 0, 0]}
-    positions = st.get("positions", [0, 0, 0])
-
-    await _write_state(
-        m,
-        {
-            "positions": positions,
-            "current_turn": m.current_turn,
-            "forfeit": True,
-            "forfeit_actor": loser_idx,
-            "continuing": True,
-            "visible_players": active_indices,
-            "status": "ACTIVE",
-            "message": f"Player {loser_idx+1} gave up and left the game.",
-        },
-    )
+    # Broadcast updated game state (coins unchanged)
+    state = await _read_state(m.id) or {}
+    state.update({
+        "forfeit": True,
+        "forfeit_actor": loser_idx,
+        "continuing": True,
+        "visible_players": active_indices,
+        "current_turn": m.current_turn,
+        "positions": state.get("positions", [0, 0, 0]),
+        "spawned": state.get("spawned", [False, False, False]),
+        "message": f"Player {loser_idx + 1} gave up and left the game.",
+    })
+    await _write_state(m, state)
 
     return {
         "ok": True,
+        "match_id": m.id,
         "forfeit": True,
+        "forfeit_actor": loser_idx,
         "continuing": True,
         "remaining_players": remaining_count,
         "current_turn": m.current_turn,

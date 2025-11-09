@@ -609,17 +609,25 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # --- Determine players ---
+    # --- Determine players dynamically ---
     expected_players = m.num_players or 2
     players = [m.p1_user_id, m.p2_user_id]
     if expected_players == 3:
         players.append(m.p3_user_id)
 
-    # --- Verify turn ---
+    # ✅ Filter out forfeited / empty slots
+    players = [p for p in players if p is not None]
+    if not players:
+        raise HTTPException(status_code=400, detail="No active players remain")
+
+    # --- Verify turn ownership ---
     if current_user.id not in players:
         raise HTTPException(status_code=403, detail="Not your match")
 
     curr = m.current_turn or 0
+    if curr >= len(players):
+        curr = 0  # fallback if invalid index after forfeit
+
     me_turn = players.index(current_user.id)
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
@@ -627,7 +635,7 @@ async def roll_dice(
     # --- Roll dice ---
     roll = random.randint(1, 6)
 
-    # --- Load previous board state (including spawn info) ---
+    # --- Load previous board state ---
     st = await _read_state(m.id) or {
         "positions": [0] * expected_players,
         "turn_count": 0,
@@ -643,12 +651,12 @@ async def roll_dice(
         copy.deepcopy(positions),
         curr,
         roll,
-        expected_players,
+        len(players),
         turn_count,
         spawned
     )
 
-    # --- Update match ---
+    # --- Update match state ---
     m.last_roll = roll
     m.current_turn = next_turn
 
@@ -663,7 +671,7 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
-    # --- Persist new game state to Redis ---
+    # --- Persist updated state ---
     new_state = {
         "positions": positions,
         "current_turn": m.current_turn,
@@ -678,7 +686,7 @@ async def roll_dice(
 
     await _write_state(m, new_state)
 
-    # --- Return final response to client ---
+    # --- Respond to client ---
     return {
         "ok": True,
         "match_id": m.id,
@@ -691,6 +699,7 @@ async def roll_dice(
         "actor": extra.get("actor"),
         "turn_count": turn_count,
     }
+
 
 # -------------------------
 # Forfeit / Give Up (Supports 3-Player Continuation)

@@ -700,7 +700,7 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Player forfeits match. Removes them cleanly from rotation."""
+    """Player forfeits the match and rotation moves to next active player instantly."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -721,7 +721,7 @@ async def forfeit_match(
     # Recompute active players
     active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
 
-    # If one player left → finish match
+    # Case 1: only one left → finish
     if len(active_indices) <= 1:
         winner_idx = active_indices[0] if active_indices else None
         m.status = MatchStatus.FINISHED
@@ -733,32 +733,44 @@ async def forfeit_match(
             "winner": winner_idx,
             "finished": True
         })
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         await _clear_state(m.id)
         return {"ok": True, "forfeit": True, "continuing": False, "winner": winner_idx}
 
-    # If match continues → set next valid turn
+    # Case 2: game continues → rotate to next valid turn
     curr = m.current_turn or 0
     if curr == loser_idx or curr not in active_indices:
-        # Move to next valid player
+        # Move to next valid active player
         next_turn = active_indices[0]
     else:
+        # Skip any forfeited players
         next_turn = curr
         while next_turn in forfeited or slots[next_turn] is None:
             next_turn = (next_turn + 1) % 3
             if next_turn in active_indices:
                 break
-    m.current_turn = next_turn
 
+    m.current_turn = next_turn
     db.commit()
+
+    # Immediately sync Redis/WS with corrected turn
     await _write_state(m, {
         "forfeit": True,
         "forfeit_actor": loser_idx,
         "continuing": True,
         "current_turn": m.current_turn,
-        "visible_players": active_indices
+        "visible_players": active_indices,
+        "turn": m.current_turn,          # ✅ explicitly include for WebSocket push
+        "positions": [0, 0, 0],          # keep valid payload shape
+        "winner": None,
     })
-    return {"ok": True, "forfeit": True, "continuing": True, "current_turn": m.current_turn}
+
+    return {
+        "ok": True,
+        "forfeit": True,
+        "continuing": True,
+        "current_turn": m.current_turn
+    }
 
 
 # -------------------------

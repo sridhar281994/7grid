@@ -700,6 +700,7 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+    """Player forfeits match. Removes them cleanly from rotation."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -711,66 +712,53 @@ async def forfeit_match(
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = slots.index(current_user.id)
-    slots[loser_idx] = None
-    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
-
     forfeited = set(m.forfeit_ids or [])
     forfeited.add(current_user.id)
     m.forfeit_ids = list(forfeited)
+    slots[loser_idx] = None
+    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
+    # Recompute active players
     active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
-    active_players = [uid for uid in slots if uid and uid not in forfeited]
 
-    # --- End match if one or zero players remain ---
-    if len(active_players) <= 1:
+    # If one player left → finish match
+    if len(active_indices) <= 1:
+        winner_idx = active_indices[0] if active_indices else None
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
-        winner_idx = active_indices[0] if active_indices else None
         db.commit()
-        await _write_state(
-            m,
-            {
-                "forfeit": True,
-                "forfeit_actor": loser_idx,
-                "winner": winner_idx,
-                "finished": True,
-            },
-        )
-        await asyncio.sleep(0.5)
-        await _clear_state(m.id)
-        return {
-            "ok": True,
-            "forfeit": True,
-            "continuing": False,
-            "winner": winner_idx,
-        }
-
-    # --- Fix: ensure backend never returns forfeited player's turn ---
-    curr = m.current_turn or 0
-    if curr == loser_idx or curr not in active_indices:
-        m.current_turn = active_indices[0]
-    else:
-        if m.current_turn >= len(slots) or slots[m.current_turn] is None:
-            m.current_turn = active_indices[0]
-
-    db.commit()
-    await _write_state(
-        m,
-        {
+        await _write_state(m, {
             "forfeit": True,
             "forfeit_actor": loser_idx,
-            "continuing": True,
-            "visible_players": active_indices,
-            "current_turn": m.current_turn,
-        },
-    )
+            "winner": winner_idx,
+            "finished": True
+        })
+        await asyncio.sleep(0.3)
+        await _clear_state(m.id)
+        return {"ok": True, "forfeit": True, "continuing": False, "winner": winner_idx}
 
-    return {
-        "ok": True,
+    # If match continues → set next valid turn
+    curr = m.current_turn or 0
+    if curr == loser_idx or curr not in active_indices:
+        # Move to next valid player
+        next_turn = active_indices[0]
+    else:
+        next_turn = curr
+        while next_turn in forfeited or slots[next_turn] is None:
+            next_turn = (next_turn + 1) % 3
+            if next_turn in active_indices:
+                break
+    m.current_turn = next_turn
+
+    db.commit()
+    await _write_state(m, {
         "forfeit": True,
+        "forfeit_actor": loser_idx,
         "continuing": True,
         "current_turn": m.current_turn,
-    }
+        "visible_players": active_indices
+    })
+    return {"ok": True, "forfeit": True, "continuing": True, "current_turn": m.current_turn}
 
 
 # -------------------------

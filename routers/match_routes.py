@@ -712,21 +712,23 @@ async def forfeit_match(
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = slots.index(current_user.id)
+
+    # Add to forfeit list
     forfeited = set(m.forfeit_ids or [])
     forfeited.add(current_user.id)
     m.forfeit_ids = list(forfeited)
-    slots[loser_idx] = None
-    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
-    # Recompute active players
+    # Compute active players (not forfeited, non-null)
     active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
 
-    # Case 1: only one left → finish
+    # === CASE 1: Only one player remains → Declare winner ===
     if len(active_indices) <= 1:
         winner_idx = active_indices[0] if active_indices else None
         m.status = MatchStatus.FINISHED
+        m.winner_user_id = slots[winner_idx] if winner_idx is not None else None
         m.finished_at = datetime.now(timezone.utc)
         db.commit()
+
         await _write_state(m, {
             "forfeit": True,
             "forfeit_actor": loser_idx,
@@ -737,31 +739,28 @@ async def forfeit_match(
         await _clear_state(m.id)
         return {"ok": True, "forfeit": True, "continuing": False, "winner": winner_idx}
 
-    # Case 2: game continues → rotate to next valid turn
-    curr = m.current_turn or 0
-    if curr == loser_idx or curr not in active_indices:
-        # Move to next valid active player
-        next_turn = active_indices[0]
-    else:
-        # Skip any forfeited players
-        next_turn = curr
-        while next_turn in forfeited or slots[next_turn] is None:
-            next_turn = (next_turn + 1) % 3
-            if next_turn in active_indices:
-                break
+    # === CASE 2: Continue game → Skip forfeited player ===
+    curr_turn = m.current_turn or 0
+    next_turn = curr_turn
+
+    # If current player forfeited, move forward until valid player found
+    for _ in range(3):
+        next_turn = (next_turn + 1) % len(slots)
+        if slots[next_turn] and slots[next_turn] not in forfeited:
+            break
 
     m.current_turn = next_turn
     db.commit()
 
-    # Immediately sync Redis/WS with corrected turn
+    # === Push live state update ===
     await _write_state(m, {
         "forfeit": True,
         "forfeit_actor": loser_idx,
         "continuing": True,
         "current_turn": m.current_turn,
         "visible_players": active_indices,
-        "turn": m.current_turn,          # ✅ explicitly include for WebSocket push
-        "positions": [0, 0, 0],          # keep valid payload shape
+        "turn": m.current_turn,
+        "positions": [0, 0, 0],
         "winner": None,
     })
 

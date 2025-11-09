@@ -607,46 +607,57 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # --- Keep original slot order for stable coin mapping ---
+    # --- Stable slot order for coin tracking ---
     all_slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
-    expected_players = len([s for s in all_slots if s is not None]) or 2
+    active_indices = [i for i, uid in enumerate(all_slots) if uid]
+    if not active_indices:
+        raise HTTPException(status_code=400, detail="No active players remain")
 
+    expected_players = len(active_indices)
+
+    # --- Validate player identity ---
     if current_user.id not in all_slots:
         raise HTTPException(status_code=403, detail="Not your match")
 
+    # --- Ensure current_turn points to a live player ---
     curr = m.current_turn or 0
-    if curr >= 3:
-        curr = 0
+    if curr not in active_indices:
+        curr = active_indices[0]
+        m.current_turn = curr
 
+    # --- Player’s actual index in slot table ---
     me_turn = all_slots.index(current_user.id)
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
+    # --- Generate dice roll ---
     roll = random.randint(1, 6)
+
+    # --- Load prior state ---
     st = await _read_state(m.id) or {
         "positions": [0, 0, 0],
         "turn_count": 0,
         "spawned": [False, False, False],
     }
-
     positions = [int(x) for x in st.get("positions", [0, 0, 0])]
     spawned = st.get("spawned", [False, False, False])
     turn_count = int(st.get("turn_count", 0)) + 1
 
+    # --- Apply dice result ---
     positions, next_turn, winner, extra = _apply_roll(
         copy.deepcopy(positions),
         curr,
         roll,
-        3,  # fixed 3-slot indexing
+        3,  # fixed slots for consistent mapping
         turn_count,
         spawned,
     )
 
-    # --- Skip forfeited/empty slots during rotation ---
-    active_indices = [i for i, uid in enumerate(all_slots) if uid]
+    # --- Skip forfeited/empty slots when rotating ---
     while next_turn not in active_indices:
         next_turn = (next_turn + 1) % 3
 
+    # --- Persist new state ---
     m.last_roll = roll
     m.current_turn = next_turn
 
@@ -661,6 +672,7 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail="DB Error during roll")
 
+    # --- Construct broadcast payload ---
     new_state = {
         "positions": positions,
         "current_turn": m.current_turn,
@@ -672,8 +684,12 @@ async def roll_dice(
         "turn_count": turn_count,
         "spawned": extra.get("spawned", spawned),
     }
+
+    # --- Broadcast update to all players ---
     await _write_state(m, new_state)
+
     return {"ok": True, "match_id": m.id, "roll": roll, **new_state}
+
 
 
 # -------------------------

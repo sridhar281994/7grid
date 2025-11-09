@@ -701,27 +701,31 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Handle player giving up (forfeit) — skip forfeited turn and continue properly."""
+    """
+    Handles player forfeit cleanly in 2–3 player matches.
+    Removes player from GameMatch, updates state so turn cannot return to forfeited seat.
+    """
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    all_slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
-    if current_user.id not in all_slots:
+    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    if current_user.id not in slots:
         raise HTTPException(status_code=403, detail="Not your match")
 
-    loser_idx = all_slots.index(current_user.id)
-    all_slots[loser_idx] = None
-    m.p1_user_id, m.p2_user_id, m.p3_user_id = all_slots
+    loser_idx = slots.index(current_user.id)
+    slots[loser_idx] = None  # clear forfeited seat
 
-    # Determine active slots after forfeit
-    active_indices = [i for i, uid in enumerate(all_slots) if uid]
-    remaining_count = len(active_indices)
+    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
-    # --- Case 1: Only one player left — declare winner ---
-    if remaining_count <= 1:
+    # Compute remaining active players
+    active_indices = [i for i, uid in enumerate(slots) if uid]
+    active_players = [uid for uid in slots if uid]
+
+    # If one or zero players remain → finish match
+    if len(active_players) <= 1:
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
         winner_idx = active_indices[0] if active_indices else None
@@ -733,57 +737,46 @@ async def forfeit_match(
                 "forfeit_actor": loser_idx,
                 "winner": winner_idx,
                 "finished": True,
-                "message": f"Player {loser_idx + 1} gave up. Match ended.",
             },
         )
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
         await _clear_state(m.id)
         return {
             "ok": True,
-            "match_id": m.id,
             "forfeit": True,
-            "winner": winner_idx,
             "continuing": False,
+            "winner": winner_idx,
         }
 
-    # --- Case 2: Multiple players remain — continue ---
-    # If forfeited player had the turn, rotate to next available player
-    current_turn = m.current_turn or 0
-    if current_turn == loser_idx or current_turn not in active_indices:
-        next_turn = None
-        for i in range(1, 4):  # max 3 players
-            t = (loser_idx + i) % 3
-            if t in active_indices:
-                next_turn = t
-                break
-        m.current_turn = next_turn if next_turn is not None else active_indices[0]
+    # Rotate turn to next active player (skipping forfeited one)
+    curr = m.current_turn or 0
+    if curr == loser_idx or curr >= len(slots):
+        next_turn = 0
+        while next_turn < len(slots) and slots[next_turn] is None:
+            next_turn += 1
+        m.current_turn = next_turn if next_turn < len(slots) else active_indices[0]
+    else:
+        # If current turn is valid, keep it but ensure it's not None
+        if slots[m.current_turn] is None:
+            m.current_turn = active_indices[0]
 
-    # Keep status active and persist
-    m.status = MatchStatus.ACTIVE
+    # Commit and persist
     db.commit()
-    db.refresh(m)
-
-    # Broadcast updated game state (coins unchanged)
-    state = await _read_state(m.id) or {}
-    state.update({
-        "forfeit": True,
-        "forfeit_actor": loser_idx,
-        "continuing": True,
-        "visible_players": active_indices,
-        "current_turn": m.current_turn,
-        "positions": state.get("positions", [0, 0, 0]),
-        "spawned": state.get("spawned", [False, False, False]),
-        "message": f"Player {loser_idx + 1} gave up and left the game.",
-    })
-    await _write_state(m, state)
+    await _write_state(
+        m,
+        {
+            "forfeit": True,
+            "forfeit_actor": loser_idx,
+            "continuing": True,
+            "visible_players": active_indices,
+            "current_turn": m.current_turn,
+        },
+    )
 
     return {
         "ok": True,
-        "match_id": m.id,
         "forfeit": True,
-        "forfeit_actor": loser_idx,
         "continuing": True,
-        "remaining_players": remaining_count,
         "current_turn": m.current_turn,
     }
 

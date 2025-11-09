@@ -3,6 +3,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import ARRAY
 import enum
 
 from database import Base
@@ -107,6 +108,9 @@ class GameMatch(Base):
     # :moneybag: NEW → mark whether entry fee is refundable (waiting only)
     refundable = Column(Boolean, nullable=False, server_default=sa_text("true"))
 
+    # ✅ NEW — track forfeited players
+    forfeit_ids = Column(ARRAY(Integer), nullable=True, default=[])
+
     # Relationships
     player1 = relationship("User", foreign_keys=[p1_user_id], back_populates="matches_as_p1")
     player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
@@ -142,7 +146,7 @@ class Stake(Base):
     __tablename__ = "stakes"
 
     id = Column(Integer, primary_key=True, index=True)
-    stake_amount = Column(Integer, unique=True, nullable=False) # stage key
-    entry_fee = Column(Integer, nullable=False) # each player pays
-    winner_payout = Column(Integer, nullable=False) # winner gets
-    label = Column(String(50), nullable=False) # UI label
+    stake_amount = Column(Integer, unique=True, nullable=False)  # stage key
+    entry_fee = Column(Integer, nullable=False)  # each player pays
+    winner_payout = Column(Integer, nullable=False)  # winner gets
+    label = Column(String(50), nullable=False)  # UI label

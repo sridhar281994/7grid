@@ -591,7 +591,7 @@ async def check_match_ready(
     }
 
 # -------------------------
-# Roll Dice
+# Roll Dice (Fixed turn skipping forfeited players)
 # -------------------------
 @router.post("/roll")
 async def roll_dice(
@@ -606,16 +606,13 @@ async def roll_dice(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
-    # --- Base slots ---
     slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
-    forfeited = set((m.forfeit_ids or []))
+    forfeited = set(m.forfeit_ids or [])
     active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
     if not active_indices:
         raise HTTPException(status_code=400, detail="No active players remain")
 
-    expected_players = len([s for s in slots if s])
-
-    # --- Verify current user is a valid player ---
+    # --- Validation ---
     if current_user.id not in slots:
         raise HTTPException(status_code=403, detail="Not your match")
 
@@ -628,10 +625,9 @@ async def roll_dice(
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
 
-    # --- Generate roll ---
     roll = random.randint(1, 6)
 
-    # --- Read prior state ---
+    # --- Read existing state ---
     st = await _read_state(m.id) or {
         "positions": [0, 0, 0],
         "turn_count": 0,
@@ -641,7 +637,6 @@ async def roll_dice(
     spawned = st.get("spawned", [False, False, False])
     turn_count = int(st.get("turn_count", 0)) + 1
 
-    # --- Apply roll ---
     positions, next_turn, winner, extra = _apply_roll(
         copy.deepcopy(positions),
         curr,
@@ -651,7 +646,7 @@ async def roll_dice(
         spawned,
     )
 
-    # --- Recalculate next_turn safely ---
+    # --- Ensure next turn points to valid player ---
     valid_indices = [i for i in range(3) if slots[i] and slots[i] not in forfeited]
     if not valid_indices:
         m.status = MatchStatus.FINISHED
@@ -660,14 +655,12 @@ async def roll_dice(
         return {"ok": True, "match_id": m.id, "winner": None, "finished": True}
 
     if next_turn not in valid_indices:
-        start = curr
-        while True:
-            start = (start + 1) % 3
-            if start in valid_indices:
-                next_turn = start
+        # skip forfeited players
+        for _ in range(3):
+            next_turn = (next_turn + 1) % 3
+            if next_turn in valid_indices:
                 break
 
-    # --- Persist match ---
     m.last_roll = roll
     m.current_turn = next_turn
 
@@ -699,7 +692,7 @@ async def roll_dice(
 
 
 # -------------------------
-# Forfeit / Give Up (fixed turn rotation)
+# Forfeit / Give Up (Turn realignment fix)
 # -------------------------
 @router.post("/forfeit")
 async def forfeit_match(
@@ -707,10 +700,6 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """
-    Player forfeits the match.
-    Removes their slot, updates Redis and DB to prevent turn cycling back.
-    """
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -725,15 +714,14 @@ async def forfeit_match(
     slots[loser_idx] = None
     m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
-    # update forfeited list
     forfeited = set(m.forfeit_ids or [])
     forfeited.add(current_user.id)
     m.forfeit_ids = list(forfeited)
 
-    # recalc active
     active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
     active_players = [uid for uid in slots if uid and uid not in forfeited]
 
+    # --- End match if one or zero players remain ---
     if len(active_players) <= 1:
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
@@ -757,7 +745,7 @@ async def forfeit_match(
             "winner": winner_idx,
         }
 
-    # next turn assignment
+    # --- Fix: ensure backend never returns forfeited player's turn ---
     curr = m.current_turn or 0
     if curr == loser_idx or curr not in active_indices:
         m.current_turn = active_indices[0]
@@ -776,6 +764,7 @@ async def forfeit_match(
             "current_turn": m.current_turn,
         },
     )
+
     return {
         "ok": True,
         "forfeit": True,

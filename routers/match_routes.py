@@ -700,7 +700,7 @@ async def forfeit_match(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-    """Player forfeits the match and rotation moves to next active player instantly."""
+    """Player forfeits the match; immediately rotates to next active player or ends match."""
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -712,63 +712,77 @@ async def forfeit_match(
         raise HTTPException(status_code=403, detail="Not your match")
 
     loser_idx = slots.index(current_user.id)
-
-    # Add to forfeit list
     forfeited = set(m.forfeit_ids or [])
     forfeited.add(current_user.id)
     m.forfeit_ids = list(forfeited)
+    slots[loser_idx] = None
+    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
-    # Compute active players (not forfeited, non-null)
     active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
 
-    # === CASE 1: Only one player remains → Declare winner ===
+    # ---- Case 1: Only one active player left -> finish match ----
     if len(active_indices) <= 1:
         winner_idx = active_indices[0] if active_indices else None
         m.status = MatchStatus.FINISHED
-        m.winner_user_id = slots[winner_idx] if winner_idx is not None else None
         m.finished_at = datetime.now(timezone.utc)
         db.commit()
 
-        await _write_state(m, {
-            "forfeit": True,
-            "forfeit_actor": loser_idx,
-            "winner": winner_idx,
-            "finished": True
-        })
+        await _write_state(
+            m,
+            {
+                "forfeit": True,
+                "forfeit_actor": loser_idx,
+                "winner": winner_idx,
+                "finished": True,
+            },
+        )
         await asyncio.sleep(0.2)
         await _clear_state(m.id)
         return {"ok": True, "forfeit": True, "continuing": False, "winner": winner_idx}
 
-    # === CASE 2: Continue game → Skip forfeited player ===
+    # ---- Case 2: Continue game -> assign next valid turn ----
     curr_turn = m.current_turn or 0
-    next_turn = curr_turn
 
-    # If current player forfeited, move forward until valid player found
-    for _ in range(3):
-        next_turn = (next_turn + 1) % len(slots)
-        if slots[next_turn] and slots[next_turn] not in forfeited:
-            break
+    if curr_turn == loser_idx or curr_turn not in active_indices:
+        # If forfeiting player had the turn or was invalid, move to next active
+        sorted_indices = sorted(active_indices)
+        next_turn = None
+        for idx in sorted_indices:
+            if idx > loser_idx:
+                next_turn = idx
+                break
+        if next_turn is None:
+            next_turn = sorted_indices[0]
+    else:
+        # Current player remains valid
+        next_turn = curr_turn
+        while next_turn in forfeited or slots[next_turn] is None:
+            next_turn = (next_turn + 1) % 3
+            if next_turn in active_indices:
+                break
 
     m.current_turn = next_turn
     db.commit()
 
-    # === Push live state update ===
-    await _write_state(m, {
-        "forfeit": True,
-        "forfeit_actor": loser_idx,
-        "continuing": True,
-        "current_turn": m.current_turn,
-        "visible_players": active_indices,
-        "turn": m.current_turn,
-        "positions": [0, 0, 0],
-        "winner": None,
-    })
+    await _write_state(
+        m,
+        {
+            "forfeit": True,
+            "forfeit_actor": loser_idx,
+            "continuing": True,
+            "current_turn": m.current_turn,
+            "visible_players": active_indices,
+            "turn": m.current_turn,
+            "positions": [0, 0, 0],
+            "winner": None,
+        },
+    )
 
     return {
         "ok": True,
         "forfeit": True,
         "continuing": True,
-        "current_turn": m.current_turn
+        "current_turn": m.current_turn,
     }
 
 

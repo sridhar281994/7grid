@@ -5,11 +5,8 @@ from fastapi.responses import RedirectResponse
 from database import Base, engine, SessionLocal
 from models import User
 from routers import auth, users, wallet, game, match_routes
-app = FastAPI(title="Spin Dice API", version="1.0.0")
 
-logging.basicConfig(level=logging.DEBUG) # or INFO in production
-logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO) # show SQL queries
-logging.getLogger("matches").setLevel(logging.DEBUG) # custom match logs
+app = FastAPI(title="Spin Dice API", version="1.0.0")
 
 # -------------------------
 # CORS
@@ -21,6 +18,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # -------------------------
 # Startup helpers
 # -------------------------
@@ -59,25 +57,35 @@ def ensure_bots():
         db.commit()
     finally:
         db.close()
+
+
 @app.on_event("startup")
 async def on_startup():
     # Ensure DB tables
     Base.metadata.create_all(bind=engine)
     print(":white_check_mark: Database tables ensured/created.")
+
     # Insert bot rows
     ensure_bots()
+
     # Redis warm-up
     from utils.redis_client import init_redis_with_retry
     await init_redis_with_retry(max_retries=5, delay=2.0)
+
+
 # -------------------------
 # Routes
 # -------------------------
 @app.get("/")
 def root():
     return RedirectResponse("/docs")
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
 # -------------------------
 # Routers
 # -------------------------

@@ -43,11 +43,11 @@ def deduct_entry_fee(db: Session, user: User, entry_fee: int):
 
 
 # -------------------------
-# Prize Distribution (Updated Logic)
+# Prize Distribution (Corrected Logic)
 # -------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
-    Updated prize logic per new structure:
+    Corrected prize logic:
 
     3-player:
       4rs game → each pays 2 → winner gets 4, merchant gets 2
@@ -62,7 +62,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     stake = int(match.stake_amount or 0)
     num_players = int(match.num_players or 2)
 
-    # Define distribution per config
+    # Define distribution per your structure
     if num_players == 3:
         if stake == 4:
             winner_prize, system_fee, loser_loss = 4, 2, 2
@@ -71,7 +71,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         elif stake == 12:
             winner_prize, system_fee, loser_loss = 12, 6, 6
         else:
-            winner_prize, system_fee, loser_loss = (stake * 2), stake, stake // 2
+            winner_prize, system_fee, loser_loss = int(stake * 1.0), int(stake * 0.5), int(stake / (num_players - 1))
     else:  # 2-player
         if stake == 4:
             winner_prize, system_fee, loser_loss = 3, 1, 2
@@ -80,7 +80,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         elif stake == 12:
             winner_prize, system_fee, loser_loss = 9, 3, 6
         else:
-            winner_prize, system_fee, loser_loss = int(stake * 0.75), int(stake * 0.25), stake // 2
+            winner_prize, system_fee, loser_loss = int(stake * 0.75), int(stake * 0.25), int(stake / (num_players - 1))
 
     # Identify players
     players = [match.p1_user_id, match.p2_user_id]
@@ -131,7 +131,6 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     db.refresh(match)
 
     print(f"[DISTRIBUTE] Completed for match {match.id}")
-
 
 
 # -------------------------

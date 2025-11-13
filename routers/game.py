@@ -7,9 +7,7 @@ from sqlalchemy import text, select, and_
 from database import get_db
 from models import User, GameMatch, MatchStatus, Stake
 from utils.security import get_current_user
-from utils.wallet_utils import distribute_prize  # ✅ IMPORTANT
-
-import asyncio
+from utils.wallet_utils import distribute_prize   # ✅ IMPORTANT FIX
 
 router = APIRouter(prefix="/game", tags=["game"])
 
@@ -71,18 +69,20 @@ def request_match(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Request to join/create a match with DB-driven rules."""
+    """Request to join/create a 3-player match with DB-driven rules.
+    Deducts wallet immediately, refunds instantly if no match is available.
+    """
     rule = get_stake_rule(db, payload.stake_amount)
     if not rule:
         raise HTTPException(400, "Invalid stake selected")
 
     entry_fee = rule["entry_fee"]
 
-    # Must have enough balance
+    # Skip wallet deduction for Free Play
     if entry_fee > 0 and (user.wallet_balance or 0) < entry_fee:
         raise HTTPException(400, "Insufficient wallet for entry fee")
 
-    # Deduct entry fee first (escrow)
+    # Deduct entry fee first (escrow style)
     if entry_fee > 0:
         user.wallet_balance = (user.wallet_balance or 0) - entry_fee
         db.commit()
@@ -98,20 +98,18 @@ def request_match(
         ).order_by(GameMatch.id.asc())
     ).scalars().first()
 
-    # Second join
-    if waiting and waiting.p1_user_id != user.id and not waiting.p2_user_id:
-        waiting.p2_user_id = user.id
-        db.commit()
-        return {"ok": True, "match_id": waiting.id, "status": waiting.status.value}
-
-    # Third join (make active)
-    if waiting and waiting.p2_user_id and not waiting.p3_user_id:
+    if waiting and waiting.p1_user_id != user.id and waiting.p2_user_id and not waiting.p3_user_id:
         waiting.p3_user_id = user.id
         waiting.status = MatchStatus.ACTIVE
         db.commit()
         return {"ok": True, "match_id": waiting.id, "status": waiting.status.value}
 
-    # No match found → refund
+    if waiting and waiting.p1_user_id != user.id and not waiting.p2_user_id:
+        waiting.p2_user_id = user.id
+        db.commit()
+        return {"ok": True, "match_id": waiting.id, "status": waiting.status.value}
+
+    # No match found → refund immediately
     if entry_fee > 0:
         user.wallet_balance = (user.wallet_balance or 0) + entry_fee
         db.commit()
@@ -121,30 +119,31 @@ def request_match(
 
 
 @router.post("/complete")
-def complete_match(
+async def complete_match(
     payload: CompleteIn,
     db: Session = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
-    """Mark a match as complete and award payout using wallet_utils."""
+    """Mark a match as complete and award payout through wallet_utils."""
     m = db.get(GameMatch, payload.match_id)
     if not m:
         raise HTTPException(404, "Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(400, "Match not active")
 
-    # Winner must be part of match
+    if me.id not in {m.p1_user_id, m.p2_user_id, m.p3_user_id}:
+        raise HTTPException(403, "Only participants can complete the match")
     if payload.winner_user_id not in {m.p1_user_id, m.p2_user_id, m.p3_user_id}:
         raise HTTPException(400, "Winner must be p1, p2, or p3")
 
-    # Determine winner index
-    players = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    # Determine winner index for prize logic
+    players = [m.p1_user_id, m.p2_user_id]
+    if m.num_players == 3:
+        players.append(m.p3_user_id)
+
     winner_idx = players.index(payload.winner_user_id)
 
-    # 🔥 Call prize distribution
-    asyncio.run(distribute_prize(db, m, winner_idx))
-
-    m.status = MatchStatus.FINISHED
-    db.commit()
+    # Call the real payout logic
+    await distribute_prize(db, m, winner_idx)
 
     return {"ok": True, "match_id": m.id, "winner_user_id": payload.winner_user_id}

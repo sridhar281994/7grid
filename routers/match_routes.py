@@ -878,39 +878,64 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
     await websocket.accept()
     print(f"[WS] New connection: user={current_user.id} match_id={match_id}")
 
-    # ✅ Always fetch a live Redis client
     r = await _get_redis()
     if not r:
         err = "Redis unavailable - closing socket"
         print(f"[WS][ERROR] {err}")
-        await websocket.send_text(json.dumps({"error": err}))
+        try:
+            await websocket.send_text(json.dumps({"error": err}))
+        except:
+            pass
         await websocket.close()
         return
 
-    # ✅ PubSub subscription
     pubsub = r.pubsub()
     await pubsub.subscribe(f"match:{match_id}:events")
     print(f"[WS] Subscribed to Redis channel match:{match_id}:events")
 
     try:
         while True:
-            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+            try:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+            except Exception:
+                msg = None
+
+            # -------------------------
+            # Redis Event
+            # -------------------------
             if msg and msg.get("type") == "message":
                 try:
-                    event = json.loads(msg["data"])  # ✅ ensure valid JSON
+                    event = json.loads(msg["data"])
                     print(f"[WS][EVENT] Redis → {event}")
-                    await websocket.send_text(json.dumps(event))
+
+                    # SAFE SEND
+                    try:
+                        await websocket.send_text(json.dumps(event))
+                    except Exception:
+                        print("[WS] Client disconnected during event send.")
+                        break
+
                 except Exception as e:
                     print(f"[WS][WARN] Raw Redis msg: {msg['data']} ({e})")
-                    await websocket.send_text(msg["data"])
+                    try:
+                        await websocket.send_text(msg["data"])
+                    except:
+                        print("[WS] Client disconnected during raw send.")
+                        break
+
             else:
-                # --- Fallback: snapshot sync from DB ---
+                # -------------------------
+                # SNAPSHOT fallback
+                # -------------------------
                 db = SessionLocal()
                 try:
                     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
                     if not m:
                         print(f"[WS][ERROR] Match not found: {match_id}")
-                        await websocket.send_text(json.dumps({"error": "Match not found"}))
+                        try:
+                            await websocket.send_text(json.dumps({"error": "Match not found"}))
+                        except:
+                            pass
                         break
 
                     expected_players = m.num_players or 2
@@ -936,12 +961,18 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "positions": st.get("positions", [0] * expected_players),
                         "winner": st.get("winner"),
                         "turn_count": st.get("turn_count", 0),
-                        "reverse": st.get("reverse", False),  # ✅ include flags in snapshots too
+                        "reverse": st.get("reverse", False),
                         "spawn": st.get("spawn", False),
                         "actor": st.get("actor"),
                     }
                     print(f"[WS][SNAPSHOT] {snapshot}")
-                    await websocket.send_text(json.dumps(snapshot))
+
+                    try:
+                        await websocket.send_text(json.dumps(snapshot))
+                    except Exception:
+                        print("[WS] Client disconnected during snapshot.")
+                        break
+
                 finally:
                     db.close()
 
@@ -949,13 +980,16 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
 
     except WebSocketDisconnect:
         print(f"[WS] Closed for match {match_id} (user={current_user.id})")
+
     finally:
         try:
             await pubsub.unsubscribe(f"match:{match_id}:events")
             await pubsub.close()
         except Exception as e:
             print(f"[WS][WARN] PubSub cleanup failed: {e}")
+
         print(f"[WS] Unsubscribed + closed Redis pubsub for match {match_id}")
+
 
 
 # -------------------------

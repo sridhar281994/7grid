@@ -43,41 +43,41 @@ def deduct_entry_fee(db: Session, user: User, entry_fee: int):
 
 
 # -------------------------
-# Prize Distribution (Corrected Logic)
+# Prize Distribution (Stake 2 / 4 / 6 Logic)
 # -------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
-    Corrected prize logic:
+    Updated prize logic (stakes 2, 4, 6):
 
     3-player:
-      4rs game → each pays 2 → winner gets 4, merchant gets 2
-      8rs game → each pays 4 → winner gets 8, merchant gets 4
-      12rs game → each pays 6 → winner gets 12, merchant gets 6
+      2rs game → each pays 2 → winner gets 4, merchant gets 2
+      4rs game → each pays 4 → winner gets 8, merchant gets 4
+      6rs game → each pays 6 → winner gets 12, merchant gets 6
 
     2-player:
-      4rs game → loser pays 2 → winner gets 3, merchant gets 1
-      8rs game → loser pays 4 → winner gets 6, merchant gets 2
-      12rs game → loser pays 6 → winner gets 9, merchant gets 3
+      2rs game → loser pays 2 → winner gets 3, merchant gets 1
+      4rs game → loser pays 4 → winner gets 6, merchant gets 2
+      6rs game → loser pays 6 → winner gets 9, merchant gets 3
     """
     stake = int(match.stake_amount or 0)
     num_players = int(match.num_players or 2)
 
-    # Define distribution per your structure
+    # Define distribution per new structure
     if num_players == 3:
-        if stake == 4:
+        if stake == 2:
             winner_prize, system_fee, loser_loss = 4, 2, 2
-        elif stake == 8:
+        elif stake == 4:
             winner_prize, system_fee, loser_loss = 8, 4, 4
-        elif stake == 12:
+        elif stake == 6:
             winner_prize, system_fee, loser_loss = 12, 6, 6
         else:
             winner_prize, system_fee, loser_loss = int(stake * 1.0), int(stake * 0.5), int(stake / (num_players - 1))
     else:  # 2-player
-        if stake == 4:
+        if stake == 2:
             winner_prize, system_fee, loser_loss = 3, 1, 2
-        elif stake == 8:
+        elif stake == 4:
             winner_prize, system_fee, loser_loss = 6, 2, 4
-        elif stake == 12:
+        elif stake == 6:
             winner_prize, system_fee, loser_loss = 9, 3, 6
         else:
             winner_prize, system_fee, loser_loss = int(stake * 0.75), int(stake * 0.25), int(stake / (num_players - 1))

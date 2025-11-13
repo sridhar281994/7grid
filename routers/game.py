@@ -154,20 +154,19 @@ def complete_match(
     db: Session = Depends(get_db),
     me: User = Depends(get_current_user)
 ):
-    """
-    Complete a match using new distribute_prize() payout logic.
-    """
     m = db.get(GameMatch, payload.match_id)
     if not m:
         raise HTTPException(404, "Match not found")
 
-    if m.status != MatchStatus.ACTIVE:
-        raise HTTPException(400, "Match is not active")
+    # If match already completed, do nothing
+    if m.status == MatchStatus.FINISHED:
+        return {"ok": True, "already_completed": True}
 
+    # Only allow participants
     if me.id not in {m.p1_user_id, m.p2_user_id, m.p3_user_id}:
         raise HTTPException(403, "Not a participant")
 
-    # Determine winners list
+    # Validate winner
     players = [m.p1_user_id, m.p2_user_id]
     if m.num_players == 3:
         players.append(m.p3_user_id)
@@ -177,7 +176,7 @@ def complete_match(
 
     winner_idx = players.index(payload.winner_user_id)
 
-    # RUN PRIZE DISTRIBUTION
+    # Distribute prize
     from routers.wallet_utils import distribute_prize
     import asyncio
     asyncio.run(distribute_prize(db, m, winner_idx))

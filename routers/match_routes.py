@@ -600,6 +600,7 @@ async def roll_dice(
     current_user: User = Depends(get_current_user),
 ) -> Dict:
     import copy
+
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -641,13 +642,13 @@ async def roll_dice(
         copy.deepcopy(positions),
         curr,
         roll,
-        3,
+        m.num_players,
         turn_count,
         spawned,
     )
 
     # --- Ensure next turn points to valid player ---
-    valid_indices = [i for i in range(3) if slots[i] and slots[i] not in forfeited]
+    valid_indices = [i for i in range(m.num_players) if slots[i] and slots[i] not in forfeited]
     if not valid_indices:
         m.status = MatchStatus.FINISHED
         await _clear_state(m.id)
@@ -655,18 +656,62 @@ async def roll_dice(
         return {"ok": True, "match_id": m.id, "winner": None, "finished": True}
 
     if next_turn not in valid_indices:
-        # skip forfeited players
-        for _ in range(3):
-            next_turn = (next_turn + 1) % 3
+        for _ in range(m.num_players):
+            next_turn = (next_turn + 1) % m.num_players
             if next_turn in valid_indices:
                 break
 
     m.last_roll = roll
     m.current_turn = next_turn
 
+    # ======================================================
+    #                WINNER HANDLING + PAYOUT
+    # ======================================================
     if winner is not None:
+        winner_uid = slots[winner]
         m.status = MatchStatus.FINISHED
+        m.winner_user_id = winner_uid
+        m.finished_at = datetime.utcnow()
+
+        # Fetch payout from stakes table
+        stake_row = db.execute(
+            text("""
+                SELECT winner_payout FROM stakes
+                WHERE stake_amount=:amt AND players=:p
+                LIMIT 1
+            """),
+            {"amt": m.stake_amount, "p": m.num_players},
+        ).first()
+
+        payout = stake_row[0] if stake_row else 0
+
+        # Update wallet
+        if winner_uid and winner_uid > 0:
+            db.execute(
+                text("""
+                    UPDATE users
+                    SET wallet_balance = wallet_balance + :amt
+                    WHERE id = :uid
+                """),
+                {"amt": payout, "uid": winner_uid},
+            )
+
+            # Record transaction
+            db.execute(
+                text("""
+                    INSERT INTO transactions (user_id, amount, transaction_id)
+                    VALUES (:uid, :amt, :txid)
+                """),
+                {
+                    "uid": winner_uid,
+                    "amt": payout,
+                    "txid": f"win-{m.id}-{time.time()}",
+                },
+            )
+
         await _clear_state(m.id)
+
+    # ======================================================
 
     try:
         db.commit()
@@ -689,6 +734,7 @@ async def roll_dice(
 
     await _write_state(m, new_state)
     return {"ok": True, "match_id": m.id, "roll": roll, **new_state}
+
 
 
 # -------------------------

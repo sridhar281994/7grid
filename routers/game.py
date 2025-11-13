@@ -49,19 +49,21 @@ class CompleteIn(BaseModel):
 # -------------------------
 @router.get("/stakes")
 def list_stakes(db: Session = Depends(get_db)):
-    """List all available stake rules for frontend stage screen."""
     rows = db.execute(
-        text("SELECT stake_amount, entry_fee, winner_payout, label FROM stakes ORDER BY stake_amount ASC")
+        text("SELECT stake_amount, entry_fee, winner_payout, players, label FROM stakes ORDER BY stake_amount ASC")
     ).mappings().all()
+
     return [
         {
             "stake_amount": int(r["stake_amount"]),
             "entry_fee": float(r["entry_fee"]),
             "winner_payout": float(r["winner_payout"]),
+            "players": int(r["players"]),    # ✅ IMPORTANT
             "label": r["label"],
         }
         for r in rows
     ]
+
 
 
 @router.post("/request")

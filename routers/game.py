@@ -119,32 +119,37 @@ def request_match(
     return {"ok": False, "refund": True, "msg": "No opponent found. Entry fee refunded."}
 
 
+from routers.wallet_utils import distribute_prize   # <-- REQUIRED
+
 @router.post("/complete")
 async def complete_match(
     payload: CompleteIn,
     db: Session = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
-    """Mark a match as complete and award payout through wallet_utils."""
+    """Mark match complete and run prize distribution."""
     m = db.get(GameMatch, payload.match_id)
     if not m:
         raise HTTPException(404, "Match not found")
+
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(400, "Match not active")
 
     if me.id not in {m.p1_user_id, m.p2_user_id, m.p3_user_id}:
         raise HTTPException(403, "Only participants can complete the match")
+
     if payload.winner_user_id not in {m.p1_user_id, m.p2_user_id, m.p3_user_id}:
         raise HTTPException(400, "Winner must be p1, p2, or p3")
 
-    # Determine winner index for prize logic
-    players = [m.p1_user_id, m.p2_user_id]
-    if m.num_players == 3:
-        players.append(m.p3_user_id)
-
+    # Determine winner index
+    players = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
     winner_idx = players.index(payload.winner_user_id)
 
-    # Call the real payout logic
     await distribute_prize(db, m, winner_idx)
 
-    return {"ok": True, "match_id": m.id, "winner_user_id": payload.winner_user_id}
+    return {
+        "ok": True,
+        "match_id": m.id,
+        "winner_user_id": payload.winner_user_id,
+        "msg": "Prize distributed"
+    }

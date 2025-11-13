@@ -7,7 +7,8 @@ from sqlalchemy import text, select, and_
 from database import get_db
 from models import User, GameMatch, MatchStatus, Stake
 from utils.security import get_current_user
-from utils.wallet_utils import distribute_prize   # ✅ IMPORTANT FIX
+from .wallet_utils import distribute_prize
+
 
 router = APIRouter(prefix="/game", tags=["game"])
 

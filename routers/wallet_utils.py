@@ -3,7 +3,7 @@ from sqlalchemy import select
 from datetime import datetime
 import uuid
 
-from models import User, GameMatch, WalletTransaction, TxType, TxStatus
+from models import User, GameMatch, WalletTransaction, TxType, TxStatus, MatchStatus
 
 
 def _log_transaction(db: Session, user_id: int, amount: float, tx_type: TxType, status: TxStatus, note=None):
@@ -14,35 +14,37 @@ def _log_transaction(db: Session, user_id: int, amount: float, tx_type: TxType, 
         status=status,
         provider_ref=note,
         transaction_id=str(uuid.uuid4()),
-        timestamp=datetime.utcnow()
     )
     db.add(tx)
-    db.commit()
-    db.refresh(tx)
+    db.flush()
     return tx
 
 
 def _lock_user(db: Session, user_id: int) -> User:
+    """Lock a user row FOR UPDATE and return it."""
     return db.execute(
         select(User).where(User.id == user_id).with_for_update()
-    ).scalar_one_or_none()
+    ).scalar_one()
 
 
-# --------------------------------------------------
-# DISTRIBUTE PRIZE (FINAL VERSION)
-# --------------------------------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
+    """
+    Distribute prize & system fee for a finished match.
+
+    - Supports 2-player and 3-player matches.
+    - Uses your requested hard-coded payout rules (2,4,6 etc).
+    - Logs wallet transactions for winner, losers, and system fee.
+    """
+
     stake = int(match.stake_amount)
     num_players = int(match.num_players)
 
-    # Load financial rule from DB
-    rule = db.execute(
-        select(
-            WalletTransaction
-        ).where(WalletTransaction.id == -1)
+    # Optional: load rule from DB (currently unused, but kept for future)
+    _ = db.execute(
+        select(WalletTransaction).where(WalletTransaction.id == -1)
     )
 
-    # Your hardcoded payout logic stays as requested
+    # ---- Payout logic ----
     if num_players == 3:
         if stake == 2:
             winner_prize, system_fee, loser_loss = 4, 2, 2
@@ -52,7 +54,6 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
             winner_prize, system_fee, loser_loss = 12, 6, 6
         else:
             winner_prize, system_fee, loser_loss = stake * 2, stake, stake
-
     else:  # 2 players
         if stake == 2:
             winner_prize, system_fee, loser_loss = 3, 1, 2
@@ -78,31 +79,44 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
             old_bal = loser.wallet_balance or 0
             new_bal = max(0, old_bal - loser_loss)
             loser.wallet_balance = new_bal
+
             _log_transaction(
-                db, loser.id, -loser_loss,
-                TxType.WITHDRAW, TxStatus.SUCCESS,
-                f"Match {match.id} Loss"
+                db,
+                loser.id,
+                -float(loser_loss),
+                TxType.MATCH_LOSS,
+                TxStatus.SUCCESS,
+                f"Match {match.id} Loss",
             )
 
     # Credit winner
-    old = winner.wallet_balance or 0
-    winner.wallet_balance = old + winner_prize
+    old_winner_bal = winner.wallet_balance or 0
+    new_winner_bal = old_winner_bal + winner_prize
+    winner.wallet_balance = new_winner_bal
+
     _log_transaction(
-        db, winner.id, winner_prize,
-        TxType.WIN, TxStatus.SUCCESS,
-        f"Match {match.id} Win"
+        db,
+        winner.id,
+        float(winner_prize),
+        TxType.WIN,
+        TxStatus.SUCCESS,
+        f"Match {match.id} Win",
     )
 
     # System fee
     _log_transaction(
-        db, 0, system_fee,
-        TxType.FEE, TxStatus.SUCCESS,
-        f"Match {match.id} Fee"
+        db,
+        0,
+        float(system_fee),
+        TxType.FEE,
+        TxStatus.SUCCESS,
+        f"Match {match.id} Fee",
     )
 
-    match.system_fee = system_fee
+    # Update match record correctly using enum
+    match.system_fee = float(system_fee)
     match.winner_user_id = winner_id
-    match.status = "finished"
+    match.status = MatchStatus.FINISHED
     match.finished_at = datetime.utcnow()
 
     db.commit()

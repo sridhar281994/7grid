@@ -69,81 +69,52 @@ def _get_stake_rule_for_match(db: Session, match: GameMatch):
 # --------------------------------------------------
 # DISTRIBUTE PRIZE (FIXED TO USE STAKES TABLE)
 # --------------------------------------------------
-async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
-    """
-    Distribute prize for a finished match.
+async def distribute_prize(db, match: GameMatch, winner_idx: int):
+    stake = match.stake_amount
+    num_players = match.num_players
+    entry_fee = stake // num_players if stake > 0 else 0
 
-    IMPORTANT:
-    - Entry fee has ALREADY been deducted in /game/request (and/or match join).
-    - Here we ONLY:
-        * Credit the winner with winner_payout from stakes table
-        * Record system fee = sum(entry_fee for all players) - winner_payout
-        * DO NOT deduct again from losers (no double-charging).
-    """
-    num_players = int(match.num_players or 2)
-    stake = int(match.stake_amount)
+    players = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:num_players]
+    winner_uid = players[winner_idx]
 
-    # --- Determine players in slot order ---
-    players = [match.p1_user_id, match.p2_user_id]
-    if num_players == 3:
-        players.append(match.p3_user_id)
+    # Winner record
+    winner = db.query(User).filter(User.id == winner_uid).first()
+    before = winner.wallet_balance
+    winner.wallet_balance += stake
+    after = winner.wallet_balance
 
-    winner_user_id = players[winner_idx]
+    db.add(MatchResult(
+        match_id=match.id,
+        user_id=winner_uid,
+        is_winner=True,
+        amount_change=stake,
+        before_balance=before,
+        after_balance=after
+    ))
 
-    # --- Load stake rule from DB (align with /game/request logic) ---
-    rule = _get_stake_rule_for_match(db, match)
+    # Losers
+    for i, uid in enumerate(players):
+        if i == winner_idx:
+            continue
 
-    if rule:
-        entry_fee = rule["entry_fee"]          # Decimal
-        winner_payout = rule["winner_payout"]  # Decimal
+        user = db.query(User).filter(User.id == uid).first()
+        if not user:
+            continue
 
-        total_entry = entry_fee * Decimal(num_players)
-        system_fee_amount = total_entry - winner_payout
-        if system_fee_amount < 0:
-            # Safety: never negative system fee
-            system_fee_amount = Decimal(0)
-    else:
-        # Fallback if stakes row missing: keep old-ish behavior but WITHOUT
-        # touching losers again. Winner gets stake * players, fee = 0.
-        entry_fee = Decimal(stake)
-        winner_payout = Decimal(stake * num_players)
-        system_fee_amount = Decimal(0)
+        before = user.wallet_balance
+        user.wallet_balance -= entry_fee
+        after = user.wallet_balance
 
-    # --- CREDIT WINNER (no second loss for losers) ---
-    winner = _lock_user(db, winner_user_id)
-    if not winner:
-        # Should never happen, but don't crash whole match
-        return
+        db.add(MatchResult(
+            match_id=match.id,
+            user_id=uid,
+            is_winner=False,
+            amount_change=-entry_fee,
+            before_balance=before,
+            after_balance=after
+        ))
 
-    old_balance = Decimal(winner.wallet_balance or 0)
-    new_balance = old_balance + winner_payout
-    winner.wallet_balance = float(new_balance)
-
-    _log_transaction(
-        db,
-        winner.id,
-        float(winner_payout),
-        TxType.WIN,
-        TxStatus.SUCCESS,
-        f"Match {match.id} Win (stake={stake}, players={num_players})",
-    )
-
-    # --- SYSTEM FEE RECORD ---
-    if system_fee_amount > 0:
-        _log_transaction(
-            db,
-            0,  # system / house account
-            float(system_fee_amount),
-            TxType.FEE,
-            TxStatus.SUCCESS,
-            f"Match {match.id} Fee",
-        )
-
-    # --- UPDATE MATCH RECORD CORRECTLY ---
-    match.system_fee = float(system_fee_amount)
-    match.winner_user_id = winner_user_id
-    match.status = MatchStatus.FINISHED
-    match.finished_at = datetime.utcnow()
+    match.winner_user_id = winner_uid
+    match.finished_at = datetime.now(timezone.utc)
 
     db.commit()
-    db.refresh(match)

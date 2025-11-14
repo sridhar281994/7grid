@@ -609,7 +609,7 @@ async def check_match_ready(
     }
 
 # -------------------------
-# Roll Dice (Fixed turn skipping forfeited players)
+# Roll Dice (STRICT single-turn rotation)
 # -------------------------
 @router.post("/roll")
 async def roll_dice(
@@ -653,7 +653,7 @@ async def roll_dice(
 
     me_turn = slots.index(current_user.id)
 
-    # Reject only if backend is 100% sure it's not user's turn
+    # Strict turn check
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
     # -------------------------
@@ -672,8 +672,8 @@ async def roll_dice(
     spawned = st.get("spawned", [False] * num_players)
     turn_count = int(st.get("turn_count", 0)) + 1
 
-    # Apply roll – THIS returns correct next_turn (even extra-turn logic)
-    positions, next_turn, winner, extra = _apply_roll(
+    # Apply roll
+    positions, _, winner, extra = _apply_roll(
         copy.deepcopy(positions),
         curr,
         roll,
@@ -683,9 +683,11 @@ async def roll_dice(
     )
 
     # -------------------------
-    # FORFEIT-SAFE TURN FIX
+    # STRICT SINGLE TURN ROTATION
     # -------------------------
-    # ONLY modify turn if it lands on a forfeited player
+    next_turn = (curr + 1) % num_players
+
+    # Skip forfeited
     if next_turn not in active_indices:
         for _ in range(num_players):
             next_turn = (next_turn + 1) % num_players
@@ -693,7 +695,7 @@ async def roll_dice(
                 break
     # -------------------------
 
-    # Update match state
+    # Update match
     m.last_roll = roll
     m.current_turn = next_turn
 
@@ -708,7 +710,6 @@ async def roll_dice(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-    # Prepare write payload
     new_state = {
         "positions": positions,
         "current_turn": m.current_turn,
@@ -724,7 +725,6 @@ async def roll_dice(
     await _write_state(m, new_state)
 
     return {"ok": True, "match_id": m.id, "roll": roll, **new_state}
-
 
 
 # -------------------------

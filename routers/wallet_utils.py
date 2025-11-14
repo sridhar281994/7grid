@@ -39,9 +39,10 @@ def _lock_user(db: Session, user_id: int) -> User:
 def _get_stake_rule_for_match(db: Session, match: GameMatch):
     """
     Read stake rule from the stakes table based on match.stake_amount
-    and match.num_players (2 or 3), same schema as used in game.py:
-
+    and match.num_players (2 or 3).
+    Uses:
         stake_amount, entry_fee, winner_payout, players, label
+    And computes system_fee = entry_fee * players - winner_payout
     """
     row = db.execute(
         text(
@@ -57,42 +58,55 @@ def _get_stake_rule_for_match(db: Session, match: GameMatch):
     if not row:
         return None
 
+    entry_fee = Decimal(row["entry_fee"])
+    players = int(row["players"])
+    winner_payout = Decimal(row["winner_payout"])
+
+    total_entry = entry_fee * players
+    system_fee = total_entry - winner_payout  # always matches your sheet
+
     return {
         "stake_amount": int(row["stake_amount"]),
-        "entry_fee": Decimal(row["entry_fee"]),
-        "winner_payout": Decimal(row["winner_payout"]),
-        "players": int(row["players"]),
+        "entry_fee": entry_fee,
+        "winner_payout": winner_payout,
+        "players": players,
         "label": row["label"],
+        "system_fee": system_fee,
     }
-
 
 # --------------------------------------------------
 # DISTRIBUTE PRIZE (FIXED TO USE STAKES TABLE)
 # --------------------------------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
-
-    # Fetch rule for this exact stake & players count
-    rule = db.execute(text("""
-        SELECT entry_fee, winner_payout, players FROM stakes
-        WHERE stake_amount = :amt AND players = :p
-    """), {"amt": match.stake_amount, "p": match.num_players}).mappings().first()
-
+    """
+    Clean 2-player / 3-player prize distribution.
+    Uses stakes table for entry_fee, winner_payout, system_fee.
+    Winner gets winner_payout.
+    Each loser loses entry_fee.
+    Merchant gets system_fee.
+    """
+    rule = _get_stake_rule_for_match(db, match)
     if not rule:
-        raise Exception("Stake rule missing")
+        # No stake rule configured – nothing to do
+        return
 
     entry_fee = rule["entry_fee"]
     winner_payout = rule["winner_payout"]
-    system_fee = match.system_fee or 0
+    players = rule["players"]
+    system_fee = rule["system_fee"]
 
-    players = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:match.num_players]
-    winner_uid = players[winner_idx]
+    slots = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:players]
+    winner_uid = slots[winner_idx]
 
     # --------------------------
     # Winner update
     # --------------------------
     winner = db.query(User).filter(User.id == winner_uid).first()
+    if not winner:
+        return
+
     before = winner.wallet_balance
-    winner.wallet_balance += winner_payout
+    winner.wallet_balance = (winner.wallet_balance or 0) + winner_payout
     after = winner.wallet_balance
 
     db.add(MatchResult(
@@ -101,21 +115,22 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         is_winner=True,
         amount_change=winner_payout,
         before_balance=before,
-        after_balance=after
+        after_balance=after,
     ))
 
     # --------------------------
     # Losers update
     # --------------------------
-    for i, uid in enumerate(players):
-        if i == winner_idx:
-            continue
-        if not uid:
+    for i, uid in enumerate(slots):
+        if i == winner_idx or not uid:
             continue
 
         user = db.query(User).filter(User.id == uid).first()
+        if not user:
+            continue
+
         before = user.wallet_balance
-        user.wallet_balance -= entry_fee
+        user.wallet_balance = (user.wallet_balance or 0) - entry_fee
         after = user.wallet_balance
 
         db.add(MatchResult(
@@ -124,17 +139,17 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
             is_winner=False,
             amount_change=-entry_fee,
             before_balance=before,
-            after_balance=after
+            after_balance=after,
         ))
 
     # --------------------------
-    # Merchant fee credit
+    # System fee → Merchant wallet
     # --------------------------
     if system_fee > 0:
-        merchant = db.query(User).filter(User.id == 1).first()
+        merchant = db.query(User).filter(User.id == 1).first()  # admin ID
         if merchant:
             before = merchant.wallet_balance
-            merchant.wallet_balance += system_fee
+            merchant.wallet_balance = (merchant.wallet_balance or 0) + system_fee
             after = merchant.wallet_balance
 
             db.add(MatchResult(
@@ -144,10 +159,12 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
                 amount_change=system_fee,
                 before_balance=before,
                 after_balance=after,
-                is_system=True
+                is_system=True,
             ))
 
+    # Keep match record consistent
+    match.system_fee = system_fee
     match.winner_user_id = winner_uid
-    match.finished_at = datetime.utcnow()
+    match.finished_at = datetime.now(timezone.utc)
 
     db.commit()

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
-from routers.wallet_utils import distribute_prize
+from routers.wallet_utils import distribute_prize, get_stake_rule
 from redis_client import redis_client, _get_redis  # ✅ shared redis instance
 import logging
 
@@ -345,7 +345,7 @@ class ForfeitIn(BaseModel):  # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or join match (Correct entry-fee deduction for 2P & 3P)
+# Create or join match (uses stakes table, proper entry_fee)
 # -------------------------
 @router.post("/create")
 async def create_or_wait_match(
@@ -356,15 +356,24 @@ async def create_or_wait_match(
     try:
         stake_amount = int(payload.stake_amount)
         num_players = int(payload.num_players or 2)
-        entry_fee = stake_amount // num_players if stake_amount > 0 else 0
 
-        log.debug(f"[CREATE] uid={current_user.id} stake={stake_amount} players={num_players} entry_fee={entry_fee}")
+        # ---- Load stake rule from stakes table ----
+        rule = get_stake_rule(db, stake_amount, num_players)
+        if not rule:
+            raise HTTPException(status_code=400, detail="Invalid stake configuration")
 
-        # --- Check balance BEFORE join ---
+        entry_fee = rule["entry_fee"]
+
+        log.debug(
+            f"[CREATE] uid={current_user.id} stake={stake_amount} "
+            f"players={num_players} entry_fee={entry_fee}"
+        )
+
+        # ---- Check balance BEFORE doing anything ----
         if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # --- Try joining existing WAITING match ---
+        # ---- Try joining existing WAITING match ----
         q = (
             db.query(GameMatch)
             .filter(
@@ -384,13 +393,10 @@ async def create_or_wait_match(
         waiting = q.with_for_update(skip_locked=True).first()
 
         if waiting:
-            # -----------------------------------
-            # Charge ONLY the joining player now
-            # -----------------------------------
+            # Player is joining an existing waiting match.
+            # P1 should have been charged when creating; we charge this user now.
             if entry_fee > 0:
-                current_user.wallet_balance -= entry_fee
-                db.commit()
-                db.refresh(current_user)
+                current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
 
             if num_players == 2:
                 waiting.p2_user_id = current_user.id
@@ -409,7 +415,7 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            # Initialize board state when ACTIVE
+            # Initialize board state when match becomes ACTIVE
             await _write_state(waiting, {"positions": [0] * num_players})
 
             return {
@@ -428,11 +434,11 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn or 0,
             }
 
-        # -----------------------------------
-        # Otherwise create a WAITING match
-        # Charge ONLY the creator (P1)?
-        # No! P1 is NOT charged until someone joins.
-        # -----------------------------------
+        # ---- No WAITING match → create new WAITING match ----
+        # We still charge P1 now so everyone pays entry_fee once.
+        if entry_fee > 0:
+            current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
+
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -443,12 +449,13 @@ async def create_or_wait_match(
             current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
             num_players=num_players,
             created_at=_utcnow(),
+            merchant_user_id=1,  # admin / system owner
         )
         db.add(new_match)
         db.commit()
         db.refresh(new_match)
 
-        # Initial empty board
+        # Initial empty board for WAITING match
         await _write_state(new_match, {"positions": [0] * num_players})
 
         log.debug(f"[CREATE] new WAITING match_id={new_match.id} by {current_user.id}")
@@ -473,7 +480,6 @@ async def create_or_wait_match(
         db.rollback()
         log.exception("DB error in /matches/create")
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
-
 
 # -------------------------
 # Check Match Readiness / Poll Sync (Updated for forfeit detection)
@@ -637,7 +643,7 @@ async def check_match_ready(
     }
 
 # -------------------------
-# Roll Dice (STRICT single-turn rotation)
+# Roll Dice (STRICT single-turn rotation, stakes-based prize)
 # -------------------------
 @router.post("/roll")
 async def roll_dice(
@@ -672,7 +678,7 @@ async def roll_dice(
         raise HTTPException(status_code=403, detail="Not your match")
 
     # -------------------------
-    # TURN VALIDATION FIX
+    # TURN VALIDATION
     # -------------------------
     curr = m.current_turn or 0
 
@@ -687,9 +693,10 @@ async def roll_dice(
     # Strict turn check
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
-    # -------------------------
 
+    # -------------------------
     # Roll dice
+    # -------------------------
     roll = random.randint(1, 6)
 
     # Read redis state
@@ -736,7 +743,7 @@ async def roll_dice(
         db.commit()
         db.refresh(m)
 
-        # FIX: distribute prize HERE
+        # stakes-based prize distribution
         await distribute_prize(db, m, winner)
 
         # Broadcast winner before clearing state
@@ -753,7 +760,7 @@ async def roll_dice(
         }
         await _write_state(m, new_state)
 
-        # Delay a bit before clearing state so loser devices receive FINISHED
+        # Short delay so loser devices receive FINISHED
         await asyncio.sleep(1)
         await _clear_state(m.id)
 
@@ -787,6 +794,7 @@ async def roll_dice(
     await _write_state(m, new_state)
 
     return {"ok": True, "match_id": m.id, "roll": roll, **new_state}
+
 
 
 # -------------------------

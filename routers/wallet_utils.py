@@ -69,7 +69,14 @@ def _get_stake_rule_for_match(db: Session, match: GameMatch):
 # --------------------------------------------------
 # DISTRIBUTE PRIZE (FIXED TO USE STAKES TABLE)
 # --------------------------------------------------
-async def distribute_prize(db, match: GameMatch, winner_idx: int):
+async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
+    """
+    Clean 2-player / 3-player prize distribution.
+    Uses match.system_fee (already in DB).
+    Winner gets stake_amount - system_fee.
+    Each loser loses entry_fee.
+    """
+
     stake = match.stake_amount
     num_players = match.num_players
     entry_fee = stake // num_players if stake > 0 else 0
@@ -77,22 +84,29 @@ async def distribute_prize(db, match: GameMatch, winner_idx: int):
     players = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:num_players]
     winner_uid = players[winner_idx]
 
-    # Winner record
+    system_fee = match.system_fee or 0
+    winner_prize = stake - system_fee
+
+    # --------------------------
+    # Winner update
+    # --------------------------
     winner = db.query(User).filter(User.id == winner_uid).first()
     before = winner.wallet_balance
-    winner.wallet_balance += stake
+    winner.wallet_balance += winner_prize
     after = winner.wallet_balance
 
     db.add(MatchResult(
         match_id=match.id,
         user_id=winner_uid,
         is_winner=True,
-        amount_change=stake,
+        amount_change=winner_prize,
         before_balance=before,
         after_balance=after
     ))
 
-    # Losers
+    # --------------------------
+    # Losers update
+    # --------------------------
     for i, uid in enumerate(players):
         if i == winner_idx:
             continue
@@ -114,6 +128,29 @@ async def distribute_prize(db, match: GameMatch, winner_idx: int):
             after_balance=after
         ))
 
+    # --------------------------
+    # System fee → Merchant wallet
+    # --------------------------
+    if system_fee > 0:
+        merchant = db.query(User).filter(User.id == 1).first()   # <-- your admin ID
+        if merchant:
+            before = merchant.wallet_balance
+            merchant.wallet_balance += system_fee
+            after = merchant.wallet_balance
+
+            db.add(MatchResult(
+                match_id=match.id,
+                user_id=merchant.id,
+                is_winner=False,
+                amount_change=system_fee,
+                before_balance=before,
+                after_balance=after,
+                is_system=True
+            ))
+
+    # --------------------------
+    # Finish match
+    # --------------------------
     match.winner_user_id = winner_uid
     match.finished_at = datetime.now(timezone.utc)
 

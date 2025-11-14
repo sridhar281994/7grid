@@ -611,7 +611,9 @@ async def roll_dice(
     # Prepare slots
     slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
     forfeited = set(m.forfeit_ids or [])
-    active_indices = [i for i, uid in enumerate(slots) if uid and uid not in forfeited]
+
+    num_players = m.num_players or 2
+    active_indices = [i for i, uid in enumerate(slots[:num_players]) if uid and uid not in forfeited]
 
     if not active_indices:
         raise HTTPException(status_code=400, detail="No active players remain")
@@ -625,7 +627,7 @@ async def roll_dice(
     # -------------------------
     curr = m.current_turn or 0
 
-    # If stored turn points to a forfeited / empty slot → select next valid
+    # Fix illegal turn (forfeited or empty)
     if curr not in active_indices:
         curr = active_indices[0]
         m.current_turn = curr
@@ -633,16 +635,13 @@ async def roll_dice(
 
     me_turn = slots.index(current_user.id)
 
-    # Only reject if backend is 100% sure it's not the user's turn
+    # Reject only if backend is 100% sure it's not user's turn
     if me_turn != curr:
         raise HTTPException(status_code=409, detail="Not your turn")
     # -------------------------
 
     # Roll dice
     roll = random.randint(1, 6)
-
-    # Determine # of players dynamically (REAL FIX)
-    num_players = m.num_players or 2
 
     # Read redis state
     st = await _read_state(m.id) or {
@@ -655,31 +654,26 @@ async def roll_dice(
     spawned = st.get("spawned", [False] * num_players)
     turn_count = int(st.get("turn_count", 0)) + 1
 
-    # Apply roll (FIXED num_players)
+    # Apply roll – THIS returns correct next_turn (even extra-turn logic)
     positions, next_turn, winner, extra = _apply_roll(
         copy.deepcopy(positions),
         curr,
         roll,
-        num_players,        # ← FIXED (no more hardcoded 3)
+        num_players,
         turn_count,
         spawned,
     )
 
-    # Validate next_turn: skip forfeited players
-    valid_indices = [i for i in range(num_players) if slots[i] and slots[i] not in forfeited]
-
-    if not valid_indices:
-        m.status = MatchStatus.FINISHED
-        await _clear_state(m.id)
-        db.commit()
-        return {"ok": True, "match_id": m.id, "winner": None, "finished": True}
-
-    if next_turn not in valid_indices:
-        # Skip until hitting a valid player
+    # -------------------------
+    # FORFEIT-SAFE TURN FIX
+    # -------------------------
+    # ONLY modify turn if it lands on a forfeited player
+    if next_turn not in active_indices:
         for _ in range(num_players):
             next_turn = (next_turn + 1) % num_players
-            if next_turn in valid_indices:
+            if next_turn in active_indices:
                 break
+    # -------------------------
 
     # Update match state
     m.last_roll = roll

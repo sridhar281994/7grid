@@ -13,10 +13,10 @@ from database import Base
 # Enums
 # -----------------------
 class MatchStatus(enum.Enum):
-    WAITING = "waiting"
-    ACTIVE = "active"
-    FINISHED = "finished"
-    ABANDONED = "abandoned"
+    WAITING = "WAITING"
+    ACTIVE = "ACTIVE"
+    FINISHED = "FINISHED"
+    ABANDONED = "ABANDONED"
 
 
 class TxType(enum.Enum):

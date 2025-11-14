@@ -482,6 +482,7 @@ async def check_match_ready(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
+
     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -490,7 +491,7 @@ async def check_match_ready(
     now = int(time.time())
     waiting_time = max(0, now - int(m.created_at.timestamp()) if m.created_at else 0)
 
-    # --- Load current Redis state ---
+    # --- Load Redis state ---
     st = await _read_state(m.id) or {
         "positions": [0] * expected_players,
         "turn_count": 0,
@@ -512,17 +513,18 @@ async def check_match_ready(
         f"turn={turn} waiting={waiting_time}s spawned={spawned}"
     )
 
-    # ✅ Handle stale WAITING matches → offer bot
+    # -------------------------------
+    # BOT PROMPT LOGIC (same as yours)
+    # -------------------------------
     if m.status == MatchStatus.WAITING and waiting_time >= STALE_TIMEOUT_SECS:
         if accept_bot:
-            # Deduct entry fee if needed
             entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
             if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
                 raise HTTPException(status_code=400, detail="Insufficient balance for bot match")
+
             if entry_fee > 0:
                 current_user.wallet_balance -= entry_fee
 
-            # Fill empty slots with bots
             if not m.p2_user_id:
                 m.p2_user_id = -1000
             if expected_players == 3 and not m.p3_user_id:
@@ -533,11 +535,9 @@ async def check_match_ready(
             db.commit()
             db.refresh(m)
 
-            # Write initial state
             await _write_state(m, {"positions": [0] * expected_players, "spawned": [False] * expected_players})
 
         else:
-            # Ask frontend to show bot prompt
             return {
                 "ready": False,
                 "finished": False,
@@ -558,23 +558,48 @@ async def check_match_ready(
                 "prompt_bot": True,
             }
 
-    # ✅ Auto-advance inactive turns
+    # ---------------------------
+    # AUTO-ADVANCE LOGIC
+    # ---------------------------
     if m.status == MatchStatus.ACTIVE:
         try:
             await _auto_advance_if_needed(m, db)
         except Exception:
             log.exception("[CHECK] auto-advance failed")
 
-    # ✅ Detect if a forfeit happened (match finished but not yet shown to players)
-    if m.status == MatchStatus.FINISHED and winner_idx is None:
-        # Fetch winner info from DB directly
-        winner_idx = 0
-        for i, uid in enumerate([m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]):
-            if uid == m.winner_user_id:
-                winner_idx = i
-                break
-        log.debug(f"[FORFEIT DETECTED] winner_idx={winner_idx} winner_user_id={m.winner_user_id}")
+    # ---------------------------
+    # FINISHED MATCH — RETURN CLEAN RESPONSE
+    # ---------------------------
+    if m.status == MatchStatus.FINISHED:
+        # Resolve winner if not already in Redis
+        if winner_idx is None:
+            winner_idx = 0
+            ids = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]
+            for i, uid in enumerate(ids):
+                if uid == m.winner_user_id:
+                    winner_idx = i
+                    break
 
+        return {
+            "ready": True,
+            "finished": True,
+            "match_id": m.id,
+            "status": _status_value(m),
+            "stake": m.stake_amount,
+            "num_players": expected_players,
+            "p1": _name_for_id(db, m.p1_user_id),
+            "p2": _name_for_id(db, m.p2_user_id),
+            "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
+            "p1_id": m.p1_user_id,
+            "p2_id": m.p2_user_id,
+            "p3_id": m.p3_user_id,
+            "winner": winner_idx,
+            "finished_at": m.finished_at.isoformat() if m.finished_at else None,
+        }
+
+    # ---------------------------
+    # ACTIVE MATCH NORMAL RESPONSE
+    # ---------------------------
     ready_flag = (
         m.status == MatchStatus.ACTIVE
         and m.p1_user_id is not None
@@ -584,7 +609,7 @@ async def check_match_ready(
 
     return {
         "ready": ready_flag,
-        "finished": m.status == MatchStatus.FINISHED,
+        "finished": False,
         "match_id": m.id,
         "status": _status_value(m),
         "stake": m.stake_amount,

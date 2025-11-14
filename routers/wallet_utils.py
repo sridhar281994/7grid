@@ -1,12 +1,17 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, text
 from datetime import datetime
 import uuid
+from decimal import Decimal
 
 from models import User, GameMatch, WalletTransaction, TxType, TxStatus, MatchStatus
 
 
-def _log_transaction(db: Session, user_id: int, amount: float, tx_type: TxType, status: TxStatus, note=None):
+def _log_transaction(db: Session, user_id: int, amount: float,
+                     tx_type: TxType, status: TxStatus, note=None):
+    """
+    Create a wallet transaction row and commit immediately.
+    """
     tx = WalletTransaction(
         user_id=user_id,
         amount=amount,
@@ -14,108 +19,129 @@ def _log_transaction(db: Session, user_id: int, amount: float, tx_type: TxType, 
         status=status,
         provider_ref=note,
         transaction_id=str(uuid.uuid4()),
+        timestamp=datetime.utcnow(),
     )
     db.add(tx)
-    db.flush()
+    db.commit()
+    db.refresh(tx)
     return tx
 
 
 def _lock_user(db: Session, user_id: int) -> User:
-    """Lock a user row FOR UPDATE and return it."""
+    """
+    Lock a user row FOR UPDATE and return it (or None).
+    """
     return db.execute(
         select(User).where(User.id == user_id).with_for_update()
-    ).scalar_one()
+    ).scalar_one_or_none()
 
 
+def _get_stake_rule_for_match(db: Session, match: GameMatch):
+    """
+    Read stake rule from the stakes table based on match.stake_amount
+    and match.num_players (2 or 3), same schema as used in game.py:
+
+        stake_amount, entry_fee, winner_payout, players, label
+    """
+    row = db.execute(
+        text(
+            """
+            SELECT stake_amount, entry_fee, winner_payout, players, label
+            FROM stakes
+            WHERE stake_amount = :amt AND players = :p
+            """
+        ),
+        {"amt": int(match.stake_amount), "p": int(match.num_players or 2)},
+    ).mappings().first()
+
+    if not row:
+        return None
+
+    return {
+        "stake_amount": int(row["stake_amount"]),
+        "entry_fee": Decimal(row["entry_fee"]),
+        "winner_payout": Decimal(row["winner_payout"]),
+        "players": int(row["players"]),
+        "label": row["label"],
+    }
+
+
+# --------------------------------------------------
+# DISTRIBUTE PRIZE (FIXED TO USE STAKES TABLE)
+# --------------------------------------------------
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
-    Distribute prize & system fee for a finished match.
+    Distribute prize for a finished match.
 
-    - Supports 2-player and 3-player matches.
-    - Uses your requested hard-coded payout rules (2,4,6 etc).
-    - Logs wallet transactions for winner, losers, and system fee.
+    IMPORTANT:
+    - Entry fee has ALREADY been deducted in /game/request (and/or match join).
+    - Here we ONLY:
+        * Credit the winner with winner_payout from stakes table
+        * Record system fee = sum(entry_fee for all players) - winner_payout
+        * DO NOT deduct again from losers (no double-charging).
     """
-
+    num_players = int(match.num_players or 2)
     stake = int(match.stake_amount)
-    num_players = int(match.num_players)
 
-    # Optional: load rule from DB (currently unused, but kept for future)
-    _ = db.execute(
-        select(WalletTransaction).where(WalletTransaction.id == -1)
-    )
-
-    # ---- Payout logic ----
-    if num_players == 3:
-        if stake == 2:
-            winner_prize, system_fee, loser_loss = 4, 2, 2
-        elif stake == 4:
-            winner_prize, system_fee, loser_loss = 8, 4, 4
-        elif stake == 6:
-            winner_prize, system_fee, loser_loss = 12, 6, 6
-        else:
-            winner_prize, system_fee, loser_loss = stake * 2, stake, stake
-    else:  # 2 players
-        if stake == 2:
-            winner_prize, system_fee, loser_loss = 3, 1, 2
-        elif stake == 4:
-            winner_prize, system_fee, loser_loss = 6, 2, 4
-        elif stake == 6:
-            winner_prize, system_fee, loser_loss = 9, 3, 6
-        else:
-            winner_prize, system_fee, loser_loss = int(stake * 0.75), int(stake * 0.25), stake
-
+    # --- Determine players in slot order ---
     players = [match.p1_user_id, match.p2_user_id]
     if num_players == 3:
         players.append(match.p3_user_id)
 
-    # Winner
-    winner_id = players[winner_idx]
-    winner = _lock_user(db, winner_id)
+    winner_user_id = players[winner_idx]
 
-    # Deduct from losers
-    for i, uid in enumerate(players):
-        if uid and i != winner_idx:
-            loser = _lock_user(db, uid)
-            old_bal = loser.wallet_balance or 0
-            new_bal = max(0, old_bal - loser_loss)
-            loser.wallet_balance = new_bal
+    # --- Load stake rule from DB (align with /game/request logic) ---
+    rule = _get_stake_rule_for_match(db, match)
 
-            _log_transaction(
-                db,
-                loser.id,
-                -float(loser_loss),
-                TxType.MATCH_LOSS,
-                TxStatus.SUCCESS,
-                f"Match {match.id} Loss",
-            )
+    if rule:
+        entry_fee = rule["entry_fee"]          # Decimal
+        winner_payout = rule["winner_payout"]  # Decimal
 
-    # Credit winner
-    old_winner_bal = winner.wallet_balance or 0
-    new_winner_bal = old_winner_bal + winner_prize
-    winner.wallet_balance = new_winner_bal
+        total_entry = entry_fee * Decimal(num_players)
+        system_fee_amount = total_entry - winner_payout
+        if system_fee_amount < 0:
+            # Safety: never negative system fee
+            system_fee_amount = Decimal(0)
+    else:
+        # Fallback if stakes row missing: keep old-ish behavior but WITHOUT
+        # touching losers again. Winner gets stake * players, fee = 0.
+        entry_fee = Decimal(stake)
+        winner_payout = Decimal(stake * num_players)
+        system_fee_amount = Decimal(0)
+
+    # --- CREDIT WINNER (no second loss for losers) ---
+    winner = _lock_user(db, winner_user_id)
+    if not winner:
+        # Should never happen, but don't crash whole match
+        return
+
+    old_balance = Decimal(winner.wallet_balance or 0)
+    new_balance = old_balance + winner_payout
+    winner.wallet_balance = float(new_balance)
 
     _log_transaction(
         db,
         winner.id,
-        float(winner_prize),
+        float(winner_payout),
         TxType.WIN,
         TxStatus.SUCCESS,
-        f"Match {match.id} Win",
+        f"Match {match.id} Win (stake={stake}, players={num_players})",
     )
 
-    # System fee
-    _log_transaction(
-        db,
-        0,
-        float(system_fee),
-        TxType.FEE,
-        TxStatus.SUCCESS,
-        f"Match {match.id} Fee",
-    )
+    # --- SYSTEM FEE RECORD ---
+    if system_fee_amount > 0:
+        _log_transaction(
+            db,
+            0,  # system / house account
+            float(system_fee_amount),
+            TxType.FEE,
+            TxStatus.SUCCESS,
+            f"Match {match.id} Fee",
+        )
 
-    # Update match record correctly using enum
-    match.system_fee = float(system_fee)
-    match.winner_user_id = winner_id
+    # --- UPDATE MATCH RECORD CORRECTLY ---
+    match.system_fee = float(system_fee_amount)
+    match.winner_user_id = winner_user_id
     match.status = MatchStatus.FINISHED
     match.finished_at = datetime.utcnow()
 

@@ -621,7 +621,7 @@ async def roll_dice(
         raise HTTPException(status_code=403, detail="Not your match")
 
     # -------------------------
-    # FIXED TURN-VALIDATION LOGIC
+    # TURN VALIDATION FIX
     # -------------------------
     curr = m.current_turn or 0
 
@@ -641,29 +641,32 @@ async def roll_dice(
     # Roll dice
     roll = random.randint(1, 6)
 
+    # Determine # of players dynamically (REAL FIX)
+    num_players = m.num_players or 2
+
     # Read redis state
     st = await _read_state(m.id) or {
-        "positions": [0, 0, 0],
+        "positions": [0] * num_players,
         "turn_count": 0,
-        "spawned": [False, False, False],
+        "spawned": [False] * num_players,
     }
 
-    positions = [int(x) for x in st.get("positions", [0, 0, 0])]
-    spawned = st.get("spawned", [False, False, False])
+    positions = [int(x) for x in st.get("positions", [0] * num_players)]
+    spawned = st.get("spawned", [False] * num_players)
     turn_count = int(st.get("turn_count", 0)) + 1
 
-    # Apply roll
+    # Apply roll (FIXED num_players)
     positions, next_turn, winner, extra = _apply_roll(
         copy.deepcopy(positions),
         curr,
         roll,
-        3,
+        num_players,        # ← FIXED (no more hardcoded 3)
         turn_count,
         spawned,
     )
 
     # Validate next_turn: skip forfeited players
-    valid_indices = [i for i in range(3) if slots[i] and slots[i] not in forfeited]
+    valid_indices = [i for i in range(num_players) if slots[i] and slots[i] not in forfeited]
 
     if not valid_indices:
         m.status = MatchStatus.FINISHED
@@ -673,8 +676,8 @@ async def roll_dice(
 
     if next_turn not in valid_indices:
         # Skip until hitting a valid player
-        for _ in range(3):
-            next_turn = (next_turn + 1) % 3
+        for _ in range(num_players):
+            next_turn = (next_turn + 1) % num_players
             if next_turn in valid_indices:
                 break
 

@@ -656,7 +656,10 @@ async def roll_dice(
     forfeited = set(m.forfeit_ids or [])
 
     num_players = m.num_players or 2
-    active_indices = [i for i, uid in enumerate(slots[:num_players]) if uid and uid not in forfeited]
+    active_indices = [
+        i for i, uid in enumerate(slots[:num_players])
+        if uid and uid not in forfeited
+    ]
 
     if not active_indices:
         raise HTTPException(status_code=400, detail="No active players remain")

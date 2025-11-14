@@ -90,9 +90,14 @@ def _apply_roll(
     spawned: list[bool] | None = None,
 ):
     """
-    Apply dice roll: handles spawn (1 to enter), reverse on box 3,
-    overshoot >7 stays, win exactly on 7. Returns updated positions,
-    next_turn, winner, and animation flags for frontend sync.
+    Apply dice roll with strict one-turn-per-player:
+      - Spawn: only when rolling 1 (if not spawned yet).
+      - Box 3: danger → coin returns to box 0.
+      - Overshoot >7: stay where you are.
+      - Exact 7: win.
+      - Capture: if you land on opponent box, opponent is sent back to box 0.
+      - Turn order: ALWAYS p0 → p1 → p2 → p0 → ... (no extra turns).
+    Returns updated positions, next_turn, winner, and flags for frontend.
     """
     if spawned is None:
         spawned = [False] * num_players
@@ -104,6 +109,7 @@ def _apply_roll(
     reverse = False
     spawn_flag = False
     BOARD_MAX = 7
+    DANGER_BOX = 3
 
     # --- Rule 1: Spawn only when rolling 1 ---
     if not spawned[p]:
@@ -112,7 +118,7 @@ def _apply_roll(
             positions[p] = 0
             spawn_flag = True
         else:
-            # Stay unspawned at 0
+            # Stay unspawned at 0 (still not on board)
             positions[p] = 0
         return positions, (p + 1) % num_players, None, {
             "reverse": False,
@@ -122,8 +128,8 @@ def _apply_roll(
             "spawned": spawned,
         }
 
-    # --- Rule 2: Reverse (danger box) at 3 ---
-    if new_pos == 3:
+    # --- Rule 2: Reverse (danger box) at 3 → back to 0 ---
+    if new_pos == DANGER_BOX:
         positions[p] = 0
         reverse = True
         return positions, (p + 1) % num_players, None, {
@@ -134,7 +140,7 @@ def _apply_roll(
             "spawned": spawned,
         }
 
-    # --- Rule 3: Overshoot (>7) → stay ---
+    # --- Rule 3: Overshoot (>7) → stay on current box ---
     if new_pos > BOARD_MAX:
         positions[p] = old
         return positions, (p + 1) % num_players, None, {
@@ -159,6 +165,17 @@ def _apply_roll(
 
     # --- Rule 5: Normal move ---
     positions[p] = new_pos
+
+    # --- Rule 6: Capture: if you land on opponent, send them back to 0 ---
+    # NOTE: we only capture opponents that are actually spawned on board.
+    for idx in range(num_players):
+        if idx == p:
+            continue
+        if spawned[idx] and positions[idx] == positions[p]:
+            # Opponent coin goes back to box 0; they stay "spawned"
+            positions[idx] = 0
+
+    # Turn ALWAYS goes to next player in order, no extra turns
     return positions, (p + 1) % num_players, None, {
         "reverse": False,
         "spawn": False,
@@ -166,6 +183,7 @@ def _apply_roll(
         "last_roll": roll,
         "spawned": spawned,
     }
+
 
 # -------------------------
 # Redis state helpers

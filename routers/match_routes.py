@@ -721,15 +721,46 @@ async def roll_dice(
             next_turn = (next_turn + 1) % num_players
             if next_turn in active_indices:
                 break
+
     # -------------------------
-
-    # Update match
-    m.last_roll = roll
-    m.current_turn = next_turn
-
+    # WINNER FOUND → FINALIZE MATCH
+    # -------------------------
     if winner is not None:
         m.status = MatchStatus.FINISHED
+        m.finished_at = datetime.now(timezone.utc)
+        m.current_turn = winner
+
+        db.commit()
+        db.refresh(m)
+
+        # FIX: distribute prize HERE
+        await distribute_prize(db, m, winner)
+
+        # Broadcast winner before clearing state
+        new_state = {
+            "positions": positions,
+            "current_turn": m.current_turn,
+            "last_roll": roll,
+            "winner": winner,
+            "reverse": extra.get("reverse", False),
+            "spawn": extra.get("spawn", False),
+            "actor": extra.get("actor"),
+            "turn_count": turn_count,
+            "spawned": extra.get("spawned", spawned),
+        }
+        await _write_state(m, new_state)
+
+        # Delay a bit before clearing state so loser devices receive FINISHED
+        await asyncio.sleep(1)
         await _clear_state(m.id)
+
+        return {"ok": True, "match_id": m.id, "winner": winner, **new_state}
+
+    # -------------------------
+    # NORMAL TURN ADVANCE
+    # -------------------------
+    m.last_roll = roll
+    m.current_turn = next_turn
 
     try:
         db.commit()
@@ -742,7 +773,7 @@ async def roll_dice(
         "positions": positions,
         "current_turn": m.current_turn,
         "last_roll": roll,
-        "winner": winner,
+        "winner": None,
         "reverse": extra.get("reverse", False),
         "spawn": extra.get("spawn", False),
         "actor": extra.get("actor"),

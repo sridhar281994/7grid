@@ -345,7 +345,7 @@ class ForfeitIn(BaseModel):  # ✅ FIXED missing model
 
 
 # -------------------------
-# Create or wait for match (JOIN first for free & paid)
+# Create or join match (Correct entry-fee deduction for 2P & 3P)
 # -------------------------
 @router.post("/create")
 async def create_or_wait_match(
@@ -360,11 +360,11 @@ async def create_or_wait_match(
 
         log.debug(f"[CREATE] uid={current_user.id} stake={stake_amount} players={num_players} entry_fee={entry_fee}")
 
-        # -------- Paid balance check (only needed if user will actually join right now) --------
-        if stake_amount > 0 and (current_user.wallet_balance or 0) < entry_fee:
+        # --- Check balance BEFORE join ---
+        if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # -------- Try to JOIN a waiting match first (works for free & paid) --------
+        # --- Try joining existing WAITING match ---
         q = (
             db.query(GameMatch)
             .filter(
@@ -375,6 +375,7 @@ async def create_or_wait_match(
             )
             .order_by(GameMatch.id.asc())
         )
+
         if num_players == 2:
             q = q.filter(GameMatch.p2_user_id.is_(None))
         else:
@@ -383,23 +384,22 @@ async def create_or_wait_match(
         waiting = q.with_for_update(skip_locked=True).first()
 
         if waiting:
-            log.debug(f"[CREATE] joining match_id={waiting.id}")
+            # -----------------------------------
+            # Charge ONLY the joining player now
+            # -----------------------------------
+            if entry_fee > 0:
+                current_user.wallet_balance -= entry_fee
+                db.commit()
+                db.refresh(current_user)
+
             if num_players == 2:
-                # Deduct only when match becomes ACTIVE
-                if stake_amount > 0:
-                    current_user.wallet_balance -= entry_fee
                 waiting.p2_user_id = current_user.id
                 waiting.status = MatchStatus.ACTIVE
                 waiting.current_turn = random.choice([0, 1])
             else:
-                # 3P: fill p2 first, then p3; ACTIVE when full
                 if not waiting.p2_user_id:
-                    if stake_amount > 0:
-                        current_user.wallet_balance -= entry_fee
                     waiting.p2_user_id = current_user.id
                 elif not waiting.p3_user_id:
-                    if stake_amount > 0:
-                        current_user.wallet_balance -= entry_fee
                     waiting.p3_user_id = current_user.id
                     waiting.status = MatchStatus.ACTIVE
                     waiting.current_turn = random.choice([0, 1, 2])
@@ -409,7 +409,7 @@ async def create_or_wait_match(
             db.commit()
             db.refresh(waiting)
 
-            # initialize state on activation (or ensure present)
+            # Initialize board state when ACTIVE
             await _write_state(waiting, {"positions": [0] * num_players})
 
             return {
@@ -428,7 +428,11 @@ async def create_or_wait_match(
                 "turn": waiting.current_turn or 0,
             }
 
-        # -------- Otherwise CREATE a new waiting match (no deduction yet) --------
+        # -----------------------------------
+        # Otherwise create a WAITING match
+        # Charge ONLY the creator (P1)?
+        # No! P1 is NOT charged until someone joins.
+        # -----------------------------------
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -444,9 +448,10 @@ async def create_or_wait_match(
         db.commit()
         db.refresh(new_match)
 
+        # Initial empty board
         await _write_state(new_match, {"positions": [0] * num_players})
 
-        log.debug(f"[CREATE] created new WAITING match_id={new_match.id} by uid={current_user.id}")
+        log.debug(f"[CREATE] new WAITING match_id={new_match.id} by {current_user.id}")
 
         return {
             "ok": True,
@@ -469,8 +474,6 @@ async def create_or_wait_match(
         log.exception("DB error in /matches/create")
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-
-STALE_TIMEOUT_SECS = 12  # for bot prompt timing
 
 # -------------------------
 # Check Match Readiness / Poll Sync (Updated for forfeit detection)

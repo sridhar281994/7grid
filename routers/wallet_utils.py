@@ -1,44 +1,25 @@
-# wallet_utils.py
-
-from datetime import datetime, timezone
-from decimal import Decimal
-import uuid
-
 from sqlalchemy.orm import Session
 from sqlalchemy import select, text
+from datetime import datetime, timezone
+import uuid
+from decimal import Decimal
 
 from models import User, GameMatch, WalletTransaction, TxType, TxStatus, MatchStatus
 
 
-def _to_decimal(value) -> Decimal:
-    if isinstance(value, Decimal):
-        return value
-    if value is None:
-        return Decimal("0")
-    return Decimal(str(value))
-
-
-def _log_transaction(
-    db: Session,
-    user_id: int,
-    amount,
-    tx_type: TxType,
-    status: TxStatus,
-    note: str | None = None,
-):
+def _log_transaction(db: Session, user_id: int, amount: float,
+                     tx_type: TxType, status: TxStatus, note=None):
     """
     Create a wallet transaction row and commit immediately.
     """
-    amount_dec = _to_decimal(amount)
-
     tx = WalletTransaction(
         user_id=user_id,
-        amount=amount_dec,
+        amount=amount,
         tx_type=tx_type,
         status=status,
         provider_ref=note,
         transaction_id=str(uuid.uuid4()),
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.utcnow(),
     )
     db.add(tx)
     db.commit()
@@ -46,26 +27,13 @@ def _log_transaction(
     return tx
 
 
-def _lock_user(db: Session, user_id: int | None) -> User | None:
+def _get_stake_rule_for_match(db: Session, match: GameMatch):
     """
-    Lock a user row FOR UPDATE and return it (or None).
-    """
-    if not user_id or user_id <= 0:
-        return None
+    Read stake rule from the stakes table based on match.stake_amount
+    and match.num_players (2 or 3).
 
-    return (
-        db.execute(select(User).where(User.id == user_id).with_for_update())
-        .scalar_one_or_none()
-    )
-
-
-def get_stake_rule(db: Session, stake_amount: int, players: int) -> dict | None:
-    """
-    Read stake rule from the stakes table based on:
-        stake_amount (stage key) AND players (2 or 3)
-
-    stakes table structure (per your DB):
-        stake_amount | entry_fee | winner_payout | players | label
+    stakes schema:
+      stake_amount, entry_fee, winner_payout, players, label
     """
     row = db.execute(
         text(
@@ -75,7 +43,7 @@ def get_stake_rule(db: Session, stake_amount: int, players: int) -> dict | None:
             WHERE stake_amount = :amt AND players = :p
             """
         ),
-        {"amt": int(stake_amount), "p": int(players)},
+        {"amt": int(match.stake_amount), "p": int(match.num_players or 2)},
     ).mappings().first()
 
     if not row:
@@ -83,117 +51,115 @@ def get_stake_rule(db: Session, stake_amount: int, players: int) -> dict | None:
 
     return {
         "stake_amount": int(row["stake_amount"]),
-        "entry_fee": _to_decimal(row["entry_fee"]),
-        "winner_payout": _to_decimal(row["winner_payout"]),
+        "entry_fee": Decimal(row["entry_fee"]),
+        "winner_payout": Decimal(row["winner_payout"]),
         "players": int(row["players"]),
         "label": row["label"],
     }
 
 
-def _get_stake_rule_for_match(db: Session, match: GameMatch) -> dict | None:
-    return get_stake_rule(db, match.stake_amount, match.num_players or 2)
-
-
-def distribute_prize(db: Session, match: GameMatch, winner_idx: int) -> None:
+# --------------------------------------------------
+# DISTRIBUTE PRIZE (uses stakes + system_fee)
+# --------------------------------------------------
+async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
-    Final, simple prize logic.
+    Final prize logic using stakes table.
 
-    Assumptions:
-    - Each human player was already charged `entry_fee` when they joined the match
-      (in /matches/create or /game/request).
-    - stakes table defines:
-          entry_fee      → amount each player pays to enter
-          winner_payout  → what the winner should receive
-          players        → 2 or 3
-    - System fee = total_collected - winner_payout
-                 = entry_fee * players - winner_payout
-
-    What this does:
-      - Marks the match as FINISHED.
-      - Credits winner with winner_payout.
-      - Credits merchant with system_fee.
-      - Does NOT touch loser balances again (they already lost entry_fee).
+    For a given stake row:
+      - Each active human player pays `entry_fee`
+      - Winner receives `winner_payout`
+      - System fee = (entry_fee * active_players) - winner_payout
+      - match.system_fee is recorded and, if merchant_user_id is set,
+        the fee is credited to that user.
     """
-
-    # Free play → just mark finished, no money movement.
-    if match.stake_amount == 0:
-        match.status = MatchStatus.FINISHED
-        match.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        return
-
     rule = _get_stake_rule_for_match(db, match)
     if not rule:
-        # No stake rule – safest fallback: just finish the match without wallet moves.
-        match.status = MatchStatus.FINISHED
-        match.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        return
+        raise RuntimeError(f"No stake rule for stake={match.stake_amount}, players={match.num_players}")
 
-    entry_fee = rule["entry_fee"]       # Decimal
-    players_count = rule["players"]     # 2 or 3
-    winner_payout = rule["winner_payout"]
+    entry_fee: Decimal = rule["entry_fee"]
+    winner_payout: Decimal = rule["winner_payout"]
+    expected_players: int = rule["players"]
 
-    if entry_fee <= 0 or players_count <= 0 or winner_payout < 0:
-        match.status = MatchStatus.FINISHED
-        match.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        return
+    # Player ID list (may contain None or bot IDs)
+    slots = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:expected_players]
 
-    total_collected = entry_fee * players_count
-    system_fee = total_collected - winner_payout
+    if winner_idx < 0 or winner_idx >= len(slots) or slots[winner_idx] is None:
+        raise RuntimeError("Invalid winner index for this match")
 
-    # Build players list based on match.num_players
-    num_players = int(match.num_players or players_count)
-    slots = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:num_players]
+    # Ignore bots / empty slots when doing money moves
+    active_ids = [uid for uid in slots if uid is not None and uid > 0]
+    if not active_ids:
+        raise RuntimeError("No active payable players in match")
 
-    if winner_idx < 0 or winner_idx >= len(slots):
-        # Invalid index – just finish without payouts instead of corrupting wallets.
-        match.status = MatchStatus.FINISHED
-        match.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        return
+    winner_id = slots[winner_idx]
+    if winner_id not in active_ids:
+        raise RuntimeError("Winner is not an active payable player")
 
-    winner_uid = slots[winner_idx]
+    # Money math
+    total_collected: Decimal = entry_fee * Decimal(len(active_ids))
+    system_fee: Decimal = total_collected - winner_payout
+    if system_fee < 0:
+        system_fee = Decimal("0")
 
-    # ---------- Winner credit ----------
-    winner = _lock_user(db, winner_uid)
-    if winner:
-        before = _to_decimal(winner.wallet_balance)
-        winner.wallet_balance = before + winner_payout
+    # --------------------------
+    # Winner update
+    # --------------------------
+    winner = db.query(User).filter(User.id == winner_id).first()
+    if not winner:
+        raise RuntimeError("Winner user not found")
 
+    winner.wallet_balance = (winner.wallet_balance or Decimal("0")) + winner_payout
+    _log_transaction(
+        db,
+        winner.id,
+        float(winner_payout),
+        TxType.WIN,
+        TxStatus.SUCCESS,
+        note=f"Match {match.id} win",
+    )
+
+    # --------------------------
+    # Losers update
+    # --------------------------
+    for uid in active_ids:
+        if uid == winner_id:
+            continue
+        user = db.query(User).filter(User.id == uid).first()
+        if not user:
+            continue
+
+        user.wallet_balance = (user.wallet_balance or Decimal("0")) - entry_fee
         _log_transaction(
             db,
-            winner.id,
-            winner_payout,
-            TxType.WIN,
+            user.id,
+            float(entry_fee),
+            TxType.ENTRY,
             TxStatus.SUCCESS,
-            note=f"Match {match.id} win",
+            note=f"Match {match.id} entry",
         )
 
-    # ---------- Merchant (system fee) ----------
-    if system_fee > 0:
-        # Use match.merchant_user_id if set, else default to user id 1 as admin.
-        merchant_id = match.merchant_user_id or 1
-        merchant = _lock_user(db, merchant_id)
-
+    # --------------------------
+    # System fee → Merchant (if set)
+    # --------------------------
+    if system_fee > 0 and match.merchant_user_id:
+        merchant = db.query(User).filter(User.id == match.merchant_user_id).first()
         if merchant:
-            before_m = _to_decimal(merchant.wallet_balance)
-            merchant.wallet_balance = before_m + system_fee
-
+            merchant.wallet_balance = (merchant.wallet_balance or Decimal("0")) + system_fee
             _log_transaction(
                 db,
                 merchant.id,
-                system_fee,
+                float(system_fee),
                 TxType.FEE,
                 TxStatus.SUCCESS,
-                note=f"Match {match.id} fee",
+                note=f"Match {match.id} system fee",
             )
 
-    # ---------- Match finalization ----------
+    # --------------------------
+    # Finish match
+    # --------------------------
     match.system_fee = system_fee
-    match.winner_user_id = winner_uid
+    match.winner_user_id = winner_id
     match.status = MatchStatus.FINISHED
-    match.finished_at = datetime.now(timezone.utc)
+    match.finished_at = datetime.now(timezone=timezone.utc)
 
     db.commit()

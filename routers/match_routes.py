@@ -721,35 +721,21 @@ async def roll_dice(
     )
 
     # -------------------------
-    # STRICT SINGLE TURN ROTATION
-    # -------------------------
-    next_turn = (curr + 1) % num_players
-
-    # Skip forfeited
-    if next_turn not in active_indices:
-        for _ in range(num_players):
-            next_turn = (next_turn + 1) % num_players
-            if next_turn in active_indices:
-                break
-
-    # -------------------------
-    # WINNER FOUND → FINALIZE MATCH
+    # WINNER FOUND → finalize via wallet_utils
     # -------------------------
     if winner is not None:
-        m.status = MatchStatus.FINISHED
-        m.finished_at = datetime.now(timezone.utc)
-        m.current_turn = winner
+        # Persist last roll before prize calc
+        m.last_roll = roll
+        try:
+            await distribute_prize(db, m, winner)
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
 
-        db.commit()
-        db.refresh(m)
-
-        # stakes-based prize distribution
-        await distribute_prize(db, m, winner)
-
-        # Broadcast winner before clearing state
+        # Broadcast final state (match is now FINISHED in DB)
         new_state = {
             "positions": positions,
-            "current_turn": m.current_turn,
+            "current_turn": winner,
             "last_roll": roll,
             "winner": winner,
             "reverse": extra.get("reverse", False),
@@ -760,7 +746,7 @@ async def roll_dice(
         }
         await _write_state(m, new_state)
 
-        # Short delay so loser devices receive FINISHED
+        # Small delay so both clients see FINISHED before state is cleared
         await asyncio.sleep(1)
         await _clear_state(m.id)
 
@@ -769,6 +755,15 @@ async def roll_dice(
     # -------------------------
     # NORMAL TURN ADVANCE
     # -------------------------
+    next_turn = (curr + 1) % num_players
+
+    # Skip forfeited
+    if next_turn not in active_indices:
+        for _ in range(num_players):
+            next_turn = (next_turn + 1) % num_players
+            if next_turn in active_indices:
+                break
+
     m.last_roll = roll
     m.current_turn = next_turn
 
@@ -794,7 +789,6 @@ async def roll_dice(
     await _write_state(m, new_state)
 
     return {"ok": True, "match_id": m.id, "roll": roll, **new_state}
-
 
 
 # -------------------------

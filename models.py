@@ -55,6 +55,9 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+    # Add this line for agent users
+    is_agent = Column(Boolean, default=False)  # Field to mark as agent
+
     matches_as_p1 = relationship("GameMatch", foreign_keys="GameMatch.p1_user_id", back_populates="player1")
     matches_as_p2 = relationship("GameMatch", foreign_keys="GameMatch.p2_user_id", back_populates="player2")
     matches_as_p3 = relationship("GameMatch", foreign_keys="GameMatch.p3_user_id", back_populates="player3")

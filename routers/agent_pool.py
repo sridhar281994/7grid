@@ -6,7 +6,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
-from db import SessionLocal
+from database import SessionLocal
 from models import GameMatch, MatchStatus, User
 
 # If you added is_agent column, you can use that instead of fixed ids.

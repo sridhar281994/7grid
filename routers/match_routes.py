@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
-from routers.wallet_utils import distribute_prize, get_stake_rule
+from routers.wallet_utils import distribute_prize
+from routers.game import get_stake_rule
 from redis_client import redis_client, _get_redis  # ✅ shared redis instance
 import logging
 

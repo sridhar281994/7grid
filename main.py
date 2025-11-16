@@ -8,7 +8,7 @@ from models import User
 from routers import auth, users, wallet, game, match_routes
 
 # NEW: agent pool
-from agent_pool import start_agent_pool
+from routers.agent_pool import start_agent_pool
 
 
 app = FastAPI(title="Spin Dice API", version="1.0.0")

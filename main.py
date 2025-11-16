@@ -26,9 +26,7 @@ app.add_middleware(
 )
 
 
-# -------------------------------------------------
-# Remove OLD bot logic — no more -1000/-1001 bots!
-# -------------------------------------------------
+
 def ensure_agent_users():
     """
     Optional helper: ensure the 20 agent accounts exist.
@@ -50,13 +48,14 @@ def ensure_agent_users():
                     password_hash="x",
                     name=f"Agent {uid}",
                     wallet_balance=100,
-                    is_agent=True if hasattr(User, "is_agent") else False,
+                    is_agent=True,  # Marking the user as an agent
                 )
             )
             print(f"[INIT] Created agent user {uid}")
         db.commit()
     finally:
         db.close()
+
 
 
 # -------------------------------------------------

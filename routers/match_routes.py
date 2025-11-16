@@ -829,47 +829,58 @@ async def forfeit_match(
         if uid is not None and uid not in forfeited
     ]
 
-    # -----------------------------
-    # CASE 1: Only one player left → They WIN
-    # -----------------------------
-    if len(active_indices) == 1:
-        winner_idx = active_indices[0]
-        winner_uid = slots[winner_idx]
+# -----------------------------
+# CASE 1: Only one player left → They WIN
+# -----------------------------
+if len(active_indices) == 1:
+    winner_idx = active_indices[0]
+    winner_uid = slots[winner_idx]
 
-        # Finalize match
-        m.status = MatchStatus.FINISHED
-        m.finished_at = datetime.now(timezone.utc)
-        m.winner_user_id = winner_uid
+    # Finalize match
+    m.status = MatchStatus.FINISHED
+    m.finished_at = datetime.now(timezone.utc)
+    m.winner_user_id = winner_uid
 
-        # Prize distribution
-        try:
-            await distribute_prize(db, m, winner_idx)
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
+    # Prize distribution
+    try:
+        await distribute_prize(db, m, winner_idx)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
 
-        # Broadcast final state
-        await _write_state(
-            m,
-            {
-                "forfeit": True,
-                "forfeit_actor": loser_idx,
-                "winner": winner_idx,
-                "finished": True,
-                "active_players": [uid for uid in slots if uid and uid not in forfeited],
-                "forfeit_ids": list(forfeited),
-            },
-        )
+    # Build fully compatible final state
+    final_state = {
+        "positions": [0, 0, 0],                 # required by client
+        "current_turn": winner_idx,
+        "last_roll": m.last_roll or None,
+        "winner": winner_idx,
+        "reverse": False,
+        "spawn": False,
+        "actor": winner_idx,
+        "turn_count": 9999,                     # ensures UI stops
+        "spawned": [False, False, False],
+        "finished": True,
+        "forfeit": True,
+        "forfeit_actor": loser_idx,
+        "active_players": [uid for uid in slots if uid and uid not in forfeited],
+        "forfeit_ids": list(forfeited),
+    }
 
-        await asyncio.sleep(0.5)
-        await _clear_state(m.id)
+    # Broadcast to clients
+    await _write_state(m, final_state)
 
-        return {
-            "ok": True,
-            "forfeit": True,
-            "continuing": False,
-            "winner": winner_idx,
-        }
+    # Allow UI to receive FINISHED update
+    await asyncio.sleep(0.5)
+    await _clear_state(m.id)
+
+    return {
+        "ok": True,
+        "forfeit": True,
+        "continuing": False,
+        "winner": winner_idx,
+        "final_state": final_state
+    }
+
 
     # -----------------------------
     # CASE 2: Zero players left (rare, no winner)

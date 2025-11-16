@@ -2,23 +2,24 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import text, select, and_
+from sqlalchemy import text
 
 from database import get_db
 from models import User, GameMatch, MatchStatus
 from utils.security import get_current_user
+from routers.wallet_utils import distribute_prize
 
 router = APIRouter(prefix="/game", tags=["game"])
 
 
 # --------------------------------------------------
-# Helpers
+# Helper: read stake rule from existing stakes table
 # --------------------------------------------------
 def get_stake_rule(db: Session, stake_amount: int, players: int):
     """
     Fetch stake rule based on stake_amount AND players (2 or 3).
 
-    stakes table:
+    stakes table schema (already in DB):
       stake_amount | entry_fee | winner_payout | players | label
     """
     row = db.execute(
@@ -35,6 +36,7 @@ def get_stake_rule(db: Session, stake_amount: int, players: int):
     if not row:
         return None
 
+    # Use Decimal to keep money math consistent
     return {
         "stake_amount": int(row["stake_amount"]),
         "entry_fee": Decimal(str(row["entry_fee"])),
@@ -49,7 +51,7 @@ def get_stake_rule(db: Session, stake_amount: int, players: int):
 # --------------------------------------------------
 class MatchIn(BaseModel):
     stake_amount: int
-    players: int = 2  # 2 or 3 (optional; default 2 if you want)
+    players: int = 2  # 2 or 3
 
 
 class CompleteIn(BaseModel):
@@ -58,12 +60,14 @@ class CompleteIn(BaseModel):
 
 
 # --------------------------------------------------
-# GET: Stakes List
+# GET: Stakes List (for UI)
 # --------------------------------------------------
 @router.get("/stakes")
 def list_stakes(db: Session = Depends(get_db)):
     """
-    Return all stakes (Free + 2/4/6 for 2P & 3P) from your existing stakes table.
+    Return all stakes (Free + 2/4/6 for 2P & 3P) from the existing stakes table.
+
+    This is used by the app to render stage cards (2-player + 3-player rows).
     """
     rows = db.execute(
         text(
@@ -88,7 +92,7 @@ def list_stakes(db: Session = Depends(get_db)):
 
 
 # --------------------------------------------------
-# POST: Request Match (optional helper; you can ignore if you use /matches/create)
+# POST: Request Match (SAFE PREVIEW ONLY – no DB writes)
 # --------------------------------------------------
 @router.post("/request")
 def request_match(
@@ -97,10 +101,15 @@ def request_match(
     user: User = Depends(get_current_user),
 ):
     """
-    Simple "join or create" endpoint.
+    SAFE helper endpoint.
 
-    Wallet is charged entry_fee immediately for this user.
-    If no matching WAITING game is found, we refund the entry_fee.
+    This DOES NOT create or join a match and DOES NOT touch wallet.
+    It just:
+      - looks up the stake rule from stakes table
+      - checks if user's wallet has enough for entry_fee
+      - returns data to the app
+
+    Real match creation is handled by /matches/create.
     """
 
     players = payload.players if payload.players in (2, 3) else 2
@@ -110,94 +119,56 @@ def request_match(
         raise HTTPException(status_code=400, detail="Invalid stake selected")
 
     entry_fee = rule["entry_fee"]
+    wallet_balance = Decimal(str(user.wallet_balance or 0))
+    wallet_ok = wallet_balance >= entry_fee
 
-    # Check wallet
-    if entry_fee > 0 and (user.wallet_balance or 0) < entry_fee:
-        raise HTTPException(status_code=400, detail="Insufficient wallet")
-
-    # Charge entry fee
-    if entry_fee > 0:
-        user.wallet_balance = (user.wallet_balance or 0) - entry_fee
-        db.commit()
-        db.refresh(user)
-
-    # Try to join existing WAITING match
-    waiting = (
-        db.execute(
-            select(GameMatch).where(
-                and_(
-                    GameMatch.stake_amount == payload.stake_amount,
-                    GameMatch.num_players == players,
-                    GameMatch.status == MatchStatus.WAITING,
-                )
-            ).order_by(GameMatch.id.asc())
-        )
-        .scalars()
-        .first()
-    )
-
-    if waiting and waiting.p1_user_id != user.id:
-        # Fill P2 or P3
-        if not waiting.p2_user_id:
-            waiting.p2_user_id = user.id
-            # 2-player game becomes ACTIVE now
-            if players == 2:
-                waiting.status = MatchStatus.ACTIVE
-            db.commit()
-            return {
-                "ok": True,
-                "match_id": waiting.id,
-                "status": waiting.status.value,
-                "num_players": players,
-            }
-
-        if players == 3 and not waiting.p3_user_id:
-            waiting.p3_user_id = user.id
-            waiting.status = MatchStatus.ACTIVE
-            db.commit()
-            return {
-                "ok": True,
-                "match_id": waiting.id,
-                "status": waiting.status.value,
-                "num_players": players,
-            }
-
-    # No usable match → refund
-    if entry_fee > 0:
-        user.wallet_balance = (user.wallet_balance or 0) + entry_fee
-        db.commit()
-        db.refresh(user)
-
-    return {"ok": False, "refund": True}
+    return {
+        "ok": True,
+        "stake_amount": rule["stake_amount"],
+        "entry_fee": float(entry_fee),
+        "winner_payout": float(rule["winner_payout"]),
+        "players": rule["players"],
+        "label": rule["label"],
+        "wallet_balance": float(wallet_balance),
+        "wallet_ok": wallet_ok,
+        "reason": None if wallet_ok else "Insufficient wallet",
+    }
 
 
 # --------------------------------------------------
-# POST: Complete Match
+# POST: Complete Match (manual override / admin)
 # --------------------------------------------------
 @router.post("/complete")
-def complete_match(
+async def complete_match(
     payload: CompleteIn,
     db: Session = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
     """
-    Manual completion endpoint (e.g. admin or emergency use).
-    Normally the game flow should call distribute_prize from /matches/roll
-    when the winner is decided.
+    Manual completion endpoint.
+
+    Normal flow:
+      - /matches/roll decides the winner and calls wallet_utils.distribute_prize
+      - You DO NOT need this for standard gameplay
+
+    This exists only as a safety / admin override:
+      - validates that the caller is a participant
+      - validates winner_user_id belongs to the match
+      - calls the SAME distribute_prize() logic used by /matches/roll
     """
-    m = db.get(GameMatch, payload.match_id)
+    m: GameMatch | None = db.get(GameMatch, payload.match_id)
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    # Already done → nothing to do.
+    # Already finalized → do nothing
     if m.status == MatchStatus.FINISHED:
         return {"ok": True, "already_completed": True}
 
-    # Only allow participants to trigger this
+    # Only allow participants to trigger manual complete
     if me.id not in {m.p1_user_id, m.p2_user_id, m.p3_user_id}:
         raise HTTPException(status_code=403, detail="Not a participant")
 
-    # Validate winner is actually in this match
+    # Validate winner is one of the players
     players = [m.p1_user_id, m.p2_user_id]
     if m.num_players == 3:
         players.append(m.p3_user_id)
@@ -207,10 +178,8 @@ def complete_match(
 
     winner_idx = players.index(payload.winner_user_id)
 
-    # Use the same wallet_utils.prize distribution as /matches/roll
-    from routers.wallet_utils import distribute_prize
-
-    distribute_prize(db, m, winner_idx)
+    # Use the same async prize logic as /matches/roll
+    await distribute_prize(db, m, winner_idx)
 
     return {
         "ok": True,

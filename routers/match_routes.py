@@ -793,7 +793,7 @@ async def roll_dice(
 
 
 # -------------------------
-# Forfeit / Give Up (Turn realignment fix + correct winner finalization)
+# Forfeit / Give Up (fully fixed)
 # -------------------------
 @router.post("/forfeit")
 async def forfeit_match(
@@ -802,12 +802,14 @@ async def forfeit_match(
     current_user: User = Depends(get_current_user),
 ) -> Dict:
 
+    # Get match
     m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Match not active")
 
+    # Player slots
     slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
     if current_user.id not in slots:
         raise HTTPException(status_code=403, detail="Not your match")
@@ -819,72 +821,67 @@ async def forfeit_match(
     forfeited.add(current_user.id)
     m.forfeit_ids = list(forfeited)
 
-    # Remove the forfeiter from slots
+    # Remove forfeiter from slot
     slots[loser_idx] = None
     m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
-    # Remaining active players (not None, not forfeited)
+    # Active = not None + not forfeited
     active_indices = [
         i for i, uid in enumerate(slots)
         if uid is not None and uid not in forfeited
     ]
 
-# -----------------------------
-# CASE 1: Only one player left → They WIN
-# -----------------------------
-if len(active_indices) == 1:
-    winner_idx = active_indices[0]
-    winner_uid = slots[winner_idx]
+    # ======================================================
+    # CASE 1 → Only ONE PLAYER LEFT → THEY WIN NOW
+    # ======================================================
+    if len(active_indices) == 1:
+        winner_idx = active_indices[0]
+        winner_uid = slots[winner_idx]
 
-    # Finalize match
-    m.status = MatchStatus.FINISHED
-    m.finished_at = datetime.now(timezone.utc)
-    m.winner_user_id = winner_uid
+        m.status = MatchStatus.FINISHED
+        m.finished_at = datetime.now(timezone.utc)
+        m.winner_user_id = winner_uid
 
-    # Prize distribution
-    try:
-        await distribute_prize(db, m, winner_idx)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
+        # Prize distribution
+        try:
+            await distribute_prize(db, m, winner_idx)
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Prize distribution failed: {e}")
 
-    # Build fully compatible final state
-    final_state = {
-        "positions": [0, 0, 0],                 # required by client
-        "current_turn": winner_idx,
-        "last_roll": m.last_roll or None,
-        "winner": winner_idx,
-        "reverse": False,
-        "spawn": False,
-        "actor": winner_idx,
-        "turn_count": 9999,                     # ensures UI stops
-        "spawned": [False, False, False],
-        "finished": True,
-        "forfeit": True,
-        "forfeit_actor": loser_idx,
-        "active_players": [uid for uid in slots if uid and uid not in forfeited],
-        "forfeit_ids": list(forfeited),
-    }
+        # Build final state
+        final_state = {
+            "positions": [0, 0, 0],
+            "current_turn": winner_idx,
+            "last_roll": m.last_roll or None,
+            "winner": winner_idx,
+            "reverse": False,
+            "spawn": False,
+            "actor": winner_idx,
+            "turn_count": 9999,
+            "spawned": [False, False, False],
+            "finished": True,
+            "forfeit": True,
+            "forfeit_actor": loser_idx,
+            "active_players": [uid for uid in slots if uid and uid not in forfeited],
+            "forfeit_ids": list(forfeited),
+        }
 
-    # Broadcast to clients
-    await _write_state(m, final_state)
+        await _write_state(m, final_state)
+        await asyncio.sleep(1)
+        await _clear_state(m.id)
 
-    # Allow UI to receive FINISHED update
-    await asyncio.sleep(0.5)
-    await _clear_state(m.id)
+        return {
+            "ok": True,
+            "forfeit": True,
+            "continuing": False,
+            "winner": winner_idx,
+            "final_state": final_state,
+        }
 
-    return {
-        "ok": True,
-        "forfeit": True,
-        "continuing": False,
-        "winner": winner_idx,
-        "final_state": final_state
-    }
-
-
-    # -----------------------------
-    # CASE 2: Zero players left (rare, no winner)
-    # -----------------------------
+    # ======================================================
+    # CASE 2 → ZERO players left (edge case)
+    # ======================================================
     if len(active_indices) == 0:
         m.status = MatchStatus.FINISHED
         m.finished_at = datetime.now(timezone.utc)
@@ -902,7 +899,7 @@ if len(active_indices) == 1:
                 "forfeit_ids": list(forfeited),
             },
         )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         await _clear_state(m.id)
 
         return {
@@ -912,26 +909,19 @@ if len(active_indices) == 1:
             "winner": None,
         }
 
-    # -----------------------------
-    # CASE 3: Match continues → rotate turn
-    # -----------------------------
-    curr_turn = m.current_turn or 0
-    next_turn = curr_turn
+    # ======================================================
+    # CASE 3 → Continue match → Find next turn
+    # ======================================================
+    curr = m.current_turn or 0
+    next_turn = curr
 
-    # If current turn belongs to forfeiter or invalid
-    if curr_turn == loser_idx or curr_turn not in active_indices:
+    # If forfeiter had turn OR turn invalid
+    if curr == loser_idx or curr not in active_indices:
         sorted_indices = sorted(active_indices)
-        next_turn = None
-        for idx in sorted_indices:
-            if idx > loser_idx:
-                next_turn = idx
-                break
-        if next_turn is None:
-            next_turn = sorted_indices[0]
-
+        next_turn = sorted_indices[0]  # move to first active
     else:
-        # Skip forfeited or empty slots
-        while next_turn in forfeited or slots[next_turn] is None:
+        # Skip forfeited / empty
+        for _ in range(len(slots)):
             next_turn = (next_turn + 1) % len(slots)
             if next_turn in active_indices:
                 break
@@ -939,7 +929,7 @@ if len(active_indices) == 1:
     m.current_turn = next_turn
     db.commit()
 
-    # Broadcast sanitized state
+    # Broadcast continuation state
     await _write_state(
         m,
         {
@@ -947,7 +937,6 @@ if len(active_indices) == 1:
             "forfeit_actor": loser_idx,
             "continuing": True,
             "current_turn": m.current_turn,
-            "visible_players": active_indices,
             "turn": m.current_turn,
             "positions": [0, 0, 0],
             "winner": None,
@@ -962,6 +951,7 @@ if len(active_indices) == 1:
         "continuing": True,
         "current_turn": m.current_turn,
     }
+
 
 # -------------------------
 # Abandon (for free-play or waiting matches)

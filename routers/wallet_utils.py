@@ -60,24 +60,23 @@ def _get_stake_rule_for_match(db: Session, match: GameMatch):
 
 async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
-    OPTION B — Entry fee charged at join (only once).
-    End of match:
-        - Winner gets winner_payout
-        - Losers pay nothing more
-        - Merchant gets system_fee = (entry_fee * active_humans) - winner_payout
+    FIXED OPTION B — each player paid entry_fee earlier.
+    On finish:
+        - Winner receives FULL POT = entry_fee * active_humans
+        - Merchant system_fee is ALWAYS 0 (unless you re-enable commission)
     """
+
     rule = _get_stake_rule_for_match(db, match)
     if not rule:
         raise RuntimeError("Missing stake rule")
 
-    entry_fee = rule["entry_fee"]
-    winner_payout = rule["winner_payout"]
+    entry_fee = Decimal(rule["entry_fee"])
     expected_players = rule["players"]
 
-    # Determine players from match
+    # Determine player slots
     slots = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:expected_players]
 
-    # Active payable players (exclude bots)
+    # Active paying players (exclude bots)
     active_ids = [uid for uid in slots if uid is not None and uid > 0]
 
     if winner_idx < 0 or winner_idx >= len(slots):
@@ -87,51 +86,35 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     if winner_id not in active_ids:
         raise RuntimeError("Winner is not an active human")
 
-    # ENTRY FEE ALREADY PAID — no loser deduction here.
-    total_collected = entry_fee * Decimal(len(active_ids))
-    system_fee = total_collected - winner_payout
-    if system_fee < 0:
-        system_fee = Decimal("0")
+    # ------------------------------------------
+    # POT CALCULATION  (main fix)
+    # ------------------------------------------
+    pot = entry_fee * Decimal(len(active_ids))     #  <-- WINNER GETS FULL POT
+    system_fee = Decimal("0")                      #  <-- for your model (no commission)
 
-    # --------------------------
+    # ------------------------------------------
     # WINNER CREDIT
-    # --------------------------
+    # ------------------------------------------
     winner = db.query(User).filter(User.id == winner_id).first()
-    winner.wallet_balance = (winner.wallet_balance or Decimal("0")) + winner_payout
+    winner.wallet_balance = (winner.wallet_balance or Decimal("0")) + pot
 
     _log_transaction(
         db,
         winner.id,
-        float(winner_payout),
+        float(pot),
         TxType.WIN,
         TxStatus.SUCCESS,
         note=f"Match {match.id} win"
     )
 
-    # --------------------------
-    # LOSERS — NO DEDUCTION
-    # --------------------------
-    # (Do nothing here)
+    # ------------------------------------------
+    # MERCHANT FEE DISABLED (set to 0)
+    # ------------------------------------------
+    # If you want to enable fee, change system_fee above.
 
-    # --------------------------
-    # MERCHANT SYSTEM FEE
-    # --------------------------
-    if match.merchant_user_id and system_fee > 0:
-        merchant = db.query(User).filter(User.id == match.merchant_user_id).first()
-        if merchant:
-            merchant.wallet_balance = (merchant.wallet_balance or Decimal("0")) + system_fee
-            _log_transaction(
-                db,
-                merchant.id,
-                float(system_fee),
-                TxType.FEE,
-                TxStatus.SUCCESS,
-                note=f"Match {match.id} system fee",
-            )
-
-    # --------------------------
+    # ------------------------------------------
     # FINALIZE MATCH
-    # --------------------------
+    # ------------------------------------------
     match.system_fee = system_fee
     match.winner_user_id = winner_id
     match.status = MatchStatus.FINISHED

@@ -49,14 +49,14 @@ class User(Base):
     description = Column(String(50), nullable=True)
     wallet_balance = Column(Numeric(10, 2), default=0)
 
-    # ✅ New column
+    # ✅ New column for agent users
+    is_agent = Column(Boolean, default=False)  # Adding is_agent column
+
+    # ✅ New column for profile image
     profile_image = Column(String, nullable=True, default="assets/default.png")
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    # Add this line for agent users
-    is_agent = Column(Boolean, default=False)  # Field to mark as agent
 
     matches_as_p1 = relationship("GameMatch", foreign_keys="GameMatch.p1_user_id", back_populates="player1")
     matches_as_p2 = relationship("GameMatch", foreign_keys="GameMatch.p2_user_id", back_populates="player2")

@@ -33,6 +33,7 @@ def ensure_bots():
                 "email": "bot_sharp@system.local",
                 "password_hash": "x",
                 "name": "Sharp (Bot)",
+                "is_agent": True,  # Ensure agent behavior for bots
             },
             {
                 "id": -1001,
@@ -40,6 +41,7 @@ def ensure_bots():
                 "email": "bot_crazy@system.local",
                 "password_hash": "x",
                 "name": "Crazy Boy (Bot)",
+                "is_agent": True,  # Ensure agent behavior for bots
             },
             {
                 "id": -1002,
@@ -47,6 +49,7 @@ def ensure_bots():
                 "email": "bot_srtech@system.local",
                 "password_hash": "x",
                 "name": "SRTech Bot",
+                "is_agent": True,  # Ensure agent behavior for bots
             },
         ]
         for bot in bots:

@@ -6,6 +6,9 @@ from database import Base, engine, SessionLocal
 from models import User
 from routers import auth, users, wallet, game, match_routes
 
+# Import the agent pool function
+from routers.agent_pool import start_agent_pool
+
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
 # -------------------------
@@ -33,7 +36,6 @@ def ensure_bots():
                 "email": "bot_sharp@system.local",
                 "password_hash": "x",
                 "name": "Sharp (Bot)",
-                "is_agent": True,  # Ensure agent behavior for bots
             },
             {
                 "id": -1001,
@@ -41,7 +43,6 @@ def ensure_bots():
                 "email": "bot_crazy@system.local",
                 "password_hash": "x",
                 "name": "Crazy Boy (Bot)",
-                "is_agent": True,  # Ensure agent behavior for bots
             },
             {
                 "id": -1002,
@@ -49,7 +50,6 @@ def ensure_bots():
                 "email": "bot_srtech@system.local",
                 "password_hash": "x",
                 "name": "SRTech Bot",
-                "is_agent": True,  # Ensure agent behavior for bots
             },
         ]
         for bot in bots:
@@ -74,6 +74,9 @@ async def on_startup():
     # Redis warm-up
     from utils.redis_client import init_redis_with_retry
     await init_redis_with_retry(max_retries=5, delay=2.0)
+
+    # Start the agent pool (background task for agent filling in matches)
+    start_agent_pool()
 
 
 # -------------------------

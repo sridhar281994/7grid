@@ -482,9 +482,9 @@ async def create_or_wait_match(
         log.exception("DB error in /matches/create")
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-# -------------------------
+# --------------------------------------------------
 # Check Match Readiness / Poll Sync (Updated for forfeit detection and agent-specific logic)
-# -------------------------
+# --------------------------------------------------
 @router.get("/check")
 async def check_match_ready(
     match_id: int,
@@ -492,7 +492,6 @@ async def check_match_ready(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict:
-
     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -536,9 +535,9 @@ async def check_match_ready(
                 current_user.wallet_balance -= entry_fee
 
             if not m.p2_user_id:
-                m.p2_user_id = -1000  # Assigning bot as player 2
+                m.p2_user_id = BOT_USER_ID  # Assigning bot as player 2
             if expected_players == 3 and not m.p3_user_id:
-                m.p3_user_id = -1001  # Assigning another bot if the match is 3 players
+                m.p3_user_id = AGENT_USER_ID  # Assigning another bot if the match is 3 players
 
             m.status = MatchStatus.ACTIVE
             m.current_turn = random.choice(range(expected_players))

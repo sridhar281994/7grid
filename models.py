@@ -55,6 +55,9 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+    # New column for agent identification
+    is_agent = Column(Boolean, default=False)  # Mark if the user is an agent
+
     matches_as_p1 = relationship("GameMatch", foreign_keys="GameMatch.p1_user_id", back_populates="player1")
     matches_as_p2 = relationship("GameMatch", foreign_keys="GameMatch.p2_user_id", back_populates="player2")
     matches_as_p3 = relationship("GameMatch", foreign_keys="GameMatch.p3_user_id", back_populates="player3")
@@ -91,7 +94,7 @@ class GameMatch(Base):
 
     # 🏆 Winner & Merchant
     winner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    merchant_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # ✅ new column
+    merchant_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # ✅ New column for the merchant
 
     status = Column(Enum(MatchStatus), default=MatchStatus.WAITING, nullable=False)
     system_fee = Column(Numeric(10, 2), default=0)
@@ -116,7 +119,7 @@ class GameMatch(Base):
     player2 = relationship("User", foreign_keys=[p2_user_id], back_populates="matches_as_p2")
     player3 = relationship("User", foreign_keys=[p3_user_id], back_populates="matches_as_p3")
     winner = relationship("User", foreign_keys=[winner_user_id])
-    merchant = relationship("User", foreign_keys=[merchant_user_id])  # ✅ linked relationship
+    merchant = relationship("User", foreign_keys=[merchant_user_id])  # ✅ New relationship for merchant
 
 
 # -----------------------

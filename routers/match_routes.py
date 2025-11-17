@@ -568,9 +568,9 @@ async def check_match_ready(
                 "prompt_bot": True,
             }
 
-    # ---------------------------
-    # AUTO-ADVANCE LOGIC
-    # ---------------------------
+    # --------------------------- 
+    # AUTO-ADVANCE LOGIC 
+    # --------------------------- 
     if m.status == MatchStatus.ACTIVE:
         try:
             await _auto_advance_if_needed(m, db)
@@ -901,7 +901,6 @@ async def forfeit_match(
     }
 
 
-
 # -------------------------
 # Abandon (for free-play or waiting matches)
 # -------------------------
@@ -1045,36 +1044,3 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
             print(f"[WS][WARN] PubSub cleanup failed: {e}")
 
         print(f"[WS] Unsubscribed + closed Redis pubsub for match {match_id}")
-
-
-
-# -------------------------
-# Finish Match (manual override)
-# -------------------------
-@router.post("/finish")
-async def finish_match(payload: FinishIn, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
-    if not m:
-        raise HTTPException(status_code=404, detail="Match not found")
-
-    m.status = MatchStatus.FINISHED
-    m.finished_at = _utcnow()
-
-    if payload.winner is not None:
-        players = [m.p1_user_id, m.p2_user_id]
-        if m.num_players == 3:
-            players.append(m.p3_user_id)
-
-        if payload.winner < 0 or payload.winner >= len(players):
-            raise HTTPException(status_code=400, detail="Invalid winner index")
-
-        winner_id = players[payload.winner]
-        if winner_id:
-            u = db.query(User).filter(User.id == winner_id).first()
-            if u:
-                u.wallet_balance += m.stake_amount
-            m.winner_user_id = winner_id
-
-    db.commit()
-
-    return {"ok": True, "message": "Match finished", "winner": payload.winner, "stake": m.stake_amount}

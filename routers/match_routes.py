@@ -24,6 +24,8 @@ import logging
 from sqlalchemy import or_, and_, text
 from sqlalchemy.exc import SQLAlchemyError, DataError
 
+STALE_TIMEOUT_SECS = 12
+
 router = APIRouter()
 log = logging.getLogger("matches")
 log.setLevel(logging.DEBUG)

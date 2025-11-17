@@ -49,10 +49,7 @@ class User(Base):
     description = Column(String(50), nullable=True)
     wallet_balance = Column(Numeric(10, 2), default=0)
 
-    # ✅ New column for agent users
-    is_agent = Column(Boolean, default=False)  # Adding is_agent column
-
-    # ✅ New column for profile image
+    # ✅ New column
     profile_image = Column(String, nullable=True, default="assets/default.png")
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

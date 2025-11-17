@@ -483,7 +483,7 @@ async def create_or_wait_match(
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 # -------------------------
-# Check Match Readiness / Poll Sync (Updated for forfeit detection)
+# Check Match Readiness / Poll Sync (Updated for forfeit detection and agent-specific logic)
 # -------------------------
 @router.get("/check")
 async def check_match_ready(
@@ -536,9 +536,9 @@ async def check_match_ready(
                 current_user.wallet_balance -= entry_fee
 
             if not m.p2_user_id:
-                m.p2_user_id = -1000
+                m.p2_user_id = -1000  # Assigning bot as player 2
             if expected_players == 3 and not m.p3_user_id:
-                m.p3_user_id = -1001
+                m.p3_user_id = -1001  # Assigning another bot if the match is 3 players
 
             m.status = MatchStatus.ACTIVE
             m.current_turn = random.choice(range(expected_players))
@@ -567,6 +567,31 @@ async def check_match_ready(
                 "waiting_time": waiting_time,
                 "prompt_bot": True,
             }
+
+    # Check if a company agent has joined and force them to win
+    if m.p1_user_id == BOT_USER_ID or m.p2_user_id == BOT_USER_ID or m.p3_user_id == BOT_USER_ID:
+        # Company agent must win
+        agent_turn = m.current_turn
+        m.status = MatchStatus.FINISHED
+        m.winner_user_id = BOT_USER_ID  # Force the bot to win
+        db.commit()
+        db.refresh(m)
+
+        # Send updated state with forced winner
+        await _write_state(m, {"positions": positions, "winner": BOT_USER_ID, "finished": True})
+
+        return {
+            "ready": True,
+            "finished": True,
+            "match_id": m.id,
+            "status": _status_value(m),
+            "stake": m.stake_amount,
+            "num_players": expected_players,
+            "p1": _name_for_id(db, m.p1_user_id),
+            "p2": _name_for_id(db, m.p2_user_id),
+            "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
+            "winner": BOT_USER_ID,
+        }
 
     # --------------------------- 
     # AUTO-ADVANCE LOGIC 

@@ -92,3 +92,14 @@ async def get_current_user_ws(websocket: WebSocket) -> User:
     finally:
         db.close()
 
+# --------------------------
+# Internal: Fake user object for agent AI
+# --------------------------
+class FakeUser:
+    """
+    Lightweight internal user placeholder for agent auto-roll logic.
+    Not related to JWT or authentication.
+    """
+    def __init__(self, uid: int):
+        self.id = uid
+        self.wallet_balance = 999999

@@ -485,7 +485,7 @@ async def create_or_wait_match(
         raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
 # --------------------------------------------------
-# Check Match Readiness / Poll Sync (Updated for forfeit detection and agent-specific logic)
+# Check Match Readiness / Poll Sync
 # --------------------------------------------------
 @router.get("/check")
 async def check_match_ready(
@@ -502,7 +502,11 @@ async def check_match_ready(
     now = int(time.time())
     waiting_time = max(0, now - int(m.created_at.timestamp()) if m.created_at else 0)
 
-    # --- Load Redis state ---
+    # ---------- slot / fill info ----------
+    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]
+    filled_slots = sum(1 for uid in slots if uid is not None)
+
+    # ---------- Redis state ----------
     st = await _read_state(m.id) or {
         "positions": [0] * expected_players,
         "turn_count": 0,
@@ -521,12 +525,62 @@ async def check_match_ready(
     log.debug(
         f"[CHECK] uid={current_user.id} match_id={m.id} "
         f"status={m.status} stake={m.stake_amount} players={expected_players} "
-        f"turn={turn} waiting={waiting_time}s spawned={spawned}"
+        f"turn={turn} waiting={waiting_time}s spawned={spawned} filled={filled_slots}"
     )
 
-    # -------------------------------
-    # BOT PROMPT LOGIC (same as yours)
-    # -------------------------------
+    # ======================================================
+    # 1) FULL LOBBY BUT STILL WAITING → PROMOTE TO ACTIVE
+    #    (this is what lets your AGENT_POOL matches become playable)
+    # ======================================================
+    if m.status == MatchStatus.WAITING and filled_slots == expected_players:
+        m.status = MatchStatus.ACTIVE
+        db.commit()
+        db.refresh(m)
+
+        # Reuse existing redis state if any
+        st = await _read_state(m.id) or {
+            "positions": [0] * expected_players,
+            "turn_count": 0,
+            "spawned": [False] * expected_players,
+            "reverse": False,
+            "spawn": False,
+            "actor": None,
+        }
+        positions = st.get("positions", [0] * expected_players)
+        spawned = st.get("spawned", [False] * expected_players)
+        last_roll = st.get("last_roll")
+        turn = st.get("current_turn", m.current_turn or (m.current_turn or 0))
+
+        return {
+            "ready": True,
+            "finished": False,
+            "match_id": m.id,
+            "status": _status_value(m),
+            "stake": m.stake_amount,
+            "num_players": expected_players,
+            "p1": _name_for_id(db, m.p1_user_id),
+            "p2": _name_for_id(db, m.p2_user_id),
+            "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
+            "p1_id": m.p1_user_id,
+            "p2_id": m.p2_user_id,
+            "p3_id": m.p3_user_id,
+            "last_roll": last_roll,
+            "turn": turn,
+            "positions": positions,
+            "spawned": spawned,
+            "reverse": st.get("reverse", False),
+            "spawn": st.get("spawn", False),
+            "actor": st.get("actor"),
+            "winner": winner_idx,
+            "turn_count": st.get("turn_count", 0),
+            "waiting_time": waiting_time,
+            "prompt_bot": False,
+        }
+
+    # ======================================================
+    # 2) BOT PROMPT LOGIC (12s timeout)
+    #    Used only for real-player queues (not Robot Army offline mode)
+    # ======================================================
     if m.status == MatchStatus.WAITING and waiting_time >= STALE_TIMEOUT_SECS:
         if accept_bot:
             entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
@@ -537,18 +591,21 @@ async def check_match_ready(
                 current_user.wallet_balance -= entry_fee
 
             if not m.p2_user_id:
-                m.p2_user_id = BOT_USER_ID  # Assigning bot as player 2
+                m.p2_user_id = BOT_USER_ID  # Assign bot as player 2
             if expected_players == 3 and not m.p3_user_id:
-                m.p3_user_id = AGENT_USER_ID  # Assigning another bot if the match is 3 players
+                m.p3_user_id = AGENT_USER_ID  # Or another configured agent/bot
 
             m.status = MatchStatus.ACTIVE
             m.current_turn = random.choice(range(expected_players))
             db.commit()
             db.refresh(m)
 
-            await _write_state(m, {"positions": [0] * expected_players, "spawned": [False] * expected_players})
-
+            await _write_state(
+                m,
+                {"positions": [0] * expected_players, "spawned": [False] * expected_players},
+            )
         else:
+            # Frontend already has its own 12s popup; this just tells it we're still waiting
             return {
                 "ready": False,
                 "finished": False,
@@ -569,16 +626,19 @@ async def check_match_ready(
                 "prompt_bot": True,
             }
 
-    # Check if a company agent has joined and force them to win
-    if m.p1_user_id == BOT_USER_ID or m.p2_user_id == BOT_USER_ID or m.p3_user_id == BOT_USER_ID:
-        # Company agent must win
-        agent_turn = m.current_turn
+    # ======================================================
+    # 3) COMPANY AGENT / BOT FORCE-WIN LOGIC (if you still want it)
+    # ======================================================
+    if (
+        m.p1_user_id == BOT_USER_ID
+        or m.p2_user_id == BOT_USER_ID
+        or m.p3_user_id == BOT_USER_ID
+    ):
         m.status = MatchStatus.FINISHED
-        m.winner_user_id = BOT_USER_ID  # Force the bot to win
+        m.winner_user_id = BOT_USER_ID
         db.commit()
         db.refresh(m)
 
-        # Send updated state with forced winner
         await _write_state(m, {"positions": positions, "winner": BOT_USER_ID, "finished": True})
 
         return {
@@ -594,20 +654,27 @@ async def check_match_ready(
             "winner": BOT_USER_ID,
         }
 
-    # --------------------------- 
-    # AUTO-ADVANCE LOGIC 
-    # --------------------------- 
+    # ======================================================
+    # 4) AUTO-ADVANCE FOR INACTIVE TURN (AFK skip)
+    # ======================================================
     if m.status == MatchStatus.ACTIVE:
         try:
             await _auto_advance_if_needed(m, db)
         except Exception:
             log.exception("[CHECK] auto-advance failed")
 
-    # ---------------------------
-    # FINISHED MATCH — RETURN CLEAN RESPONSE
-    # ---------------------------
+        # refresh state after auto-advance
+        st = await _read_state(m.id) or st
+        positions = st.get("positions", positions)
+        spawned = st.get("spawned", spawned)
+        last_roll = st.get("last_roll", last_roll)
+        turn = st.get("current_turn", m.current_turn or turn)
+        winner_idx = st.get("winner", winner_idx)
+
+    # ======================================================
+    # 5) FINISHED MATCH
+    # ======================================================
     if m.status == MatchStatus.FINISHED:
-        # Resolve winner if not already in Redis
         if winner_idx is None:
             winner_idx = 0
             ids = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]
@@ -633,9 +700,9 @@ async def check_match_ready(
             "finished_at": m.finished_at.isoformat() if m.finished_at else None,
         }
 
-    # ---------------------------
-    # ACTIVE MATCH NORMAL RESPONSE
-    # ---------------------------
+    # ======================================================
+    # 6) ACTIVE MATCH NORMAL RESPONSE
+    # ======================================================
     ready_flag = (
         m.status == MatchStatus.ACTIVE
         and m.p1_user_id is not None
@@ -668,6 +735,7 @@ async def check_match_ready(
         "waiting_time": waiting_time,
         "prompt_bot": (m.status == MatchStatus.WAITING and waiting_time >= STALE_TIMEOUT_SECS),
     }
+
 
 # -------------------------
 # Roll Dice (STRICT rotation + forfeit skip)

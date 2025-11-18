@@ -5,6 +5,7 @@ from fastapi.responses import RedirectResponse
 from database import Base, engine, SessionLocal
 from models import User
 from routers import auth, users, wallet, game, match_routes
+from routers.smart_agent_worker import start_agent_ai
 
 # Import the agent pool function
 from routers.agent_pool import start_agent_pool
@@ -77,6 +78,7 @@ async def on_startup():
 
     # Start the agent pool (background task for agent filling in matches)
     start_agent_pool()
+    start_agent_ai() 
 
 
 # -------------------------

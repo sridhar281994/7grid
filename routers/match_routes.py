@@ -508,6 +508,7 @@ async def check_match_ready(
     st = await _read_state(m.id) or {
         "positions": [0] * expected_players,
         "turn_count": 0,
+    
         "spawned": [False] * expected_players,
         "reverse": False,
         "spawn": False,
@@ -527,11 +528,16 @@ async def check_match_ready(
     )
 
     # ======================================================
-    # 0) FREE PLAY FIX — prevent bot popup, always online
+    # 0) FREE PLAY — ONLINE ONLY, NO BOT PROMPT EVER
     # ======================================================
     if m.stake_amount == 0:
+        ready_flag = (
+            m.status == MatchStatus.ACTIVE
+            and filled_slots == expected_players
+        )
+
         return {
-            "ready": False,
+            "ready": ready_flag,
             "finished": False,
             "match_id": m.id,
             "status": _status_value(m),
@@ -553,8 +559,6 @@ async def check_match_ready(
             "winner": winner_idx,
             "turn_count": st.get("turn_count", 0),
             "waiting_time": waiting_time,
-
-            # KEY LINE — no popup ever
             "prompt_bot": False,
         }
 
@@ -566,17 +570,9 @@ async def check_match_ready(
         db.commit()
         db.refresh(m)
 
-        st = await _read_state(m.id) or {
-            "positions": [0] * expected_players,
-            "turn_count": 0,
-            "spawned": [False] * expected_players,
-            "reverse": False,
-            "spawn": False,
-            "actor": None,
-        }
-
-        positions = st.get("positions", [0] * expected_players)
-        spawned = st.get("spawned", [False] * expected_players)
+        st = await _read_state(m.id) or st
+        positions = st.get("positions", positions)
+        spawned = st.get("spawned", spawned)
         last_roll = st.get("last_roll")
         turn = st.get("current_turn", m.current_turn or 0)
 
@@ -607,70 +603,12 @@ async def check_match_ready(
         }
 
     # ======================================================
-    # 2) NORMAL PAID STAGES → BOT POPUP AFTER 12 SECONDS
+    # 2) WAITING + TIMEOUT → LET AGENT_POOL HANDLE IT (NO POPUP)
     # ======================================================
     if m.status == MatchStatus.WAITING and waiting_time >= STALE_TIMEOUT_SECS:
-        if accept_bot:
-            entry_fee = m.stake_amount // expected_players if m.stake_amount > 0 else 0
-            if entry_fee > 0 and (current_user.wallet_balance or 0) < entry_fee:
-                raise HTTPException(status_code=400, detail="Insufficient balance for bot match")
-
-            if entry_fee > 0:
-                current_user.wallet_balance -= entry_fee
-
-            if not m.p2_user_id:
-                m.p2_user_id = BOT_USER_ID
-            if expected_players == 3 and not m.p3_user_id:
-                m.p3_user_id = BOT_USER_ID
-
-            m.status = MatchStatus.ACTIVE
-            m.current_turn = random.choice(range(expected_players))
-            db.commit()
-            db.refresh(m)
-
-            await _write_state(
-                m,
-                {"positions": [0] * expected_players, "spawned": [False] * expected_players},
-            )
-        else:
-            return {
-                "ready": False,
-                "finished": False,
-                "match_id": m.id,
-                "status": _status_value(m),
-                "stake": m.stake_amount,
-                "num_players": expected_players,
-                "p1": _name_for_id(db, m.p1_user_id),
-                "p2": _name_for_id(db, m.p2_user_id),
-                "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
-                "p1_id": m.p1_user_id,
-                "p2_id": m.p2_user_id,
-                "p3_id": m.p3_user_id,
-                "turn": turn,
-                "positions": positions,
-                "winner": winner_idx,
-                "waiting_time": waiting_time,
-                "prompt_bot": True,
-            }
-
-    # ======================================================
-    # 3) FORCE-WIN BOT LOGIC (if enabled)
-    # ======================================================
-    if (
-        m.p1_user_id == BOT_USER_ID
-        or m.p2_user_id == BOT_USER_ID
-        or m.p3_user_id == BOT_USER_ID
-    ):
-        m.status = MatchStatus.FINISHED
-        m.winner_user_id = BOT_USER_ID
-        db.commit()
-        db.refresh(m)
-
-        await _write_state(m, {"positions": positions, "winner": BOT_USER_ID, "finished": True})
-
         return {
-            "ready": True,
-            "finished": True,
+            "ready": False,
+            "finished": False,
             "match_id": m.id,
             "status": _status_value(m),
             "stake": m.stake_amount,
@@ -678,11 +616,18 @@ async def check_match_ready(
             "p1": _name_for_id(db, m.p1_user_id),
             "p2": _name_for_id(db, m.p2_user_id),
             "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
-            "winner": BOT_USER_ID,
+            "p1_id": m.p1_user_id,
+            "p2_id": m.p2_user_id,
+            "p3_id": m.p3_user_id,
+            "turn": turn,
+            "positions": positions,
+            "winner": winner_idx,
+            "waiting_time": waiting_time,
+            "prompt_bot": False,
         }
 
     # ======================================================
-    # 4) AUTO-ADVANCE FOR AFK
+    # 3) AUTO-ADVANCE FOR AFK
     # ======================================================
     if m.status == MatchStatus.ACTIVE:
         try:
@@ -698,7 +643,7 @@ async def check_match_ready(
         winner_idx = st.get("winner", winner_idx)
 
     # ======================================================
-    # 5) FINISHED MATCH
+    # 4) FINISHED MATCH
     # ======================================================
     if m.status == MatchStatus.FINISHED:
         if winner_idx is None:
@@ -727,7 +672,7 @@ async def check_match_ready(
         }
 
     # ======================================================
-    # 6) ACTIVE NORMAL RESPONSE
+    # 5) ACTIVE NORMAL RESPONSE
     # ======================================================
     ready_flag = (
         m.status == MatchStatus.ACTIVE
@@ -759,7 +704,7 @@ async def check_match_ready(
         "winner": winner_idx,
         "turn_count": st.get("turn_count", 0),
         "waiting_time": waiting_time,
-        "prompt_bot": (m.status == MatchStatus.WAITING and waiting_time >= STALE_TIMEOUT_SECS),
+        "prompt_bot": False,
     }
 
 

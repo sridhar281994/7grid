@@ -1,37 +1,40 @@
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
 
 # Ensure .env is loaded FIRST
 load_dotenv()
 
+SMTP_HOST = "smtp.zoho.in"
+SMTP_PORT = 465  # SSL
+
+EMAIL_FROM = os.getenv("EMAIL_FROM")   # your Zoho email (eg: no-reply@srtech.co.in)
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  # Zoho App Password
+
 
 def send_email(to_email: str, subject: str, body_text: str) -> None:
     """
-    Send plain text email using SendGrid API.
-    Env vars are read at runtime to avoid stale values.
+    Send plain text email using Zoho SMTP.
     """
 
-    sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
-    email_from = os.getenv("EMAIL_FROM", "no-reply@srtech.co.in")
-
-    if not sendgrid_api_key or not email_from:
+    if not EMAIL_FROM or not EMAIL_PASSWORD:
         raise RuntimeError(
-            "SendGrid env vars not configured (SENDGRID_API_KEY / EMAIL_FROM)."
+            "Zoho SMTP env vars not configured (EMAIL_FROM / EMAIL_PASSWORD)."
         )
 
-    message = Mail(
-        from_email=email_from,
-        to_emails=to_email,
-        subject=subject,
-        plain_text_content=body_text
-    )
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_text, "plain"))
 
     try:
-        sg = SendGridAPIClient(sendgrid_api_key)
-        response = sg.send(message)
-        print(f"[INFO] Email sent to {to_email} | Status: {response.status_code}")
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.send_message(msg)
+            print(f"[INFO] Email sent to {to_email}")
     except Exception as e:
         print(f"[ERROR] Failed to send email: {e}")
         raise

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))  # <-- use 587 (TLS)
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 SMTP_FROM = os.getenv("SMTP_FROM")
@@ -16,13 +16,11 @@ SMTP_FROM = os.getenv("SMTP_FROM")
 
 def send_email(to_email: str, subject: str, body_text: str) -> None:
     """
-    Send plain text email using Zoho SMTP (Render-friendly).
+    Send plain text email using Zoho SMTP (Render-friendly via STARTTLS).
     """
 
     if not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
-        raise RuntimeError(
-            "Missing SMTP config: SMTP_USER / SMTP_PASS / SMTP_FROM"
-        )
+        raise RuntimeError("Missing SMTP config: SMTP_USER / SMTP_PASS / SMTP_FROM")
 
     msg = MIMEMultipart()
     msg["From"] = SMTP_FROM
@@ -31,10 +29,14 @@ def send_email(to_email: str, subject: str, body_text: str) -> None:
     msg.attach(MIMEText(body_text, "plain"))
 
     try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-            print(f"[INFO] Email sent to {to_email}")
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+        server.ehlo()
+        server.starttls()          # <-- critical change
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+        server.quit()
+        print(f"[INFO] Email sent to {to_email}")
     except Exception as e:
         print(f"[ERROR] Failed to send email: {e}")
         raise

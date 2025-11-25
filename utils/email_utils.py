@@ -1,26 +1,35 @@
 import os
+from dotenv import load_dotenv
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
-# Load from environment
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "info@srtech.co.in") # Use your verified sender/domain
+# Ensure .env is loaded FIRST
+load_dotenv()
 
 
 def send_email(to_email: str, subject: str, body_text: str) -> None:
-    """Send plain text email using SendGrid API."""
-    if not (SENDGRID_API_KEY and EMAIL_FROM):
-        raise RuntimeError("SendGrid env vars not configured (SENDGRID_API_KEY / EMAIL_FROM).")
+    """
+    Send plain text email using SendGrid API.
+    Env vars are read at runtime to avoid stale values.
+    """
+
+    sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+    email_from = os.getenv("EMAIL_FROM", "no-reply@srtech.co.in")
+
+    if not sendgrid_api_key or not email_from:
+        raise RuntimeError(
+            "SendGrid env vars not configured (SENDGRID_API_KEY / EMAIL_FROM)."
+        )
 
     message = Mail(
-        from_email=EMAIL_FROM,
+        from_email=email_from,
         to_emails=to_email,
         subject=subject,
         plain_text_content=body_text
     )
 
     try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        sg = SendGridAPIClient(sendgrid_api_key)
         response = sg.send(message)
         print(f"[INFO] Email sent to {to_email} | Status: {response.status_code}")
     except Exception as e:

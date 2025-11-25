@@ -2,59 +2,70 @@ import os
 import requests
 from dotenv import load_dotenv
 
+# Load env vars
 load_dotenv()
 
-ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
-ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
-ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
-ZOHO_FROM = os.getenv("SMTP_FROM")
-
-
-def _get_access_token():
-    url = "https://accounts.zoho.com/oauth/v2/token"
-    payload = {
-        "refresh_token": ZOHO_REFRESH_TOKEN,
-        "client_id": ZOHO_CLIENT_ID,
-        "client_secret": ZOHO_CLIENT_SECRET,
-        "grant_type": "refresh_token"
-    }
-    r = requests.post(url, data=payload, timeout=15)
-    return r.json().get("access_token")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+BREVO_FROM = os.getenv("BREVO_FROM")  # info@srtech.co.in
+BREVO_SENDER_NAME = "SRTech"
 
 
 def send_email(to_email: str, subject: str, body_text: str) -> None:
-    access_token = _get_access_token()
+    """
+    Send plain text email using Brevo REST API
+    """
 
-    url = "https://mail.zoho.com/api/accounts/me/messages"
-    headers = {
-        "Authorization": f"Zoho-oauthtoken {access_token}",
-        "Content-Type": "application/json"
-    }
+    if not BREVO_API_KEY or not BREVO_FROM:
+        raise RuntimeError("BREVO_API_KEY or BREVO_FROM not configured")
 
-    data = {
-        "fromAddress": ZOHO_FROM,
-        "toAddress": to_email,
+    url = "https://api.brevo.com/v3/smtp/email"
+
+    payload = {
+        "sender": {
+            "name": BREVO_SENDER_NAME,
+            "email": BREVO_FROM
+        },
+        "to": [
+            {"email": to_email}
+        ],
         "subject": subject,
-        "content": body_text,
-        "mailFormat": "plaintext"
+        "textContent": body_text
     }
 
-    r = requests.post(url, json=data, headers=headers, timeout=15)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"Zoho API mail failed: {r.text}")
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json"
+    }
+
+    response = requests.post(url, json=payload, headers=headers, timeout=10)
+
+    if response.status_code not in (200, 201, 202):
+        print(f"[ERROR] Brevo email failed: {response.status_code} {response.text}")
+        raise RuntimeError("Brevo email send failed")
+
+    print(f"[INFO] OTP email sent to {to_email} via Brevo")
 
 
 def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
     subject = "Your One-Time Password (OTP)"
-    body = f"""
-Hello,
-
-Your login OTP is: {otp}
-
-This code is valid for {minutes_valid} minute(s).
-Do not share it with anyone.
-
-Thanks,
-SRTech
-"""
+    body = (
+        f"Hello,\n\n"
+        f"Your login OTP is: {otp}\n\n"
+        f"This code is valid for {minutes_valid} minute(s).\n"
+        f"Do not share it with anyone.\n\n"
+        f"Thanks,\nSRTech"
+    )
     send_email(to_email, subject, body)
+
+
+def mask_email(e: str) -> str:
+    try:
+        local, domain = e.split("@", 1)
+        if len(local) <= 2:
+            masked = local[0] + "*"
+        else:
+            masked = local[0] + "*" * (len(local) - 2) + local[-1]
+        return f"{masked}@{domain}"
+    except Exception:
+        return "***"

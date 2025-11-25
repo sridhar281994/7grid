@@ -4,35 +4,35 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 
-# Ensure .env is loaded FIRST
+# Load env vars
 load_dotenv()
 
-SMTP_HOST = "smtp.zoho.in"
-SMTP_PORT = 465  # SSL
-
-EMAIL_FROM = os.getenv("EMAIL_FROM")   # your Zoho email (eg: no-reply@srtech.co.in)
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  # Zoho App Password
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM")
 
 
 def send_email(to_email: str, subject: str, body_text: str) -> None:
     """
-    Send plain text email using Zoho SMTP.
+    Send plain text email using Zoho SMTP (Render-friendly).
     """
 
-    if not EMAIL_FROM or not EMAIL_PASSWORD:
+    if not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
         raise RuntimeError(
-            "Zoho SMTP env vars not configured (EMAIL_FROM / EMAIL_PASSWORD)."
+            "Missing SMTP config: SMTP_USER / SMTP_PASS / SMTP_FROM"
         )
 
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
+    msg["From"] = SMTP_FROM
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.attach(MIMEText(body_text, "plain"))
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.login(SMTP_USER, SMTP_PASS)
             server.send_message(msg)
             print(f"[INFO] Email sent to {to_email}")
     except Exception as e:
@@ -41,12 +41,14 @@ def send_email(to_email: str, subject: str, body_text: str) -> None:
 
 
 def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
-    """Send OTP via email."""
+    """
+    Send OTP via email.
+    """
     subject = "Your One-Time Password (OTP)"
     body = (
         f"Hello,\n\n"
         f"Your login OTP is: {otp}\n\n"
-        f"This code is valid for {minutes_valid} minute(s). "
+        f"This code is valid for {minutes_valid} minute(s).\n"
         f"Do not share it with anyone.\n\n"
         f"Thanks,\nSRTech"
     )
@@ -54,7 +56,9 @@ def send_email_otp(to_email: str, otp: str, minutes_valid: int = 5) -> None:
 
 
 def mask_email(e: str) -> str:
-    """Mask email for safe logs (e.g., j****e@gmail.com)."""
+    """
+    Mask email for logs (example: j****e@gmail.com).
+    """
     try:
         local, domain = e.split("@", 1)
         if len(local) <= 2:

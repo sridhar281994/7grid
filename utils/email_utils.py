@@ -4,7 +4,7 @@ from sendgrid.helpers.mail import Mail
 
 # Load from environment
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "no-reply@srtech.co.in") # Use your verified sender/domain
+EMAIL_FROM = os.getenv("EMAIL_FROM", "info@srtech.co.in") # Use your verified sender/domain
 
 
 def send_email(to_email: str, subject: str, body_text: str) -> None:

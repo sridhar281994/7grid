@@ -1,8 +1,6 @@
 import uuid
 from datetime import datetime, timezone
 
-from decimal import Decimal
-
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -19,9 +17,9 @@ SYSTEM_MERCHANT_NAME = "System Merchant"
 _SYSTEM_MERCHANT_ID_CACHE: int | None = None
 
 
-def get_system_merchant_id(db: Session) -> int | None:
+def _get_system_merchant_id(db: Session) -> int | None:
     """
-    Return the cached id for the 'System Merchant' user.
+    Resolve and cache the ID for the System Merchant user.
     """
     global _SYSTEM_MERCHANT_ID_CACHE
     if _SYSTEM_MERCHANT_ID_CACHE:
@@ -35,6 +33,13 @@ def get_system_merchant_id(db: Session) -> int | None:
     if merchant:
         _SYSTEM_MERCHANT_ID_CACHE = int(merchant[0])
     return _SYSTEM_MERCHANT_ID_CACHE
+
+
+def get_system_merchant_id(db: Session) -> int | None:
+    """
+    Public helper so other modules (match creation) can fetch the merchant ID.
+    """
+    return _get_system_merchant_id(db)
 
 
 def _log_transaction(db: Session, user_id: int, amount: float,
@@ -52,7 +57,7 @@ def _log_transaction(db: Session, user_id: int, amount: float,
         timestamp=datetime.utcnow(),
     )
     db.add(tx)
-    db.flush()
+    db.commit()
     return tx
 
 
@@ -85,16 +90,16 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     """
     FIXED OPTION B — each player paid entry_fee earlier.
     On finish:
-        - Winner receives FULL POT = entry_fee * active_humans
-        - Merchant system_fee is ALWAYS 0 (unless you re-enable commission)
+        - Winner receives the configured winner_payout (capped by collected pot)
+        - Remaining pot is assigned to the System Merchant (house rake)
     """
 
     rule = _get_stake_rule_for_match(db, match)
     if not rule:
         raise RuntimeError("Missing stake rule")
 
-    entry_fee = Decimal(str(rule["entry_fee"]))
-    winner_payout = Decimal(str(rule["winner_payout"]))
+    entry_fee = rule["entry_fee"]
+    winner_payout = rule["winner_payout"]
     expected_players = rule["players"]
 
     # Determine player slots
@@ -114,23 +119,21 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # POT CALCULATION
     # ------------------------------------------
-    collected_pot = entry_fee * Decimal(len(active_ids))
-    prize = winner_payout
-    if prize > collected_pot:
+    collected_pot = entry_fee * len(active_ids)
+    prize = min(winner_payout, collected_pot)
+    if winner_payout > collected_pot:
         print(
             f"[WARN] Not enough collected pot (have {collected_pot}) "
-            f"for payout {prize}; paying collected amount."
+            f"for payout {winner_payout}; paying collected amount."
         )
-        prize = collected_pot
-
     system_fee = collected_pot - prize
 
     # ------------------------------------------
     # WINNER CREDIT
     # ------------------------------------------
     winner = db.query(User).filter(User.id == winner_id).first()
-    current_balance = Decimal(str(winner.wallet_balance or 0))
-    winner.wallet_balance = float(current_balance + prize)
+    current_balance = int(winner.wallet_balance or 0)
+    winner.wallet_balance = current_balance + prize
 
     match.winner_user_id = winner_id
     match.status = MatchStatus.FINISHED
@@ -148,10 +151,9 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # MERCHANT FEE (house keeps the remainder)
     # ------------------------------------------
-    fallback_id = get_system_merchant_id(db)
+    fallback_id = _get_system_merchant_id(db)
     merchant_id = match.merchant_user_id or fallback_id
     if merchant_id in participant_ids:
-        # Never credit a participant as the merchant; fall back to global System Merchant.
         if fallback_id and fallback_id not in participant_ids:
             merchant_id = fallback_id
         else:
@@ -164,8 +166,8 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     if system_fee > 0 and merchant_id:
         merchant = db.query(User).filter(User.id == merchant_id).first()
         if merchant:
-            merchant_balance = Decimal(str(merchant.wallet_balance or 0))
-            merchant.wallet_balance = float(merchant_balance + system_fee)
+            merchant_balance = int(merchant.wallet_balance or 0)
+            merchant.wallet_balance = merchant_balance + system_fee
             _log_transaction(
                 db,
                 merchant.id,
@@ -174,11 +176,6 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
                 TxStatus.SUCCESS,
                 note=f"Match {match.id} fee",
             )
-
-    # ------------------------------------------
-    # MERCHANT FEE DISABLED (set to 0)
-    # ------------------------------------------
-    # If you want to enable fee, change system_fee above.
 
     # ------------------------------------------
     # FINALIZE MATCH

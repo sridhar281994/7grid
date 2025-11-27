@@ -1,7 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime, timezone
-from decimal import Decimal
 import uuid
 
 from models import (
@@ -51,8 +50,8 @@ def _get_stake_rule_for_match(db: Session, match: GameMatch):
 
     return {
         "stake_amount": int(row["stake_amount"]),
-        "entry_fee": Decimal(str(row["entry_fee"])),
-        "winner_payout": Decimal(str(row["winner_payout"])),
+        "entry_fee": int(row["entry_fee"]),
+        "winner_payout": int(row["winner_payout"]),
         "players": int(row["players"]),
         "label": row["label"],
     }
@@ -70,7 +69,8 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     if not rule:
         raise RuntimeError("Missing stake rule")
 
-    entry_fee = Decimal(rule["entry_fee"])
+    entry_fee = rule["entry_fee"]
+    winner_payout = rule["winner_payout"]
     expected_players = rule["players"]
 
     # Determine player slots
@@ -87,21 +87,28 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         raise RuntimeError("Winner is not an active human")
 
     # ------------------------------------------
-    # POT CALCULATION  (main fix)
+    # POT CALCULATION
     # ------------------------------------------
-    pot = entry_fee * Decimal(len(active_ids))     #  <-- WINNER GETS FULL POT
-    system_fee = Decimal("0")                      #  <-- for your model (no commission)
+    pot = entry_fee * len(active_ids)
+
+    # Respect configured winner payout but never pay more than total pot.
+    prize = min(winner_payout, pot)
+    if winner_payout > pot:
+        print(f"[WARN] Winner payout {winner_payout} exceeds pot {pot}; paying pot value.")
+
+    system_fee = pot - prize
 
     # ------------------------------------------
     # WINNER CREDIT
     # ------------------------------------------
     winner = db.query(User).filter(User.id == winner_id).first()
-    winner.wallet_balance = (winner.wallet_balance or Decimal("0")) + pot
+    current_balance = float(winner.wallet_balance or 0)
+    winner.wallet_balance = current_balance + prize
 
     _log_transaction(
         db,
         winner.id,
-        float(pot),
+        float(prize),
         TxType.WIN,
         TxStatus.SUCCESS,
         note=f"Match {match.id} win"
@@ -115,7 +122,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # FINALIZE MATCH
     # ------------------------------------------
-    match.system_fee = system_fee
+    match.system_fee = float(system_fee)
     match.winner_user_id = winner_id
     match.status = MatchStatus.FINISHED
     match.finished_at = datetime.now(timezone.utc)

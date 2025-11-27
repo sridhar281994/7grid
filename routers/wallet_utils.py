@@ -104,9 +104,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
 
     # Determine player slots
     slots = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:expected_players]
-
-    # ✅ FIX: Only REAL humans are participants (exclude bots)
-    participant_ids = {uid for uid in slots if uid is not None and uid > 0}
+    participant_ids = {uid for uid in slots if uid is not None}
 
     # Active paying players (exclude bots)
     active_ids = [uid for uid in slots if uid is not None and uid > 0]
@@ -155,14 +153,11 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     fallback_id = _get_system_merchant_id(db)
     merchant_id = match.merchant_user_id or fallback_id
-
     if merchant_id in participant_ids:
         if fallback_id and fallback_id not in participant_ids:
             merchant_id = fallback_id
         else:
-            print(
-                f"[WARN] Merchant id {merchant_id} is part of match {match.id}; skipping fee credit."
-            )
+            print(f"[WARN] Merchant id {merchant_id} is part of match {match.id}; skipping fee credit.")
             merchant_id = None
 
     if merchant_id:

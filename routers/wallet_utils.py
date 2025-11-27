@@ -142,15 +142,18 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # MERCHANT FEE (house keeps the remainder)
     # ------------------------------------------
-    merchant_id = match.merchant_user_id or get_system_merchant_id(db)
+    fallback_id = get_system_merchant_id(db)
+    merchant_id = match.merchant_user_id or fallback_id
     if merchant_id in participant_ids:
         # Never credit a participant as the merchant; fall back to global System Merchant.
-        fallback_id = get_system_merchant_id(db)
         if fallback_id and fallback_id not in participant_ids:
             merchant_id = fallback_id
         else:
             print(f"[WARN] Merchant id {merchant_id} is part of match {match.id}; skipping fee credit.")
             merchant_id = None
+
+    if merchant_id:
+        match.merchant_user_id = merchant_id
 
     if system_fee > 0 and merchant_id:
         merchant = db.query(User).filter(User.id == merchant_id).first()

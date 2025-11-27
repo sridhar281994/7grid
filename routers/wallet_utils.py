@@ -71,6 +71,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         raise RuntimeError("Missing stake rule")
 
     entry_fee = Decimal(rule["entry_fee"])
+    winner_payout = Decimal(rule["winner_payout"])
     expected_players = rule["players"]
 
     # Determine player slots
@@ -87,21 +88,27 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         raise RuntimeError("Winner is not an active human")
 
     # ------------------------------------------
-    # POT CALCULATION  (main fix)
+    # POT CALCULATION
     # ------------------------------------------
-    pot = entry_fee * Decimal(len(active_ids))     #  <-- WINNER GETS FULL POT
-    system_fee = Decimal("0")                      #  <-- for your model (no commission)
+    pot = entry_fee * Decimal(len(active_ids))
+
+    # Respect configured winner payout but never pay more than total pot.
+    prize = min(winner_payout, pot)
+    if winner_payout > pot:
+        print(f"[WARN] Winner payout {winner_payout} exceeds pot {pot}; paying pot value.")
+
+    system_fee = pot - prize
 
     # ------------------------------------------
     # WINNER CREDIT
     # ------------------------------------------
     winner = db.query(User).filter(User.id == winner_id).first()
-    winner.wallet_balance = (winner.wallet_balance or Decimal("0")) + pot
+    winner.wallet_balance = (winner.wallet_balance or Decimal("0")) + prize
 
     _log_transaction(
         db,
         winner.id,
-        float(pot),
+        float(prize),
         TxType.WIN,
         TxStatus.SUCCESS,
         note=f"Match {match.id} win"

@@ -89,14 +89,18 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # POT CALCULATION
     # ------------------------------------------
-    pot = entry_fee * len(active_ids)
+    collected_pot = entry_fee * len(active_ids)
+    rule_pot = entry_fee * expected_players
 
-    # Respect configured winner payout but never pay more than total pot.
-    prize = min(winner_payout, pot)
-    if winner_payout > pot:
-        print(f"[WARN] Winner payout {winner_payout} exceeds pot {pot}; paying pot value.")
+    prize = winner_payout
+    if prize > collected_pot:
+        print(
+            f"[WARN] Not enough collected pot (have {collected_pot}) "
+            f"for payout {prize}; paying collected amount."
+        )
+        prize = collected_pot
 
-    system_fee = pot - prize
+    system_fee = max(rule_pot - prize, 0)
 
     # ------------------------------------------
     # WINNER CREDIT
@@ -113,6 +117,23 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         TxStatus.SUCCESS,
         note=f"Match {match.id} win"
     )
+
+    # ------------------------------------------
+    # MERCHANT FEE (house keeps the remainder)
+    # ------------------------------------------
+    merchant_id = match.merchant_user_id
+    if system_fee > 0 and merchant_id:
+        merchant = db.query(User).filter(User.id == merchant_id).first()
+        if merchant:
+            merchant.wallet_balance = float(merchant.wallet_balance or 0) + system_fee
+            _log_transaction(
+                db,
+                merchant.id,
+                float(system_fee),
+                TxType.FEE,
+                TxStatus.SUCCESS,
+                note=f"Match {match.id} fee",
+            )
 
     # ------------------------------------------
     # MERCHANT FEE DISABLED (set to 0)

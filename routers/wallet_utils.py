@@ -1,4 +1,3 @@
-import os
 import uuid
 from datetime import datetime, timezone
 
@@ -14,19 +13,26 @@ from models import (
     MatchStatus,
 )
 
-
-def _env_int(name: str) -> int | None:
-    raw = os.getenv(name)
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-        return value if value != 0 else None
-    except ValueError:
-        return None
+SYSTEM_MERCHANT_NAME = "System Merchant"
+_SYSTEM_MERCHANT_ID_CACHE: int | None = None
 
 
-HOUSE_MERCHANT_ID = _env_int("MERCHANT_USER_ID")
+def get_system_merchant_id(db: Session) -> int | None:
+    """
+    Return the cached id for the 'System Merchant' user.
+    """
+    global _SYSTEM_MERCHANT_ID_CACHE
+    if _SYSTEM_MERCHANT_ID_CACHE:
+        return _SYSTEM_MERCHANT_ID_CACHE
+
+    merchant = (
+        db.query(User.id)
+        .filter(User.name == SYSTEM_MERCHANT_NAME)
+        .first()
+    )
+    if merchant:
+        _SYSTEM_MERCHANT_ID_CACHE = int(merchant[0])
+    return _SYSTEM_MERCHANT_ID_CACHE
 
 
 def _log_transaction(db: Session, user_id: int, amount: float,
@@ -136,11 +142,12 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # MERCHANT FEE (house keeps the remainder)
     # ------------------------------------------
-    merchant_id = match.merchant_user_id or HOUSE_MERCHANT_ID
+    merchant_id = match.merchant_user_id or get_system_merchant_id(db)
     if merchant_id in participant_ids:
-        # Never credit a participant as the merchant; fall back to env setting or skip.
-        if HOUSE_MERCHANT_ID and HOUSE_MERCHANT_ID not in participant_ids:
-            merchant_id = HOUSE_MERCHANT_ID
+        # Never credit a participant as the merchant; fall back to global System Merchant.
+        fallback_id = get_system_merchant_id(db)
+        if fallback_id and fallback_id not in participant_ids:
+            merchant_id = fallback_id
         else:
             print(f"[WARN] Merchant id {merchant_id} is part of match {match.id}; skipping fee credit.")
             merchant_id = None

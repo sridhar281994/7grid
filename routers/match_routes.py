@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import random
 import time
 from datetime import datetime, timezone, timedelta
@@ -16,7 +15,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
 from utils.security import get_current_user, get_current_user_ws
-from routers.wallet_utils import distribute_prize
+from routers.wallet_utils import distribute_prize, get_system_merchant_id
 from routers.game import get_stake_rule
 from redis_client import redis_client, _get_redis  # ✅ shared redis instance
 import logging
@@ -31,20 +30,6 @@ log = logging.getLogger("matches")
 log.setLevel(logging.DEBUG)
 
 BOT_FALLBACK_SECONDS = 10
-
-
-def _env_int(name: str) -> int | None:
-    raw = os.getenv(name)
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-        return value if value != 0 else None
-    except ValueError:
-        return None
-
-
-HOUSE_MERCHANT_ID = _env_int("MERCHANT_USER_ID")
 
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -457,7 +442,7 @@ async def create_or_wait_match(
         if entry_fee > 0:
             current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
 
-        merchant_id = HOUSE_MERCHANT_ID
+        merchant_id = get_system_merchant_id(db)
         if merchant_id == current_user.id:
             # Prevent players from being treated as the merchant for this match.
             merchant_id = None

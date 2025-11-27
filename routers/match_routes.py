@@ -865,22 +865,31 @@ async def forfeit_match(
     if m.status != MatchStatus.ACTIVE:
         raise HTTPException(400, "Match not active")
 
-    # Player slots
-    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id]
+    expected_players = m.num_players or 2
+
+    # Player slots (do NOT mutate the DB columns; keep for history)
+    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]
 
     if current_user.id not in slots:
         raise HTTPException(403, "Not your match")
 
     loser_idx = slots.index(current_user.id)
+    state = await _read_state(m.id) or {
+        "positions": [0] * expected_players,
+        "current_turn": m.current_turn or 0,
+        "last_roll": m.last_roll,
+        "turn_count": 0,
+        "spawned": [False] * expected_players,
+    }
+    positions = state.get("positions", [0] * expected_players)
+    spawned = state.get("spawned", [False] * expected_players)
+    turn_count = state.get("turn_count", 0)
+    last_roll = state.get("last_roll", m.last_roll)
 
     # Mark forfeiter
     forfeited = set(m.forfeit_ids or [])
     forfeited.add(current_user.id)
     m.forfeit_ids = list(forfeited)
-
-    # Remove forfeiter
-    slots[loser_idx] = None
-    m.p1_user_id, m.p2_user_id, m.p3_user_id = slots
 
     # Active players
     active_indices = [
@@ -906,17 +915,17 @@ async def forfeit_match(
             raise
 
         final_state = {
-            "positions": [0, 0, 0],
+            "positions": positions,
             "current_turn": winner_idx,
-            "last_roll": m.last_roll,
+            "last_roll": last_roll,
             "winner": winner_idx,
             "finished": True,
             "forfeit": True,
             "forfeit_actor": loser_idx,
-            "active_players": [uid for uid in slots if uid and uid not in forfeited],
+            "active_players": [slots[winner_idx]],
             "forfeit_ids": list(forfeited),
-            "spawned": [False, False, False],
-            "turn_count": 9999,
+            "spawned": spawned,
+            "turn_count": turn_count,
         }
 
         await _write_state(m, final_state)
@@ -941,13 +950,15 @@ async def forfeit_match(
     else:
         # Move to next active
         nxt = curr
-        for _ in range(len(slots)):
-            nxt = (nxt + 1) % len(slots)
+        for _ in range(expected_players):
+            nxt = (nxt + 1) % expected_players
             if nxt in active_indices:
                 break
         m.current_turn = nxt
 
     db.commit()
+
+    active_player_ids = [slots[i] for i in active_indices]
 
     await _write_state(
         m,
@@ -956,10 +967,13 @@ async def forfeit_match(
             "forfeit_actor": loser_idx,
             "continuing": True,
             "current_turn": m.current_turn,
-            "positions": [0, 0, 0],
+            "positions": positions,
+            "last_roll": last_roll,
+            "turn_count": turn_count,
             "winner": None,
-            "active_players": [uid for uid in slots if uid and uid not in forfeited],
+            "active_players": active_player_ids,
             "forfeit_ids": list(forfeited),
+            "spawned": spawned,
         },
     )
 

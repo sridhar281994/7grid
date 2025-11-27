@@ -1,7 +1,9 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from datetime import datetime, timezone
+import os
 import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from models import (
     User,
@@ -11,6 +13,20 @@ from models import (
     TxStatus,
     MatchStatus,
 )
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        return value if value != 0 else None
+    except ValueError:
+        return None
+
+
+HOUSE_MERCHANT_ID = _env_int("MERCHANT_USER_ID")
 
 
 def _log_transaction(db: Session, user_id: int, amount: float,
@@ -75,6 +91,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
 
     # Determine player slots
     slots = [match.p1_user_id, match.p2_user_id, match.p3_user_id][:expected_players]
+    participant_ids = {uid for uid in slots if uid is not None}
 
     # Active paying players (exclude bots)
     active_ids = [uid for uid in slots if uid is not None and uid > 0]
@@ -90,8 +107,6 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # POT CALCULATION
     # ------------------------------------------
     collected_pot = entry_fee * len(active_ids)
-    rule_pot = entry_fee * expected_players
-
     prize = winner_payout
     if prize > collected_pot:
         print(
@@ -100,7 +115,7 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
         )
         prize = collected_pot
 
-    system_fee = max(rule_pot - prize, 0)
+    system_fee = max(collected_pot - prize, 0)
 
     # ------------------------------------------
     # WINNER CREDIT
@@ -121,7 +136,15 @@ async def distribute_prize(db: Session, match: GameMatch, winner_idx: int):
     # ------------------------------------------
     # MERCHANT FEE (house keeps the remainder)
     # ------------------------------------------
-    merchant_id = match.merchant_user_id
+    merchant_id = match.merchant_user_id or HOUSE_MERCHANT_ID
+    if merchant_id in participant_ids:
+        # Never credit a participant as the merchant; fall back to env setting or skip.
+        if HOUSE_MERCHANT_ID and HOUSE_MERCHANT_ID not in participant_ids:
+            merchant_id = HOUSE_MERCHANT_ID
+        else:
+            print(f"[WARN] Merchant id {merchant_id} is part of match {match.id}; skipping fee credit.")
+            merchant_id = None
+
     if system_fee > 0 and merchant_id:
         merchant = db.query(User).filter(User.id == merchant_id).first()
         if merchant:

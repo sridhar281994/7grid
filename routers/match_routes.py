@@ -31,6 +31,21 @@ log = logging.getLogger("matches")
 log.setLevel(logging.DEBUG)
 
 BOT_FALLBACK_SECONDS = 10
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        return value if value != 0 else None
+    except ValueError:
+        return None
+
+
+HOUSE_MERCHANT_ID = _env_int("MERCHANT_USER_ID")
+
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -442,6 +457,11 @@ async def create_or_wait_match(
         if entry_fee > 0:
             current_user.wallet_balance = (current_user.wallet_balance or 0) - entry_fee
 
+        merchant_id = HOUSE_MERCHANT_ID
+        if merchant_id == current_user.id:
+            # Prevent players from being treated as the merchant for this match.
+            merchant_id = None
+
         new_match = GameMatch(
             stake_amount=stake_amount,
             status=MatchStatus.WAITING,
@@ -452,7 +472,7 @@ async def create_or_wait_match(
             current_turn=random.choice([0, 1] if num_players == 2 else [0, 1, 2]),
             num_players=num_players,
             created_at=_utcnow(),
-            merchant_user_id=1,  # admin / system owner
+            merchant_user_id=merchant_id,
         )
         db.add(new_match)
         db.commit()

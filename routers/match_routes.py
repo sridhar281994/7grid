@@ -77,6 +77,20 @@ def _name_for_id(db: Session, user_id: Optional[int]) -> Optional[str]:
     return _name_for(db.get(User, user_id))
 
 
+def _player_ids(m: GameMatch) -> list[Optional[int]]:
+    num = m.num_players or 2
+    return [m.p1_user_id, m.p2_user_id, m.p3_user_id][:num]
+
+
+def _player_index_for_user(m: GameMatch, user_id: Optional[int]) -> Optional[int]:
+    if user_id is None:
+        return None
+    try:
+        return _player_ids(m).index(user_id)
+    except ValueError:
+        return None
+
+
 def _status_value(m: GameMatch) -> str:
     try:
         return m.status.value
@@ -219,6 +233,7 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "actor": state.get("actor"),
         "spawned": state.get("spawned", [False] * num_players), # ✅ persistent spawn state
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
+        "player_ids": _player_ids(m),
     }
     try:
         if redis_client:
@@ -435,6 +450,8 @@ async def create_or_wait_match(
                 "p2_id": waiting.p2_user_id,
                 "p3_id": waiting.p3_user_id,
                 "turn": waiting.current_turn or 0,
+                "player_ids": _player_ids(waiting),
+                "player_index": _player_index_for_user(waiting, current_user.id),
             }
 
         # ---- No WAITING match → create new WAITING match ----
@@ -482,6 +499,8 @@ async def create_or_wait_match(
             "p2_id": None,
             "p3_id": None,
             "turn": new_match.current_turn or 0,
+            "player_ids": _player_ids(new_match),
+            "player_index": _player_index_for_user(new_match, current_user.id),
         }
 
     except SQLAlchemyError as e:
@@ -506,7 +525,8 @@ async def check_match_ready(
     waiting_time = max(0, now - int(m.created_at.timestamp()) if m.created_at else 0)
 
     # ---------- slot / fill info ----------
-    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]
+    slots = _player_ids(m)
+    player_index = _player_index_for_user(m, current_user.id)
     filled_slots = sum(1 for uid in slots if uid is not None)
 
     # ---------- Redis state ----------
@@ -565,6 +585,8 @@ async def check_match_ready(
             "turn_count": st.get("turn_count", 0),
             "waiting_time": waiting_time,
             "prompt_bot": False,
+            "player_ids": slots,
+            "player_index": player_index,
         }
 
     # ======================================================
@@ -605,6 +627,8 @@ async def check_match_ready(
             "turn_count": st.get("turn_count", 0),
             "waiting_time": waiting_time,
             "prompt_bot": False,
+            "player_ids": slots,
+            "player_index": player_index,
         }
 
     # ======================================================
@@ -629,6 +653,8 @@ async def check_match_ready(
             "winner": winner_idx,
             "waiting_time": waiting_time,
             "prompt_bot": False,
+            "player_ids": slots,
+            "player_index": player_index,
         }
 
     # ======================================================
@@ -674,6 +700,8 @@ async def check_match_ready(
             "p3_id": m.p3_user_id,
             "winner": winner_idx,
             "finished_at": m.finished_at.isoformat() if m.finished_at else None,
+            "player_ids": slots,
+            "player_index": player_index,
         }
 
     # ======================================================
@@ -710,6 +738,8 @@ async def check_match_ready(
         "turn_count": st.get("turn_count", 0),
         "waiting_time": waiting_time,
         "prompt_bot": False,
+        "player_ids": slots,
+        "player_index": player_index,
     }
 
 
@@ -818,7 +848,12 @@ async def roll_dice(
         await asyncio.sleep(1)
         await _clear_state(m.id)
 
-        return {"ok": True, **final_state}
+        return {
+            "ok": True,
+            **final_state,
+            "player_ids": _player_ids(m),
+            "player_index": me_idx,
+        }
 
     # -------------------------
     # Normal turn advance
@@ -846,7 +881,12 @@ async def roll_dice(
     }
 
     await _write_state(m, new_state)
-    return {"ok": True, **new_state}
+    return {
+        "ok": True,
+        **new_state,
+        "player_ids": _player_ids(m),
+        "player_index": me_idx,
+    }
 
 
 # -------------------------
@@ -868,7 +908,8 @@ async def forfeit_match(
     expected_players = m.num_players or 2
 
     # Player slots (do NOT mutate the DB columns; keep for history)
-    slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:expected_players]
+    slots = _player_ids(m)
+    player_index = _player_index_for_user(m, current_user.id)
 
     if current_user.id not in slots:
         raise HTTPException(403, "Not your match")
@@ -937,6 +978,8 @@ async def forfeit_match(
             "forfeit": True,
             "continuing": False,
             "winner": winner_idx,
+            "player_ids": slots,
+            "player_index": player_index,
         }
 
     # ---------------------------
@@ -982,6 +1025,8 @@ async def forfeit_match(
         "forfeit": True,
         "continuing": True,
         "current_turn": m.current_turn,
+        "player_ids": slots,
+        "player_index": player_index,
     }
 
 
@@ -1103,6 +1148,8 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "reverse": st.get("reverse", False),
                         "spawn": st.get("spawn", False),
                         "actor": st.get("actor"),
+                        "player_ids": _player_ids(m),
+                        "player_index": _player_index_for_user(m, current_user.id),
                     }
                     print(f"[WS][SNAPSHOT] {snapshot}")
 

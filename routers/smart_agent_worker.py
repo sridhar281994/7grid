@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import GameMatch, MatchStatus
-from routers.match_routes import roll_dice  # reuse your existing /roll logic
+from routers.match_routes import roll_dice, RollIn  # reuse your existing /roll logic
 from utils.security import FakeUser
 
 # Same list used in agent_pool.py
@@ -52,7 +52,7 @@ async def _auto_roll_worker():
 
                     try:
                         await roll_dice(
-                            payload={"match_id": m.id},
+                            payload=RollIn(match_id=m.id),
                             db=db,
                             current_user=fake_user
                         )

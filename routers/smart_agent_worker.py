@@ -36,9 +36,15 @@ async def _auto_roll_worker():
 
             for m in matches:
                 slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:m.num_players]
-                
-                # If it's an agent's turn → auto roll
+
+                if not slots:
+                    continue
+
                 turn = m.current_turn or 0
+                if turn < 0 or turn >= len(slots):
+                    # slot data out of sync (match partially filled) – skip until backend fixes turn
+                    continue
+
                 uid_turn = slots[turn]
 
                 if uid_turn in AGENT_USER_IDS:

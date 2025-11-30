@@ -37,6 +37,14 @@ async def _auto_roll_worker():
             for m in matches:
                 slots = [m.p1_user_id, m.p2_user_id, m.p3_user_id][:m.num_players]
 
+                # Only engage bots if at least one real human (id>0 and not an agent) joined
+                has_human_player = any(
+                    uid and uid > 0 and uid not in AGENT_USER_IDS
+                    for uid in slots
+                )
+                if not has_human_player:
+                    continue
+
                 if not slots:
                     continue
 

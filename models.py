@@ -33,6 +33,18 @@ class TxStatus(enum.Enum):
     FAILED = "failed"
 
 
+class WithdrawalMethod(enum.Enum):
+    UPI = "upi"
+    PAYPAL = "paypal"
+
+
+class WithdrawalStatus(enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    PAID = "paid"
+    REJECTED = "rejected"
+
+
 # -----------------------
 # User Table
 # -----------------------
@@ -140,6 +152,25 @@ class WalletTransaction(Base):
     transaction_id = Column(String, unique=True, nullable=True)
 
     user = relationship("User", back_populates="transactions")
+
+
+class WithdrawalRequest(Base):
+    __tablename__ = "withdrawals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    wallet_tx_id = Column(Integer, ForeignKey("wallet_transactions.id"), nullable=False, unique=True)
+    amount = Column(Numeric(10, 2), nullable=False)
+    method = Column(Enum(WithdrawalMethod), nullable=False)
+    account = Column(String, nullable=False)
+    status = Column(Enum(WithdrawalStatus), default=WithdrawalStatus.PENDING, nullable=False)
+    payout_txn_id = Column(String, nullable=True)
+    details = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User")
+    tx = relationship("WalletTransaction")
 
 
 # -----------------------

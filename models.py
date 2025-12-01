@@ -1,9 +1,18 @@
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, ForeignKey, Numeric, Enum, text as sa_text
+    Column,
+    Integer,
+    String,
+    DateTime,
+    Boolean,
+    ForeignKey,
+    Numeric,
+    Enum,
+    Text,
+    text as sa_text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 import enum
 
 from database import Base
@@ -150,6 +159,9 @@ class WalletTransaction(Base):
     provider_ref = Column(String, nullable=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     transaction_id = Column(String, unique=True, nullable=True)
+    channel = Column(String(32), nullable=True)
+    initiator_ip = Column(String(64), nullable=True)
+    metadata = Column(JSONB, nullable=True)
 
     user = relationship("User", back_populates="transactions")
 
@@ -165,7 +177,10 @@ class WithdrawalRequest(Base):
     account = Column(String, nullable=False)
     status = Column(Enum(WithdrawalStatus), default=WithdrawalStatus.PENDING, nullable=False)
     payout_txn_id = Column(String, nullable=True)
-    details = Column(String, nullable=True)
+    details = Column(Text, nullable=True)
+    channel = Column(String(32), nullable=True)
+    initiator_ip = Column(String(64), nullable=True)
+    metadata = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -184,3 +199,82 @@ class Stake(Base):
     entry_fee = Column(Integer, nullable=False)  # each player pays
     winner_payout = Column(Integer, nullable=False)  # winner gets
     label = Column(String(50), nullable=False)  # UI label
+
+
+# -----------------------
+# Wallet bridge tokens (short-lived auth handoff)
+# -----------------------
+class WalletBridgeToken(Base):
+    __tablename__ = "wallet_bridge_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token = Column(String(128), unique=True, nullable=False)
+    channel = Column(String(32), nullable=False)
+    device_fingerprint = Column(String(128), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+
+class WalletDeviceCode(Base):
+    __tablename__ = "wallet_device_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    code = Column(String(12), unique=True, nullable=False)
+    channel = Column(String(32), nullable=False)
+    device_fingerprint = Column(String(128), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+
+class PayoutAuditLog(Base):
+    __tablename__ = "payout_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    withdrawal_id = Column(Integer, ForeignKey("withdrawals.id"), nullable=False)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(String(64), nullable=False)
+    status_before = Column(String(32), nullable=True)
+    status_after = Column(String(32), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(256), nullable=True)
+    details = Column(Text, nullable=True)
+    provider_txn_id = Column(String(128), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    withdrawal = relationship("WithdrawalRequest")
+    admin = relationship("User")
+
+
+class AdminMFASecret(Base):
+    __tablename__ = "admin_mfa_secrets"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    secret = Column(String(64), nullable=False)
+    enabled_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_verified_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+
+
+class KYCSnapshot(Base):
+    __tablename__ = "kyc_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(String(32), nullable=False)
+    document_type = Column(String(64), nullable=True)
+    document_ref = Column(String(128), nullable=True)
+    data = Column(JSONB, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    reviewer = relationship("User", foreign_keys=[reviewed_by])

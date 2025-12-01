@@ -1,5 +1,5 @@
-import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -12,13 +12,13 @@ def log_payout_action(
     withdrawal: WithdrawalRequest,
     admin: Optional[User],
     action: str,
-    status_before: str,
-    status_after: str,
+    status_before: Optional[str],
+    status_after: Optional[str],
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
     details: Optional[str] = None,
     provider_txn_id: Optional[str] = None,
-):
+) -> PayoutAuditLog:
     log = PayoutAuditLog(
         withdrawal_id=withdrawal.id,
         admin_id=admin.id if admin else None,
@@ -29,7 +29,7 @@ def log_payout_action(
         user_agent=user_agent,
         details=details,
         provider_txn_id=provider_txn_id,
-        created_at=datetime.datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db.add(log)
     db.commit()

@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from database import Base, engine, SessionLocal
 from models import User
-from routers import auth, users, wallet, game, match_routes
+from routers import auth, users, wallet, game, match_routes, wallet_portal, admin_wallet
 from routers.smart_agent_worker import start_agent_ai
 
 # Import the agent pool function
@@ -118,3 +118,5 @@ app.include_router(users.router)
 app.include_router(wallet.router)
 app.include_router(game.router)
 app.include_router(match_routes.router)
+app.include_router(wallet_portal.router)
+app.include_router(admin_wallet.router)

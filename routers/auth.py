@@ -3,16 +3,25 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from jose import jwt
 from passlib.hash import bcrypt   # ✅ secure hashing
 
 from database import get_db
 from models import OTP, User
 from utils.email_utils import send_email_otp
-from utils.security import get_current_user
+from utils.security import (
+    get_current_user,
+    create_access_token,
+    hash_fingerprint,
+    issue_wallet_bridge_token,
+    issue_device_code,
+    consume_device_code,
+    issue_wallet_cookie,
+    require_channel,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -23,6 +32,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", str(60 * 24 * 30)))  # default 30 days
 OTP_EXP_MIN = int(os.getenv("OTP_EXP_MINUTES", "5"))
+WALLET_LINK_CHANNEL = "web"
 
 # =====================
 # Helpers
@@ -30,13 +40,13 @@ OTP_EXP_MIN = int(os.getenv("OTP_EXP_MINUTES", "5"))
 def _now():
     return datetime.now(timezone.utc)
 
-def _jwt_for_user(user_id: int) -> str:
-    payload = {
-        "sub": str(user_id),
-        "exp": int((_now() + timedelta(minutes=JWT_EXP_MIN)).timestamp()),
-        "iat": int(_now().timestamp()),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+def _jwt_for_user(user_id: int, channel: str, fingerprint: Optional[str]) -> str:
+    return create_access_token(
+        user_id,
+        channel=channel,
+        fingerprint=fingerprint,
+        expires_minutes=JWT_EXP_MIN,
+    )
 
 def _gen_otp():
     return f"{random.randint(100000, 999999)}"
@@ -50,6 +60,7 @@ class PhoneIn(BaseModel):
 class VerifyIn(BaseModel):
     phone: str
     otp: str
+    channel: Optional[str] = None
 
 class RegisterIn(BaseModel):
     phone: str
@@ -62,6 +73,20 @@ class RegisterIn(BaseModel):
 # =====================
 # Routes
 # =====================
+
+class WalletLinkOut(BaseModel):
+    token: str
+    expires_in: int
+
+
+class DeviceCodeOut(BaseModel):
+    code: str
+    expires_in: int
+
+
+class DeviceCodeConsumeIn(BaseModel):
+    code: str
+
 
 @router.post("/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
@@ -131,9 +156,12 @@ def send_otp_by_phone(payload: PhoneIn, db: Session = Depends(get_db)):
 
 
 @router.post("/verify-otp")
-def verify_otp_phone(payload: VerifyIn, db: Session = Depends(get_db)):
+def verify_otp_phone(payload: VerifyIn, request: Request, db: Session = Depends(get_db)):
     phone = payload.phone.strip()
     otp = payload.otp.strip()
+    channel = (payload.channel or "app").lower()
+    if channel not in {"app", "web"}:
+        raise HTTPException(400, "Invalid channel")
 
     if not (phone.isdigit() and len(phone) == 10):
         raise HTTPException(400, "Enter a valid 10-digit phone number.")
@@ -160,8 +188,15 @@ def verify_otp_phone(payload: VerifyIn, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(400, "User not found.")
 
-    token = _jwt_for_user(user.id)
-    return {"ok": True, "user_id": user.id, "access_token": token, "token_type": "bearer"}
+    fingerprint = _collect_fingerprint(request)
+    token = _jwt_for_user(user.id, channel=channel, fingerprint=fingerprint)
+    return {
+        "ok": True,
+        "user_id": user.id,
+        "access_token": token,
+        "token_type": "bearer",
+        "channel": channel,
+    }
 
 
 @router.get("/me")
@@ -193,5 +228,78 @@ def get_me(
         "wallet_balance": float(user.wallet_balance or 0),
         "created_at": user.created_at.isoformat() if user.created_at else None,
     }
+
+
+def _collect_fingerprint(request: Request) -> Optional[str]:
+    user_agent = request.headers.get("user-agent", "")
+    device = request.headers.get("x-device-fingerprint") or request.headers.get("x-device-id") or ""
+    raw = "|".join(filter(None, [user_agent, device]))
+    return hash_fingerprint(raw) if raw else None
+
+
+@router.post(
+    "/wallet-link",
+    response_model=WalletLinkOut,
+    dependencies=[Depends(require_channel("app"))],
+)
+def create_wallet_link(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    fingerprint = _collect_fingerprint(request)
+    result = issue_wallet_bridge_token(
+        db,
+        user,
+        channel=WALLET_LINK_CHANNEL,
+        fingerprint=fingerprint,
+    )
+    return {"token": result["token"], "expires_in": result["expires_in"]}
+
+
+@router.post(
+    "/device-code",
+    response_model=DeviceCodeOut,
+    dependencies=[Depends(require_channel("app"))],
+)
+def create_device_code_endpoint(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    fingerprint = _collect_fingerprint(request)
+    record = issue_device_code(
+        db,
+        user,
+        channel=WALLET_LINK_CHANNEL,
+        fingerprint=fingerprint,
+    )
+    return {"code": record["code"], "expires_in": record["expires_in"]}
+
+
+@router.post("/device-code/consume")
+def consume_device_code_endpoint(
+    payload: DeviceCodeConsumeIn,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    result = consume_device_code(db, payload.code)
+    user = db.get(User, result["user_id"])
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    fingerprint = _collect_fingerprint(request)
+    token = _jwt_for_user(user.id, channel=WALLET_LINK_CHANNEL, fingerprint=fingerprint)
+    response = JSONResponse(
+        {
+            "ok": True,
+            "user_id": user.id,
+            "access_token": token,
+            "token_type": "bearer",
+            "channel": WALLET_LINK_CHANNEL,
+        }
+    )
+    issue_wallet_cookie(response, {"user_id": user.id, "channel": WALLET_LINK_CHANNEL})
+    return response
 
 

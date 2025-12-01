@@ -14,3 +14,8 @@ websockets==12.0
 redis>=5.0
 setuptools
 sendgrid==6.11.0
+itsdangerous==2.2.0
+pyotp==2.9.0
+Jinja2==3.1.4
+orjson==3.10.5
+user-agents==2.2.0

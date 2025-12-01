@@ -3,16 +3,24 @@ import json
 import hmac
 import hashlib
 import requests
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, condecimal
+from pydantic import BaseModel, condecimal, validator
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc
-from sqlalchemy.exc import SQLAlchemyError
 
 from database import get_db
-from models import User, WalletTransaction, TxType, TxStatus
+from models import (
+    User,
+    WalletTransaction,
+    TxType,
+    TxStatus,
+    WithdrawalMethod,
+    WithdrawalStatus,
+    WithdrawalRequest,
+)
 from utils.security import get_current_user
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
@@ -24,14 +32,32 @@ class AmountIn(BaseModel):
     amount: condecimal(gt=0, max_digits=12, decimal_places=2)
 
 
-class WithdrawIn(BaseModel):
-    amount: condecimal(gt=0, max_digits=12, decimal_places=2)
-    upi_id: str
-
-
 # -----------------------------
 # Helpers
 # -----------------------------
+class WithdrawRequestIn(BaseModel):
+    amount: condecimal(gt=0, max_digits=12, decimal_places=2)
+    method: WithdrawalMethod
+    account: str
+
+    @validator("account")
+    def validate_account(cls, value: str, values):
+        method = values.get("method")
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("Account identifier is required")
+
+        if method == WithdrawalMethod.UPI:
+            if "@" not in value or len(value) > 80:
+                raise ValueError("Enter a valid UPI ID")
+        elif method == WithdrawalMethod.PAYPAL:
+            if "@" not in value or "." not in value.split("@")[-1]:
+                raise ValueError("Enter a valid PayPal email")
+            if len(value) > 120:
+                raise ValueError("PayPal email is too long")
+        return value
+
+
 def _lock_user(db: Session, user_id: int) -> User:
     """🔒 Always lock row before modifying wallet balance."""
     u = db.execute(
@@ -54,6 +80,126 @@ def _verify_rzp_signature(secret: str, body_bytes: bytes, signature: str) -> boo
 def _amount_to_paise(amount: Decimal) -> int:
     # Razorpay expects integer paise
     return int(Decimal(amount) * 100)
+
+
+def _get_withdrawal_by_tx(db: Session, tx_id: int) -> Optional[WithdrawalRequest]:
+    stmt = select(WithdrawalRequest).where(WithdrawalRequest.wallet_tx_id == tx_id)
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def _mask_payout_account(account: str) -> str:
+    account = (account or "").strip()
+    if len(account) <= 6:
+        return account[:1] + "***" + account[-1:] if account else ""
+    return f"{account[:3]}****{account[-3:]}"
+
+
+def _format_withdraw_note(provider_ref: Optional[str]) -> Optional[str]:
+    if not provider_ref:
+        return None
+    method = None
+    account = provider_ref
+    if ":" in provider_ref:
+        method, account = provider_ref.split(":", 1)
+    masked = _mask_payout_account(account)
+    if method:
+        return f"{method.upper()} → {masked}"
+    return masked
+
+
+# -----------------------------
+# PayPal Config
+# -----------------------------
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
+PAYPAL_ENV = os.getenv("PAYPAL_ENV", "live").lower()
+PAYPAL_API_BASE = os.getenv(
+    "PAYPAL_API_BASE",
+    "https://api-m.sandbox.paypal.com" if PAYPAL_ENV == "sandbox" else "https://api-m.paypal.com",
+)
+PAYPAL_PAYOUT_CURRENCY = os.getenv("PAYPAL_PAYOUT_CURRENCY", "USD")
+PAYPAL_PAYOUT_BATCH_PREFIX = os.getenv("PAYPAL_PAYOUT_BATCH_PREFIX", "DICEPAY")
+
+
+def _paypal_is_configured() -> bool:
+    return bool(PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET)
+
+
+def _ensure_method_supported(method: WithdrawalMethod):
+    if method == WithdrawalMethod.PAYPAL and not _paypal_is_configured():
+        raise HTTPException(503, "PayPal payouts not configured")
+
+
+def _paypal_get_access_token() -> str:
+    if not _paypal_is_configured():
+        raise HTTPException(503, "PayPal payouts not configured")
+
+    try:
+        resp = requests.post(
+            f"{PAYPAL_API_BASE}/v1/oauth2/token",
+            data={"grant_type": "client_credentials"},
+            auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"PayPal auth network error: {exc}") from exc
+
+    if resp.status_code >= 300:
+        raise HTTPException(502, f"PayPal auth failed: {resp.text}")
+
+    token = resp.json().get("access_token")
+    if not token:
+        raise HTTPException(502, "PayPal auth failed: missing token")
+    return token
+
+
+def _paypal_send_payout(
+    withdrawal: WithdrawalRequest, token: Optional[str] = None
+) -> Tuple[str, dict]:
+    access_token = token or _paypal_get_access_token()
+    value = Decimal(withdrawal.amount or 0).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    payload = {
+        "sender_batch_header": {
+            "sender_batch_id": f"{PAYPAL_PAYOUT_BATCH_PREFIX}-{withdrawal.id}",
+            "email_subject": "You have a payout",
+            "email_message": "You received a payout from Dice Game.",
+        },
+        "items": [
+            {
+                "recipient_type": "EMAIL",
+                "amount": {"value": f"{value:.2f}", "currency": PAYPAL_PAYOUT_CURRENCY},
+                "receiver": withdrawal.account,
+                "note": f"Wallet withdrawal #{withdrawal.id}",
+                "sender_item_id": f"withdrawal-{withdrawal.id}",
+            }
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(
+            f"{PAYPAL_API_BASE}/v1/payments/payouts",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"PayPal payout network error: {exc}") from exc
+
+    if resp.status_code >= 300:
+        raise RuntimeError(f"PayPal payout failed: {resp.text}")
+
+    data = resp.json()
+    payout_id = data.get("batch_header", {}).get("payout_batch_id")
+    item = (data.get("items") or [{}])[0]
+    txn_id = item.get("transaction_id") or payout_id
+    if not txn_id:
+        raise RuntimeError("PayPal payout missing transaction id")
+    return txn_id, data
 
 
 # -----------------------------
@@ -86,12 +232,9 @@ def wallet_history(
             "amount": float(tx.amount),
             "type": tx.tx_type.value,
             "status": tx.status.value,
-            # Mask UPI ID for privacy (optional)
-            "note": (
-                tx.provider_ref[:4] + "****" + tx.provider_ref[-4:]
-                if tx.tx_type == TxType.WITHDRAW and tx.provider_ref
-                else tx.provider_ref
-            ),
+            "note": _format_withdraw_note(tx.provider_ref)
+            if tx.tx_type == TxType.WITHDRAW
+            else tx.provider_ref,
             "timestamp": tx.timestamp.isoformat() if tx.timestamp else None,
         }
         for tx in rows
@@ -250,22 +393,18 @@ def recharge_tx_status(
     }
 
 
-# -------------------------------------------------
-# WITHDRAWAL (Payout)
-# -------------------------------------------------
-class WithdrawRequestIn(BaseModel):
-    amount: condecimal(gt=0, max_digits=12, decimal_places=2)
-    upi_id: str
-
-
 @router.post("/withdraw/request")
 def withdraw_request(
     payload: WithdrawRequestIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Deduct immediately, leave payout processing to worker/webhook."""
+    """Deduct immediately, capture payout preference, queue for processor."""
     amount = Decimal(payload.amount)
+    method = payload.method
+    account = payload.account.strip()
+    _ensure_method_supported(method)
+
     u = _lock_user(db, user.id)
     if (u.wallet_balance or 0) < amount:
         raise HTTPException(400, "Insufficient balance")
@@ -276,18 +415,41 @@ def withdraw_request(
         amount=amount,
         tx_type=TxType.WITHDRAW,
         status=TxStatus.PENDING,
-        provider_ref=payload.upi_id,
+        provider_ref=f"{method.value}:{account}",
     )
     db.add(tx)
+    db.flush()
+
+    withdrawal = WithdrawalRequest(
+        user_id=u.id,
+        wallet_tx_id=tx.id,
+        amount=amount,
+        method=method,
+        account=account,
+        status=WithdrawalStatus.PENDING,
+    )
+    db.add(withdrawal)
     db.commit()
     db.refresh(tx)
+    db.refresh(withdrawal)
 
-    return {"ok": True, "tx_id": tx.id, "status": tx.status.value, "balance": float(u.wallet_balance or 0)}
+    return {
+        "ok": True,
+        "tx_id": tx.id,
+        "withdrawal_id": withdrawal.id,
+        "method": method.value,
+        "status": tx.status.value,
+        "balance": float(u.wallet_balance or 0),
+    }
 
 
 # Admin-only finalize
 @router.post("/withdraw/mark-success")
-def withdraw_mark_success(tx_id: int, db: Session = Depends(get_db)):
+def withdraw_mark_success(
+    tx_id: int,
+    payout_txn_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     if os.getenv("ALLOW_ADMIN", "false").lower() != "true":
         raise HTTPException(403, "Forbidden")
 
@@ -298,12 +460,22 @@ def withdraw_mark_success(tx_id: int, db: Session = Depends(get_db)):
         return {"ok": True, "already": tx.status.value}
 
     tx.status = TxStatus.SUCCESS
+    withdrawal = _get_withdrawal_by_tx(db, tx.id)
+    if withdrawal:
+        withdrawal.status = WithdrawalStatus.PAID
+        if payout_txn_id:
+            withdrawal.payout_txn_id = payout_txn_id
+
     db.commit()
     return {"ok": True, "status": "SUCCESS"}
 
 
 @router.post("/withdraw/mark-failed")
-def withdraw_mark_failed(tx_id: int, db: Session = Depends(get_db)):
+def withdraw_mark_failed(
+    tx_id: int,
+    reason: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     if os.getenv("ALLOW_ADMIN", "false").lower() != "true":
         raise HTTPException(403, "Forbidden")
 
@@ -313,10 +485,83 @@ def withdraw_mark_failed(tx_id: int, db: Session = Depends(get_db)):
     if tx.status != TxStatus.PENDING:
         return {"ok": True, "already": tx.status.value}
 
-    user = db.get(User, tx.user_id)
-    if user:
-        user.wallet_balance = (user.wallet_balance or 0) + tx.amount
+    user = _lock_user(db, tx.user_id)
+    user.wallet_balance = (user.wallet_balance or 0) + tx.amount
 
     tx.status = TxStatus.FAILED
+    withdrawal = _get_withdrawal_by_tx(db, tx.id)
+    if withdrawal:
+        withdrawal.status = WithdrawalStatus.REJECTED
+        if reason:
+            withdrawal.details = reason[:255]
+
     db.commit()
     return {"ok": True, "status": "FAILED_REFUNDED"}
+
+
+@router.post("/withdraw/process/paypal")
+def process_paypal_withdrawals(
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    if os.getenv("ALLOW_ADMIN", "false").lower() != "true":
+        raise HTTPException(403, "Forbidden")
+    if not _paypal_is_configured():
+        raise HTTPException(503, "PayPal payouts not configured")
+
+    stmt = (
+        select(WithdrawalRequest)
+        .where(
+            WithdrawalRequest.status == WithdrawalStatus.PENDING,
+            WithdrawalRequest.method == WithdrawalMethod.PAYPAL,
+        )
+        .order_by(WithdrawalRequest.id.asc())
+        .limit(limit)
+    )
+    pending = db.execute(stmt).scalars().all()
+    if not pending:
+        return {"ok": True, "processed": []}
+
+    token = _paypal_get_access_token()
+    processed = []
+
+    for req in pending:
+        tx = db.get(WalletTransaction, req.wallet_tx_id)
+        if not tx or tx.status != TxStatus.PENDING:
+            req.status = WithdrawalStatus.REJECTED
+            req.details = "Missing or already processed tx"
+            processed.append({"withdrawal_id": req.id, "skipped": True})
+            db.commit()
+            continue
+
+        try:
+            req.status = WithdrawalStatus.PROCESSING
+            db.flush()
+
+            payout_txn_id, raw = _paypal_send_payout(req, token)
+            req.status = WithdrawalStatus.PAID
+            req.payout_txn_id = payout_txn_id
+            req.details = json.dumps(raw)[:1000]
+            tx.status = TxStatus.SUCCESS
+            processed.append(
+                {
+                    "withdrawal_id": req.id,
+                    "payout_txn_id": payout_txn_id,
+                }
+            )
+        except Exception as exc:
+            user = _lock_user(db, req.user_id)
+            user.wallet_balance = (user.wallet_balance or 0) + req.amount
+            tx.status = TxStatus.FAILED
+            req.status = WithdrawalStatus.REJECTED
+            req.details = f"PayPal error: {exc}"[:255]
+            processed.append(
+                {
+                    "withdrawal_id": req.id,
+                    "error": str(exc),
+                }
+            )
+        finally:
+            db.commit()
+
+    return {"ok": True, "processed": processed}

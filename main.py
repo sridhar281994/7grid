@@ -1,5 +1,6 @@
 import asyncio
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from database import Base, engine, SessionLocal
@@ -12,16 +13,31 @@ from routers.agent_pool import start_agent_pool
 
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
+ANDROID_APP_ORIGIN = os.getenv("ANDROID_APP_ORIGIN")
+WALLET_WEB_ORIGIN = os.getenv("WALLET_WEB_ORIGIN")
+ALLOWED_ORIGINS = [origin for origin in [ANDROID_APP_ORIGIN, WALLET_WEB_ORIGIN] if origin]
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ["https://localhost"]
+
 # -------------------------
 # CORS
 # -------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # :warning: TODO: restrict origins in production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def attach_request_context(request: Request, call_next):
+    request.state.client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else None)
+    request.state.user_agent = request.headers.get("user-agent")
+    request.state.device_fingerprint = request.headers.get("x-device-fingerprint")
+    response = await call_next(request)
+    return response
 
 # -------------------------
 # Startup helpers

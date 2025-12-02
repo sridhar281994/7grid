@@ -161,7 +161,7 @@ class WalletTransaction(Base):
     transaction_id = Column(String, unique=True, nullable=True)
     channel = Column(String(32), nullable=True)
     initiator_ip = Column(String(64), nullable=True)
-    metadata = Column(JSONB, nullable=True)
+    extra_data = Column(JSONB, nullable=True)
 
     user = relationship("User", back_populates="transactions")
 
@@ -180,7 +180,7 @@ class WithdrawalRequest(Base):
     details = Column(Text, nullable=True)
     channel = Column(String(32), nullable=True)
     initiator_ip = Column(String(64), nullable=True)
-    metadata = Column(JSONB, nullable=True)
+    extra_data = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

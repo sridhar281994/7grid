@@ -97,14 +97,29 @@ def _decode_token(token: str) -> dict:
 
 def get_token_payload(
     creds: HTTPAuthorizationCredentials = Depends(_auth),
+    request: Optional[Request] = None,
 ) -> dict:
-    if not creds or creds.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = creds.credentials
-    try:
-        return _decode_token(token)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    token = None
+    if creds and creds.scheme.lower() == "bearer":
+        token = creds.credentials
+
+    if token:
+        try:
+            return _decode_token(token)
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    cookie_value = request.cookies.get(WALLET_COOKIE_NAME) if request else None
+    if cookie_value:
+        session_payload = verify_wallet_cookie(cookie_value)
+        return {
+            "sub": str(session_payload["user_id"]),
+            "channel": session_payload.get("channel"),
+            "fingerprint": session_payload.get("fingerprint"),
+            "source": "wallet_cookie",
+        }
+
+    raise HTTPException(status_code=401, detail="Missing bearer token")
 
 
 def get_current_user(

@@ -96,8 +96,8 @@ def _decode_token(token: str) -> dict:
 
 
 def get_token_payload(
+    request: Request,
     creds: HTTPAuthorizationCredentials = Depends(_auth),
-    request: Optional[Request] = None,
 ) -> dict:
     token = None
     if creds and creds.scheme.lower() == "bearer":
@@ -109,7 +109,7 @@ def get_token_payload(
         except JWTError:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-    cookie_value = request.cookies.get(WALLET_COOKIE_NAME) if request else None
+    cookie_value = request.cookies.get(WALLET_COOKIE_NAME)
     if cookie_value:
         session_payload = verify_wallet_cookie(cookie_value)
         return {

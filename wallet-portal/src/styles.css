@@ -1,14 +1,44 @@
-body {
-  font-family: sans-serif;
-  margin: 0;
-  background: #f4f6fb;
-  color: #0b1437;
+.page-card {
+  max-width: 640px;
+  margin: 40px auto;
+  padding: 24px;
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 10px 40px rgba(10, 31, 68, 0.1);
 }
 
-a {
-  color: #0066ff;
+.page-card h1 {
+  margin-top: 0;
 }
 
-button {
-  cursor: pointer;
+.page-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.page-card input,
+.page-card select {
+  padding: 10px 12px;
+  border: 1px solid #dce0ef;
+  border-radius: 8px;
+}
+
+.page-card button {
+  background: #171d68;
+  color: #fff;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.history-table th,
+.history-table td {
+  border-bottom: 1px solid #e5e7f3;
+  padding: 8px;
 }

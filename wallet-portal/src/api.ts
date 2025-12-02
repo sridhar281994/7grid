@@ -1,6 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_BASE ?? "https://api.example.com";
 
-async function apiFetch(path: string, options: RequestInit = {}) {
+async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem("wallet_jwt");
   const headers = new Headers(options.headers);
   headers.set("Content-Type", "application/json");
@@ -14,12 +14,22 @@ async function apiFetch(path: string, options: RequestInit = {}) {
   return res.json();
 }
 
+type BridgeSessionResponse = {
+  ok: boolean;
+  user_id: number;
+  access_token: string;
+};
+
 export async function bridgeSession(linkToken: string) {
-  await apiFetch("/wallet-portal/sessions/bridge", {
+  const res = await apiFetch<BridgeSessionResponse>("/wallet-portal/sessions/bridge", {
     method: "POST",
     body: JSON.stringify({ token: linkToken })
   });
-  // TODO: fetch JWT or rely on backend cookie; we’ll extend later.
+  if (!res?.access_token) {
+    throw new Error("Wallet session created without access token.");
+  }
+  localStorage.setItem("wallet_jwt", res.access_token);
+  return res;
 }
 
 export default apiFetch;

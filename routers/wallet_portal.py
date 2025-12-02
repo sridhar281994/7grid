@@ -10,6 +10,7 @@ from utils.security import (
     consume_wallet_bridge_token,
     issue_wallet_cookie,
     get_request_context,
+    create_access_token,
 )
 from routers.wallet import wallet_history, recharge_create_link, withdraw_request
 
@@ -28,12 +29,19 @@ def bridge_session(
         raise HTTPException(404, "User not found")
 
     ctx = get_request_context(request)
-    response = JSONResponse({"ok": True, "user_id": user.id})
     cookie_payload = {
         "user_id": user.id,
         "channel": payload["channel"],
         "fingerprint": ctx.get("fingerprint"),
     }
+
+    access_token = create_access_token(
+        user_id=user.id,
+        channel=payload["channel"],
+        fingerprint=ctx.get("fingerprint"),
+    )
+
+    response = JSONResponse({"ok": True, "user_id": user.id, "access_token": access_token})
     issue_wallet_cookie(response, cookie_payload)
     return response
 

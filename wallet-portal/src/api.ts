@@ -1,4 +1,20 @@
-const API_BASE = import.meta.env.VITE_API_BASE ?? "https://api.example.com";
+function resolveApiBase(): string {
+  const envBase = import.meta.env.VITE_API_BASE;
+  if (envBase && envBase.trim().length > 0) {
+    return envBase.replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    const { protocol, hostname, port } = window.location;
+    const guessedHost = hostname.startsWith("wallet.")
+      ? hostname.replace("wallet.", "api.")
+      : hostname;
+    const portPart = port ? `:${port}` : "";
+    return `${protocol}//${guessedHost}${portPart}`;
+  }
+  return "";
+}
+
+const API_BASE = resolveApiBase();
 
 async function apiFetch<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem("wallet_jwt");

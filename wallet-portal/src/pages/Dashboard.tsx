@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import apiFetch from "../api";
+
+type BalanceResponse = { balance: number };
 
 export default function Dashboard() {
   const [balance, setBalance] = useState<number | null>(null);
@@ -7,22 +10,35 @@ export default function Dashboard() {
 
   useEffect(() => {
     apiFetch("/wallet/balance")
-      .then((res) => setBalance(res.balance))
+      .then((res: BalanceResponse) => setBalance(res.balance))
       .catch((err) => setError(err.message || "Failed to load balance."));
   }, []);
 
-  if (error) return <div>Error: {error}</div>;
-  if (balance === null) return <div>Loading wallet...</div>;
+  if (error) return <PageCard title="Wallet" body={<p>Error: {error}</p>} />;
+  if (balance === null) return <PageCard title="Wallet" body={<p>Loading...</p>} />;
 
   return (
-    <div style={{ padding: "24px" }}>
-      <h1>Wallet</h1>
-      <p>Balance: {balance.toFixed(2)} coins</p>
-      <p>
-        <a href="/wallet/recharge">Recharge</a> ·{" "}
-        <a href="/wallet/withdraw">Withdraw</a> ·{" "}
-        <a href="/wallet/history">History</a>
-      </p>
+    <PageCard
+      title="Wallet"
+      body={
+        <>
+          <p className="balance">{balance.toFixed(2)} coins</p>
+          <div className="actions">
+            <Link to="/wallet/recharge">Recharge</Link>
+            <Link to="/wallet/withdraw">Withdraw</Link>
+            <Link to="/wallet/history">History</Link>
+          </div>
+        </>
+      }
+    />
+  );
+}
+
+function PageCard({ title, body }: { title: string; body: React.ReactNode }) {
+  return (
+    <div className="page-card">
+      <h1>{title}</h1>
+      {body}
     </div>
   );
 }

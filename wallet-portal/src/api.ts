@@ -1,6 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_BASE ?? "https://api.example.com";
 
-async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
+async function apiFetch<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem("wallet_jwt");
   const headers = new Headers(options.headers);
   headers.set("Content-Type", "application/json");

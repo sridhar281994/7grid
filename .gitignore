@@ -16,3 +16,6 @@ venv/
 
 # Local env files
 .env
+wallet-portal/.env.local
+wallet-portal/node_modules
+wallet-portal/dist

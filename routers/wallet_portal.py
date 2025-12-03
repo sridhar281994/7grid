@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
 from typing import Optional
 
 from database import get_db
@@ -21,18 +20,14 @@ from routers.wallet import wallet_history, recharge_create_link, withdraw_reques
 router = APIRouter(prefix="/wallet-portal", tags=["wallet-portal"])
 
 
-class BridgeSessionIn(BaseModel):
-    token: str
-
-
 @router.post("/sessions/bridge")
 def bridge_session(
     request: Request,
-    payload: Optional[BridgeSessionIn] = Body(default=None),
+    token_payload: Optional[str] = Body(default=None, embed=True, alias="token"),
     token: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    link_token = (payload.token if payload else None) or token
+    link_token = token_payload or token
     if not link_token:
         raise HTTPException(422, "Missing wallet link token")
 

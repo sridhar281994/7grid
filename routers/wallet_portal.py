@@ -27,9 +27,9 @@ class BridgeSessionIn(BaseModel):
 
 @router.post("/sessions/bridge")
 def bridge_session(
+    request: Request,
     payload: Optional[BridgeSessionIn] = Body(default=None),
     token: Optional[str] = None,
-    request: Request,
     db: Session = Depends(get_db),
 ):
     link_token = (payload.token if payload else None) or token

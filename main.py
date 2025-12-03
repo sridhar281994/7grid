@@ -1,5 +1,7 @@
 import asyncio
 import os
+from typing import List
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -11,13 +13,55 @@ from routers.smart_agent_worker import start_agent_ai
 # Import the agent pool function
 from routers.agent_pool import start_agent_pool
 
+def _split_origins(raw: str | None) -> List[str]:
+    if not raw:
+        return []
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    return parts or []
+
+
+def _normalize_origin(origin: str) -> str:
+    if origin.startswith(("http://", "https://")):
+        return origin.rstrip("/")
+    return origin
+
+
+DEFAULT_WALLET_ORIGINS = ["https://wallet.srtech.co.in"]
+LOCALHOST_ORIGINS = ["https://localhost", "http://localhost"]
+
+
+def _build_allowed_origins() -> List[str]:
+    """Build a deterministic CORS origin list with sensible defaults."""
+    android_origin = os.getenv("ANDROID_APP_ORIGIN")
+    wallet_origin = os.getenv("WALLET_WEB_ORIGIN")
+    extra_origins = os.getenv("CORS_ALLOWED_ORIGINS")
+
+    candidates: List[str] = []
+    for raw in (
+        _split_origins(extra_origins)
+        + _split_origins(android_origin)
+        + _split_origins(wallet_origin)
+    ):
+        normalized = _normalize_origin(raw)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    if not candidates:
+        normalized_defaults = [
+            _normalize_origin(origin) for origin in DEFAULT_WALLET_ORIGINS
+        ]
+        return normalized_defaults + LOCALHOST_ORIGINS
+
+    for fallback in LOCALHOST_ORIGINS:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    return candidates
+
+
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
-ANDROID_APP_ORIGIN = os.getenv("ANDROID_APP_ORIGIN")
-WALLET_WEB_ORIGIN = os.getenv("WALLET_WEB_ORIGIN")
-ALLOWED_ORIGINS = [origin for origin in [ANDROID_APP_ORIGIN, WALLET_WEB_ORIGIN] if origin]
-if not ALLOWED_ORIGINS:
-    ALLOWED_ORIGINS = ["https://localhost"]
+ALLOWED_ORIGINS = _build_allowed_origins()
 
 # -------------------------
 # CORS

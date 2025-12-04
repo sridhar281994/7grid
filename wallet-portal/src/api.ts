@@ -1,4 +1,32 @@
 const DEFAULT_API_BASE = "https://api.srtech.co.in";
+const TOKEN_STORAGE_KEY = "wallet_jwt";
+
+function getStoredToken(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setStoredToken(token: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // Ignore storage errors (e.g., privacy mode)
+  }
+}
+
+function clearStoredToken() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 function resolveApiBase(): string {
   const envBase = import.meta.env.VITE_API_BASE;
@@ -30,7 +58,7 @@ async function apiFetch<T = any>(
   options: RequestInit = {},
   allowRefresh = true
 ): Promise<T> {
-  const token = localStorage.getItem("wallet_jwt");
+  const token = getStoredToken();
   const headers = new Headers(options.headers);
   headers.set("Content-Type", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
@@ -89,15 +117,15 @@ async function refreshAccessToken(): Promise<string | null> {
         });
         if (!res.ok) {
           await res.text().catch(() => undefined);
-          localStorage.removeItem("wallet_jwt");
+          clearStoredToken();
           return null;
         }
         const data: BridgeSessionResponse = await res.json();
         if (data?.access_token) {
-          localStorage.setItem("wallet_jwt", data.access_token);
+          setStoredToken(data.access_token);
           return data.access_token;
         }
-        localStorage.removeItem("wallet_jwt");
+        clearStoredToken();
         return null;
       } catch {
         return null;
@@ -123,8 +151,18 @@ export async function bridgeSession(linkToken: string) {
   if (!res?.access_token) {
     throw new Error("Wallet session created without access token.");
   }
-  localStorage.setItem("wallet_jwt", res.access_token);
+  setStoredToken(res.access_token);
   return res;
+}
+
+export function hasStoredWalletSession(): boolean {
+  return Boolean(getStoredToken());
+}
+
+export async function ensureWalletSession(): Promise<boolean> {
+  if (hasStoredWalletSession()) return true;
+  const refreshed = await refreshAccessToken();
+  return Boolean(refreshed);
 }
 
 export default apiFetch;

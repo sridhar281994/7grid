@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/api.ts","./src/main.tsx","./src/vite-env.d.ts","./src/pages/Admin.tsx","./src/pages/Dashboard.tsx","./src/pages/History.tsx","./src/pages/LinkPage.tsx","./src/pages/Recharge.tsx","./src/pages/Withdraw.tsx"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/api.ts","./src/main.tsx","./src/vite-env.d.ts","./src/components/WalletSessionGate.tsx","./src/pages/Admin.tsx","./src/pages/Dashboard.tsx","./src/pages/History.tsx","./src/pages/LinkPage.tsx","./src/pages/Recharge.tsx","./src/pages/Withdraw.tsx"],"version":"5.9.3"}

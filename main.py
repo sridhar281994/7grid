@@ -28,6 +28,7 @@ def _normalize_origin(origin: str) -> str:
 
 DEFAULT_WALLET_ORIGINS = ["https://wallet.srtech.co.in"]
 LOCALHOST_ORIGINS = ["https://localhost", "http://localhost"]
+DEFAULT_ORIGIN_REGEX = r"https://([a-z0-9-]+\.)?(srtech\.co\.in|onrender\.com)$"
 
 
 def _build_allowed_origins() -> List[str]:
@@ -59,9 +60,16 @@ def _build_allowed_origins() -> List[str]:
     return candidates
 
 
+def _build_allowed_origin_regex() -> str:
+    """Regex fallback that covers managed domains like Render."""
+    env_regex = (os.getenv("CORS_ALLOWED_REGEX") or "").strip()
+    return env_regex or DEFAULT_ORIGIN_REGEX
+
+
 app = FastAPI(title="Spin Dice API", version="1.0.0")
 
 ALLOWED_ORIGINS = _build_allowed_origins()
+ALLOWED_ORIGIN_REGEX = _build_allowed_origin_regex()
 
 # -------------------------
 # CORS
@@ -69,6 +77,7 @@ ALLOWED_ORIGINS = _build_allowed_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

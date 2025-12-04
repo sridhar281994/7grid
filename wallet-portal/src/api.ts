@@ -1,3 +1,5 @@
+const DEFAULT_API_BASE = "https://api.srtech.co.in";
+
 function resolveApiBase(): string {
   const envBase = import.meta.env.VITE_API_BASE;
   if (envBase && envBase.trim().length > 0) {
@@ -9,9 +11,12 @@ function resolveApiBase(): string {
       ? hostname.replace("wallet.", "api.")
       : hostname;
     const portPart = port ? `:${port}` : "";
-    return `${protocol}//${guessedHost}${portPart}`;
+    const derived = `${protocol}//${guessedHost}${portPart}`;
+    if (derived && derived !== `${protocol}//${hostname}${portPart}`) {
+      return derived.replace(/\/$/, "");
+    }
   }
-  return "";
+  return DEFAULT_API_BASE;
 }
 
 const API_BASE = resolveApiBase();

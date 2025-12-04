@@ -5,17 +5,20 @@ function resolveApiBase(): string {
   if (envBase && envBase.trim().length > 0) {
     return envBase.replace(/\/$/, "");
   }
+
   if (typeof window !== "undefined") {
     const { protocol, hostname, port } = window.location;
-    const guessedHost = hostname.startsWith("wallet.")
-      ? hostname.replace("wallet.", "api.")
-      : hostname;
     const portPart = port ? `:${port}` : "";
-    const derived = `${protocol}//${guessedHost}${portPart}`;
-    if (derived && derived !== `${protocol}//${hostname}${portPart}`) {
-      return derived.replace(/\/$/, "");
+    const currentOrigin = `${protocol}//${hostname}${portPart}`.replace(/\/$/, "");
+
+    if (hostname.startsWith("wallet.")) {
+      const guessedHost = hostname.replace("wallet.", "api.");
+      return `${protocol}//${guessedHost}${portPart}`.replace(/\/$/, "");
     }
+
+    return currentOrigin;
   }
+
   return DEFAULT_API_BASE;
 }
 

@@ -37,15 +37,41 @@ async function apiFetch<T = any>(
     credentials: "include"
   });
 
+  let consumedBody: string | null = null;
+  async function readBodyText() {
+    if (consumedBody !== null) return consumedBody;
+    try {
+      consumedBody = await res.text();
+    } catch {
+      consumedBody = "";
+    }
+    return consumedBody;
+  }
+
   if (res.status === 401 && allowRefresh) {
-    await res.text().catch(() => undefined);
+    await readBodyText();
     const refreshed = await refreshAccessToken();
     if (refreshed) {
       return apiFetch<T>(path, options, false);
     }
   }
 
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    const bodyText = await readBodyText();
+    let message = bodyText;
+    try {
+      const parsed = JSON.parse(bodyText);
+      message =
+        parsed?.detail ||
+        parsed?.message ||
+        parsed?.error ||
+        parsed?.errors?.[0] ||
+        bodyText;
+    } catch {
+      // Ignore JSON parse errors
+    }
+    throw new Error(message || `Request failed (${res.status})`);
+  }
   return res.json();
 }
 

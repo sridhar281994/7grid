@@ -1,12 +1,16 @@
 import { ReactNode, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { bridgeSession } from "../api";
+import {
+  bridgeSession,
+  ensureWalletSession,
+  hasStoredWalletSession,
+} from "../api";
 
 type Props = {
   children: ReactNode;
 };
 
-type Status = "ready" | "linking" | "error";
+type Status = "ready" | "linking" | "error" | "checking";
 
 type RouterLocation = {
   pathname: string;
@@ -69,21 +73,22 @@ function extractLinkToken(location: RouterLocation): LinkTokenData | null {
  * Intercepts any `?token=...` query parameter (from the native app deep link)
  * and ensures we exchange it for a wallet session before rendering the portal.
  */
+const NO_SESSION_MESSAGE =
+  "Missing wallet session. Open the portal from the SR Tech app or use a valid wallet link.";
+
 export default function WalletSessionGate({ children }: Props) {
   const location = useLocation();
   const navigate = useNavigate();
-  const [status, setStatus] = useState<Status>("ready");
+  const [status, setStatus] = useState<Status>(() =>
+    hasStoredWalletSession() ? "ready" : "checking"
+  );
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
 
   const linkTokenData = useMemo(() => extractLinkToken(location), [location]);
 
   useEffect(() => {
-    if (!linkTokenData) {
-      setStatus("ready");
-      setError(null);
-      return;
-    }
+    if (!linkTokenData) return;
 
     let cancelled = false;
     setStatus("linking");
@@ -92,6 +97,7 @@ export default function WalletSessionGate({ children }: Props) {
     bridgeSession(linkTokenData.token)
       .then(() => {
         if (cancelled) return;
+        setStatus("ready");
         navigate(
           {
             pathname: linkTokenData.targetPathname ?? location.pathname,
@@ -115,11 +121,53 @@ export default function WalletSessionGate({ children }: Props) {
     // re-run when user requests a retry
   }, [location, navigate, retryKey, linkTokenData]);
 
-  if (status === "linking") {
+  useEffect(() => {
+    if (linkTokenData) return;
+
+    let cancelled = false;
+
+    if (hasStoredWalletSession()) {
+      setStatus("ready");
+      setError(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setStatus("checking");
+    setError(null);
+
+    ensureWalletSession()
+      .then((hasSession) => {
+        if (cancelled) return;
+        if (hasSession) {
+          setStatus("ready");
+          setError(null);
+          return;
+        }
+        setError(NO_SESSION_MESSAGE);
+        setStatus("error");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message || NO_SESSION_MESSAGE);
+        setStatus("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [linkTokenData, retryKey]);
+
+  if (status === "linking" || status === "checking") {
     return (
       <div className="page-card">
         <h1>Wallet</h1>
-        <p>Connecting to your wallet…</p>
+        <p>
+          {status === "linking"
+            ? "Connecting to your wallet…"
+            : "Preparing your wallet session…"}
+        </p>
       </div>
     );
   }

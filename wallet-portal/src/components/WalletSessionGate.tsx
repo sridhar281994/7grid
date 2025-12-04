@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useState } from "react";
+import { ReactNode, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { bridgeSession } from "../api";
 
@@ -7,6 +7,63 @@ type Props = {
 };
 
 type Status = "ready" | "linking" | "error";
+
+type RouterLocation = {
+  pathname: string;
+  search: string;
+  hash: string;
+};
+
+type LinkTokenData = {
+  token: string;
+  cleanedSearch: string;
+  cleanedHash: string;
+  targetPathname?: string;
+};
+
+function normalizePath(pathname: string | undefined): string | undefined {
+  if (!pathname) return undefined;
+  return pathname.startsWith("/") ? pathname : `/${pathname}`;
+}
+
+function extractLinkToken(location: RouterLocation): LinkTokenData | null {
+  const searchParams = new URLSearchParams(location.search);
+  const searchToken = searchParams.get("token");
+  if (searchToken) {
+    searchParams.delete("token");
+    return {
+      token: searchToken,
+      cleanedSearch: searchParams.toString(),
+      cleanedHash: location.hash,
+      targetPathname: location.pathname,
+    };
+  }
+
+  const rawHash = location.hash.startsWith("#")
+    ? location.hash.slice(1)
+    : location.hash;
+  if (!rawHash) return null;
+
+  const [hashPathPart, hashQueryPart = ""] = rawHash.split("?");
+  const hashParams = new URLSearchParams(hashQueryPart);
+  const hashToken = hashParams.get("token");
+  if (!hashToken) return null;
+
+  hashParams.delete("token");
+  const cleanedHashParams = hashParams.toString();
+  const cleanedHashPath = hashPathPart || "";
+  const cleanedHash =
+    cleanedHashPath || cleanedHashParams
+      ? `#${cleanedHashPath}${cleanedHashParams ? `?${cleanedHashParams}` : ""}`
+      : "";
+
+  return {
+    token: hashToken,
+    cleanedSearch: location.search.replace(/^\?/, ""),
+    cleanedHash,
+    targetPathname: normalizePath(cleanedHashPath) || location.pathname,
+  };
+}
 
 /**
  * Intercepts any `?token=...` query parameter (from the native app deep link)
@@ -19,10 +76,10 @@ export default function WalletSessionGate({ children }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
 
+  const linkTokenData = useMemo(() => extractLinkToken(location), [location]);
+
   useEffect(() => {
-    const params = new URLSearchParams(location.search);
-    const linkToken = params.get("token");
-    if (!linkToken) {
+    if (!linkTokenData) {
       setStatus("ready");
       setError(null);
       return;
@@ -32,13 +89,17 @@ export default function WalletSessionGate({ children }: Props) {
     setStatus("linking");
     setError(null);
 
-    bridgeSession(linkToken)
+    bridgeSession(linkTokenData.token)
       .then(() => {
         if (cancelled) return;
-        params.delete("token");
-        const nextSearch = params.toString();
         navigate(
-          { pathname: location.pathname, search: nextSearch ? `?${nextSearch}` : "" },
+          {
+            pathname: linkTokenData.targetPathname ?? location.pathname,
+            search: linkTokenData.cleanedSearch
+              ? `?${linkTokenData.cleanedSearch}`
+              : "",
+            hash: linkTokenData.cleanedHash,
+          },
           { replace: true }
         );
       })
@@ -52,7 +113,7 @@ export default function WalletSessionGate({ children }: Props) {
       cancelled = true;
     };
     // re-run when user requests a retry
-  }, [location, navigate, retryKey]);
+  }, [location, navigate, retryKey, linkTokenData]);
 
   if (status === "linking") {
     return (

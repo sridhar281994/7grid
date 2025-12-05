@@ -70,6 +70,10 @@ class RegisterIn(BaseModel):
     upi_id: Optional[str] = None
 
 
+class ResetPasswordIn(BaseModel):
+    password: str
+
+
 # =====================
 # Routes
 # =====================
@@ -197,6 +201,25 @@ def verify_otp_phone(payload: VerifyIn, request: Request, db: Session = Depends(
         "token_type": "bearer",
         "channel": channel,
     }
+
+
+@router.post("/reset-password")
+def reset_password_endpoint(
+    payload: ResetPasswordIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update the authenticated user's password after OTP verification."""
+    new_password = payload.password.strip()
+    if len(new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters.")
+
+    # bcrypt accepts up to 72 chars reliably
+    hashed_pw = bcrypt.hash(new_password[:72])
+    current_user.password_hash = hashed_pw
+    db.add(current_user)
+    db.commit()
+    return {"ok": True, "message": "Password updated successfully."}
 
 
 @router.get("/me")

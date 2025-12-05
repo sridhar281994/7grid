@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import apiFetch from "../api";
 
@@ -22,11 +23,24 @@ export default function Dashboard() {
       title="Wallet"
       body={
         <>
-          <p className="balance">{balance.toFixed(2)} coins</p>
-          <div className="actions">
-            <Link to="/wallet/recharge">Recharge</Link>
-            <Link to="/wallet/withdraw">Withdraw</Link>
-            <Link to="/wallet/history">History</Link>
+          <p className="wallet-subtitle">Manage your SR Tech coins with confidence.</p>
+          <div className="wallet-balance">
+            <span className="wallet-balance-amount">{balance.toFixed(2)}</span>
+            <span className="wallet-balance-label">coins</span>
+          </div>
+          <div className="wallet-actions">
+            <Link className="wallet-action primary" to="/wallet/recharge">
+              <span className="wallet-action-title">Recharge</span>
+              <span className="wallet-action-copy">Add coins instantly via UPI</span>
+            </Link>
+            <Link className="wallet-action secondary" to="/wallet/withdraw">
+              <span className="wallet-action-title">Withdraw</span>
+              <span className="wallet-action-copy">Send winnings to your bank</span>
+            </Link>
+            <Link className="wallet-action ghost" to="/wallet/history">
+              <span className="wallet-action-title">History</span>
+              <span className="wallet-action-copy">Track every transaction</span>
+            </Link>
           </div>
         </>
       }
@@ -34,7 +48,7 @@ export default function Dashboard() {
   );
 }
 
-function PageCard({ title, body }: { title: string; body: React.ReactNode }) {
+function PageCard({ title, body }: { title: string; body: ReactNode }) {
   return (
     <div className="page-card">
       <h1>{title}</h1>

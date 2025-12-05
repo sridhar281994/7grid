@@ -1,10 +1,6 @@
 import { ReactNode, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import {
-  bridgeSession,
-  ensureWalletSession,
-  hasStoredWalletSession,
-} from "../api";
+import { bridgeSession, clearStoredToken } from "../api";
 
 type Props = {
   children: ReactNode;
@@ -79,11 +75,10 @@ const NO_SESSION_MESSAGE =
 export default function WalletSessionGate({ children }: Props) {
   const location = useLocation();
   const navigate = useNavigate();
-  const [status, setStatus] = useState<Status>(() =>
-    hasStoredWalletSession() ? "ready" : "checking"
-  );
+  const [status, setStatus] = useState<Status>("checking");
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
+  const [sessionReady, setSessionReady] = useState(false);
 
   const linkTokenData = useMemo(() => extractLinkToken(location), [location]);
 
@@ -97,6 +92,7 @@ export default function WalletSessionGate({ children }: Props) {
     bridgeSession(linkTokenData.token)
       .then(() => {
         if (cancelled) return;
+        setSessionReady(true);
         setStatus("ready");
         navigate(
           {
@@ -123,41 +119,15 @@ export default function WalletSessionGate({ children }: Props) {
 
   useEffect(() => {
     if (linkTokenData) return;
-
-    let cancelled = false;
-
-    if (hasStoredWalletSession()) {
+    if (sessionReady) {
       setStatus("ready");
       setError(null);
-      return () => {
-        cancelled = true;
-      };
+      return;
     }
-
-    setStatus("checking");
-    setError(null);
-
-    ensureWalletSession()
-      .then((hasSession) => {
-        if (cancelled) return;
-        if (hasSession) {
-          setStatus("ready");
-          setError(null);
-          return;
-        }
-        setError(NO_SESSION_MESSAGE);
-        setStatus("error");
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setError(err.message || NO_SESSION_MESSAGE);
-        setStatus("error");
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [linkTokenData, retryKey]);
+    clearStoredToken();
+    setError(NO_SESSION_MESSAGE);
+    setStatus("error");
+  }, [linkTokenData, retryKey, sessionReady]);
 
   if (status === "linking" || status === "checking") {
     return (

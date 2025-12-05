@@ -19,7 +19,7 @@ function setStoredToken(token: string) {
   }
 }
 
-function clearStoredToken() {
+export function clearStoredToken() {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -153,16 +153,6 @@ export async function bridgeSession(linkToken: string) {
   }
   setStoredToken(res.access_token);
   return res;
-}
-
-export function hasStoredWalletSession(): boolean {
-  return Boolean(getStoredToken());
-}
-
-export async function ensureWalletSession(): Promise<boolean> {
-  if (hasStoredWalletSession()) return true;
-  const refreshed = await refreshAccessToken();
-  return Boolean(refreshed);
 }
 
 export default apiFetch;

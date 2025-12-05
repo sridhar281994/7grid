@@ -5,6 +5,8 @@ from typing import List
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from sqlalchemy import text
+
 from database import Base, engine, SessionLocal
 from models import User
 from routers import auth, users, wallet, game, match_routes, wallet_portal, admin_wallet
@@ -95,6 +97,14 @@ async def attach_request_context(request: Request, call_next):
 # -------------------------
 # Startup helpers
 # -------------------------
+def ensure_paypal_column():
+    """Backfill paypal_id column in legacy databases."""
+    ddl = text("ALTER TABLE users ADD COLUMN IF NOT EXISTS paypal_id VARCHAR(255)")
+    with engine.begin() as conn:
+        conn.execute(ddl)
+    print(":white_check_mark: Ensured users.paypal_id column exists.")
+
+
 def ensure_bots():
     """Insert bot users (-1000, -1001, -1002) into DB if missing."""
     db = SessionLocal()
@@ -137,6 +147,9 @@ async def on_startup():
     # Ensure DB tables
     Base.metadata.create_all(bind=engine)
     print(":white_check_mark: Database tables ensured/created.")
+
+    # Backfill paypal column for legacy databases
+    ensure_paypal_column()
 
     # Insert bot rows
     ensure_bots()

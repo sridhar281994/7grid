@@ -10,20 +10,21 @@ from utils.security import get_current_user
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-# ----------------------------------------------------------
-# SCHEMAS
-# ----------------------------------------------------------
+
+
+# ============================================================
+#                     Pydantic Schemas
+# ============================================================
 
 class UserOut(BaseModel):
     id: int
     email: str | None = None
     name: str | None = None
     upi_id: str | None = None
-    paypal_id: str | None = None        # ✔ Added PayPal
     description: str | None = None
     wallet_balance: float
     created_at: datetime | None = None
-    profile_image: str | None = None    # ✔ User or bot image
+    profile_image: str | None = None   # supports bots + real users
 
     class Config:
         from_attributes = True
@@ -32,13 +33,13 @@ class UserOut(BaseModel):
 class UserUpdate(BaseModel):
     name: str | None = None
     upi_id: str | None = None
-    paypal_id: str | None = None        # ✔ Added PayPal
     description: constr(max_length=50) | None = None
 
 
-# ----------------------------------------------------------
-# BOT PROFILES
-# ----------------------------------------------------------
+
+# ============================================================
+#                        BOT PROFILES
+# ============================================================
 
 BOT_PROFILES = [
     {
@@ -48,7 +49,6 @@ BOT_PROFILES = [
         "description": "AI Opponent",
         "email": None,
         "upi_id": None,
-        "paypal_id": None,
         "created_at": None,
         "profile_image": "assets/bot_sharp.png",
     },
@@ -59,7 +59,6 @@ BOT_PROFILES = [
         "description": "AI Opponent",
         "email": None,
         "upi_id": None,
-        "paypal_id": None,
         "created_at": None,
         "profile_image": "assets/bot_crazy.png",
     },
@@ -70,7 +69,6 @@ BOT_PROFILES = [
         "description": "AI Opponent",
         "email": None,
         "upi_id": None,
-        "paypal_id": None,
         "created_at": None,
         "profile_image": "assets/bot_kurfi.png",
     },
@@ -78,25 +76,27 @@ BOT_PROFILES = [
 
 
 def _bot_profile(user_id: int) -> dict:
-    """Return predefined bot profile."""
+    """
+    Return the specified bot profile.
+    If no direct match, return a random bot.
+    """
     for bot in BOT_PROFILES:
         if bot["id"] == user_id:
             return bot
     return random.choice(BOT_PROFILES)
 
 
-def _random_bot_pair() -> list[dict]:
-    """Random 2 bots for free-play."""
-    return random.sample(BOT_PROFILES, 2)
 
-
-# ----------------------------------------------------------
-# ENDPOINTS
-# ----------------------------------------------------------
+# ============================================================
+#                      USER ENDPOINTS
+# ============================================================
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
-    """Return current user or bot."""
+    """
+    Return current authenticated user.
+    If ID <= 0 => treat as bot.
+    """
     if user.id <= 0:
         return _bot_profile(user.id)
 
@@ -106,29 +106,26 @@ def me(user: User = Depends(get_current_user)):
     }
 
 
+
 @router.patch("/me", response_model=UserOut)
 def update_me(
     payload: UserUpdate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Update only provided user fields."""
+    """
+    Update name, upi_id, description.
+    Bot accounts cannot be modified.
+    """
     if user.id <= 0:
         raise HTTPException(status_code=400, detail="Bots cannot be updated")
 
-    # Name
     if payload.name is not None:
         user.name = payload.name.strip() or None
 
-    # UPI
     if payload.upi_id is not None:
         user.upi_id = payload.upi_id.strip() or None
 
-    # PayPal
-    if payload.paypal_id is not None:
-        user.paypal_id = payload.paypal_id.strip() or None
-
-    # Description
     if payload.description is not None:
         user.description = payload.description.strip() or None
 
@@ -141,12 +138,20 @@ def update_me(
     }
 
 
+
 @router.get("/{user_id}", response_model=UserOut)
 def get_user(user_id: int, db: Session = Depends(get_db)):
-    """Get any user or bot profile."""
+    """
+    Fetch any user by ID.
+    Supports:
+        • Bot IDs (<= 0)
+        • Real users
+    """
+    # BOT USER
     if user_id <= 0:
         return _bot_profile(user_id)
 
+    # REAL USER
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

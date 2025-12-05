@@ -10,18 +10,20 @@ from utils.security import get_current_user
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-# -----------------------------
-# Schemas
-# -----------------------------
+# ----------------------------------------------------------
+# SCHEMAS
+# ----------------------------------------------------------
+
 class UserOut(BaseModel):
     id: int
     email: str | None = None
     name: str | None = None
     upi_id: str | None = None
+    paypal_id: str | None = None        # ✔ Added PayPal
     description: str | None = None
     wallet_balance: float
     created_at: datetime | None = None
-    profile_image: str | None = None # ✅ support bot / user image
+    profile_image: str | None = None    # ✔ User or bot image
 
     class Config:
         from_attributes = True
@@ -30,12 +32,14 @@ class UserOut(BaseModel):
 class UserUpdate(BaseModel):
     name: str | None = None
     upi_id: str | None = None
+    paypal_id: str | None = None        # ✔ Added PayPal
     description: constr(max_length=50) | None = None
 
 
-# -----------------------------
-# Bot Profiles
-# -----------------------------
+# ----------------------------------------------------------
+# BOT PROFILES
+# ----------------------------------------------------------
+
 BOT_PROFILES = [
     {
         "id": -1000,
@@ -44,6 +48,7 @@ BOT_PROFILES = [
         "description": "AI Opponent",
         "email": None,
         "upi_id": None,
+        "paypal_id": None,
         "created_at": None,
         "profile_image": "assets/bot_sharp.png",
     },
@@ -54,6 +59,7 @@ BOT_PROFILES = [
         "description": "AI Opponent",
         "email": None,
         "upi_id": None,
+        "paypal_id": None,
         "created_at": None,
         "profile_image": "assets/bot_crazy.png",
     },
@@ -64,6 +70,7 @@ BOT_PROFILES = [
         "description": "AI Opponent",
         "email": None,
         "upi_id": None,
+        "paypal_id": None,
         "created_at": None,
         "profile_image": "assets/bot_kurfi.png",
     },
@@ -71,7 +78,7 @@ BOT_PROFILES = [
 
 
 def _bot_profile(user_id: int) -> dict:
-    """Return bot profile. If ID not mapped, pick random bot profile."""
+    """Return predefined bot profile."""
     for bot in BOT_PROFILES:
         if bot["id"] == user_id:
             return bot
@@ -79,18 +86,20 @@ def _bot_profile(user_id: int) -> dict:
 
 
 def _random_bot_pair() -> list[dict]:
-    """Pick 2 distinct random bots for free play mode."""
+    """Random 2 bots for free-play."""
     return random.sample(BOT_PROFILES, 2)
 
 
-# -----------------------------
-# Endpoints
-# -----------------------------
+# ----------------------------------------------------------
+# ENDPOINTS
+# ----------------------------------------------------------
+
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
-    """Return current authenticated user (or bot profile)."""
-    if user.id <= 0: # Bot user
+    """Return current user or bot."""
+    if user.id <= 0:
         return _bot_profile(user.id)
+
     return {
         **user.__dict__,
         "profile_image": user.profile_image or "assets/default.png",
@@ -103,19 +112,29 @@ def update_me(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Update only the provided fields. Bots cannot be updated."""
+    """Update only provided user fields."""
     if user.id <= 0:
         raise HTTPException(status_code=400, detail="Bots cannot be updated")
 
+    # Name
     if payload.name is not None:
         user.name = payload.name.strip() or None
+
+    # UPI
     if payload.upi_id is not None:
         user.upi_id = payload.upi_id.strip() or None
+
+    # PayPal
+    if payload.paypal_id is not None:
+        user.paypal_id = payload.paypal_id.strip() or None
+
+    # Description
     if payload.description is not None:
         user.description = payload.description.strip() or None
 
     db.commit()
     db.refresh(user)
+
     return {
         **user.__dict__,
         "profile_image": user.profile_image or "assets/default.png",
@@ -124,7 +143,7 @@ def update_me(
 
 @router.get("/{user_id}", response_model=UserOut)
 def get_user(user_id: int, db: Session = Depends(get_db)):
-    """Fetch any user by ID (supports bots)."""
+    """Get any user or bot profile."""
     if user_id <= 0:
         return _bot_profile(user_id)
 

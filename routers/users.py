@@ -19,6 +19,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 class UserOut(BaseModel):
     id: int
     email: str | None = None
+    phone: str | None = None
     name: str | None = None
     upi_id: str | None = None
     description: str | None = None

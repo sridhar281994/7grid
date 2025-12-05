@@ -22,6 +22,7 @@ class UserOut(BaseModel):
     phone: str | None = None
     name: str | None = None
     upi_id: str | None = None
+    paypal_id: str | None = None
     description: str | None = None
     wallet_balance: float
     created_at: datetime | None = None
@@ -34,6 +35,7 @@ class UserOut(BaseModel):
 class UserUpdate(BaseModel):
     name: str | None = None
     upi_id: str | None = None
+    paypal_id: str | None = None
     description: constr(max_length=50) | None = None
 
 
@@ -126,6 +128,9 @@ def update_me(
 
     if payload.upi_id is not None:
         user.upi_id = payload.upi_id.strip() or None
+
+    if payload.paypal_id is not None:
+        user.paypal_id = payload.paypal_id.strip() or None
 
     if payload.description is not None:
         user.description = payload.description.strip() or None

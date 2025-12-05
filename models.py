@@ -67,6 +67,7 @@ class User(Base):
 
     name = Column(String, nullable=True)
     upi_id = Column(String, nullable=True)
+    paypal_id = Column(String, nullable=True)
     description = Column(String(50), nullable=True)
     wallet_balance = Column(Numeric(10, 2), default=0)
 

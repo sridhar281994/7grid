@@ -175,14 +175,16 @@ def get_profile(token: str) -> Dict[str, Any]:
 def update_profile(token: str,
                    name: Optional[str] = None,
                    upi_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Backend expects PATCH /users/me with JSON body
+    """
+    payload: Dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name.strip()
+    if upi_id is not None:
+        payload["upi_id"] = upi_id.strip()
 
-    params: Dict[str, str] = {}
-    if name:
-        params["name"] = name.strip()
-    if upi_id:
-        params["upi_id"] = upi_id.strip()
-
-    return _request("POST", "/users/me/profile", params=params, token=token)
+    return _request("PATCH", "/users/me", json=payload, token=token)
 
 
 # ======================================================
@@ -220,22 +222,18 @@ class LegacyOtpUnavailable(RuntimeError):
     pass
 
 
-def _normalize_identifier(identifier: str) -> Dict[str, str]:
-    ident = identifier.strip()
-
-    if "@" in ident:
-        return {"email": ident}
-    if ident.isdigit():
-        return {"phone": ident}
-    return {"username": ident}
-
-
 # ------------------------------
 # 1) Password check
 # ------------------------------
 def password_check(identifier: str, password: str) -> bool:
-    payload = _normalize_identifier(identifier)
-    payload["password"] = password
+    """
+    Backend expects: {"identifier": str, "password": str}
+    Backend parses identifier internally (email if contains @, phone if digits)
+    """
+    payload = {
+        "identifier": identifier.strip(),
+        "password": password
+    }
 
     try:
         data = _request("POST", "/auth/login/password-check", json=payload)
@@ -255,8 +253,14 @@ def password_check(identifier: str, password: str) -> bool:
 # 2) Request OTP
 # ------------------------------
 def request_login_otp(identifier: str, password: str) -> Dict[str, Any]:
-    payload = _normalize_identifier(identifier)
-    payload["password"] = password
+    """
+    Backend expects: {"identifier": str, "password": str}
+    Backend parses identifier internally (email if contains @, phone if digits)
+    """
+    payload = {
+        "identifier": identifier.strip(),
+        "password": password
+    }
 
     global _LOGIN_OTP_ENDPOINT_AVAILABLE
     try:
@@ -272,9 +276,10 @@ def request_login_otp(identifier: str, password: str) -> Dict[str, Any]:
 
         if status == 404:
             _LOGIN_OTP_ENDPOINT_AVAILABLE = False
-            phone = payload.get("phone")
-            if phone:
-                return send_otp(phone)
+            # Try legacy OTP if identifier is a phone number
+            ident = identifier.strip()
+            if ident.isdigit():
+                return send_otp(ident)
             raise LegacyOtpUnavailable("Phone number required for fallback OTP.")
 
         raise
@@ -283,10 +288,17 @@ def request_login_otp(identifier: str, password: str) -> Dict[str, Any]:
 # ------------------------------
 # 3) Verify OTP
 # ------------------------------
-def verify_login_with_otp(identifier: str, password: str, otp: str) -> Dict[str, Any]:
-    payload = _normalize_identifier(identifier)
-    payload["password"] = password
-    payload["otp"] = otp.strip()
+def verify_login_with_otp(identifier: str, password: str, otp: str, channel: str = "app") -> Dict[str, Any]:
+    """
+    Backend expects: {"identifier": str, "password": str, "otp": str, "channel": Optional[str]}
+    Backend parses identifier internally (email if contains @, phone if digits)
+    """
+    payload = {
+        "identifier": identifier.strip(),
+        "password": password,
+        "otp": otp.strip(),
+        "channel": channel.lower()
+    }
 
     global _LOGIN_OTP_ENDPOINT_AVAILABLE
     try:
@@ -302,9 +314,10 @@ def verify_login_with_otp(identifier: str, password: str, otp: str) -> Dict[str,
 
         if status == 404:
             _LOGIN_OTP_ENDPOINT_AVAILABLE = False
-            phone = payload.get("phone")
-            if phone:
-                return verify_otp(phone, otp)
+            # Try legacy OTP if identifier is a phone number
+            ident = identifier.strip()
+            if ident.isdigit():
+                return verify_otp(ident, otp)
             raise LegacyOtpUnavailable("Phone number required for fallback verify.")
 
         raise

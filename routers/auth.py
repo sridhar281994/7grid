@@ -203,6 +203,175 @@ def verify_otp_phone(payload: VerifyIn, request: Request, db: Session = Depends(
     }
 
 
+# -----------------------
+# NEW: Password check + login-initiated OTP endpoints
+# Phone OR Email supported for identifier
+# -----------------------
+
+class PasswordCheckIn(BaseModel):
+    identifier: str
+    password: str
+
+@router.post("/login/password-check")
+def login_password_check(payload: PasswordCheckIn, db: Session = Depends(get_db)):
+    """
+    Validates identifier + password.
+    Identifier can be: email OR phone.
+    Returns 200 if password matches.
+    Returns 401 if wrong password.
+    """
+    ident = payload.identifier.strip()
+    password = payload.password.strip()
+
+    user = None
+    if "@" in ident:
+        user = db.query(User).filter(User.email == ident.lower()).first()
+    elif ident.isdigit():
+        user = db.query(User).filter(User.phone == ident).first()
+    else:
+        # not allowing username here per request (Phone OR Email only)
+        raise HTTPException(400, "Identifier must be phone or email.")
+
+    if not user:
+        raise HTTPException(404, "Account not found.")
+
+    # Validate password
+    if not bcrypt.verify(password, user.password_hash):
+        raise HTTPException(401, "Incorrect password.")
+
+    return {"ok": True, "message": "Password valid."}
+
+
+class LoginOtpRequestIn(BaseModel):
+    identifier: str
+    password: str
+
+@router.post("/login/request-otp")
+def login_request_otp(payload: LoginOtpRequestIn, db: Session = Depends(get_db)):
+    """
+    Step 1: Validate identifier + password.
+    Step 2: If correct, send OTP to registered email.
+    Identifier supports Phone OR Email.
+    """
+    ident = payload.identifier.strip()
+    password = payload.password.strip()
+
+    user = None
+    if "@" in ident:
+        user = db.query(User).filter(User.email == ident.lower()).first()
+    elif ident.isdigit():
+        user = db.query(User).filter(User.phone == ident).first()
+    else:
+        # per request, restrict to phone or email
+        raise HTTPException(400, "Identifier must be phone or email.")
+
+    if not user:
+        raise HTTPException(404, "Account not found.")
+
+    # Password check
+    if not bcrypt.verify(password, user.password_hash):
+        raise HTTPException(401, "Incorrect password.")
+
+    # Generate OTP
+    code = _gen_otp()
+    expires = _now() + timedelta(minutes=OTP_EXP_MIN)
+
+    db_otp = OTP(
+        phone=user.phone,
+        code=code,
+        used=False,
+        expires_at=expires
+    )
+    db.add(db_otp)
+    db.commit()
+
+    # Send email OTP
+    try:
+        send_email_otp(user.email, code)
+    except Exception as e:
+        raise HTTPException(502, f"Failed to send OTP email: {e}")
+
+    masked = (user.email[:2] + "****@" + user.email.split("@", 1)[1]) if user.email else "your email"
+    return {
+        "ok": True,
+        "message": f"OTP sent to {masked}"
+    }
+
+
+class LoginVerifyOtpIn(BaseModel):
+    identifier: str
+    password: str
+    otp: str
+    channel: Optional[str] = "app"
+
+@router.post("/login/verify-otp")
+def login_verify_otp(payload: LoginVerifyOtpIn, request: Request, db: Session = Depends(get_db)):
+    """
+    Verify OTP after identifier+password check. Returns JWT on success.
+    Supports Phone OR Email for identifier (email->lookup user by email, phone->lookup by phone).
+    """
+    ident = payload.identifier.strip()
+    password = payload.password.strip()
+    otp = payload.otp.strip()
+    channel = (payload.channel or "app").lower()
+
+    if channel not in {"web", "app"}:
+        raise HTTPException(400, "Invalid channel.")
+
+    user = None
+    if "@" in ident:
+        user = db.query(User).filter(User.email == ident.lower()).first()
+    elif ident.isdigit():
+        user = db.query(User).filter(User.phone == ident).first()
+    else:
+        raise HTTPException(400, "Identifier must be phone or email.")
+
+    if not user:
+        raise HTTPException(404, "Account not found.")
+
+    # Check password again for safety
+    if not bcrypt.verify(password, user.password_hash):
+        raise HTTPException(401, "Incorrect password.")
+
+    # Check OTP
+    db_otp = (
+        db.query(OTP)
+        .filter(OTP.phone == user.phone, OTP.used == False)
+        .order_by(OTP.id.desc())
+        .first()
+    )
+    if not db_otp:
+        raise HTTPException(400, "No OTP found. Please request again.")
+    if db_otp.expires_at <= _now():
+        raise HTTPException(400, "OTP expired.")
+    if db_otp.code != otp:
+        raise HTTPException(400, "Invalid OTP.")
+
+    # Mark OTP used
+    db_otp.used = True
+    db.commit()
+
+    # Login success → generate JWT
+    fingerprint = _collect_fingerprint(request)
+    token = _jwt_for_user(user.id, channel=channel, fingerprint=fingerprint)
+
+    return {
+        "ok": True,
+        "user_id": user.id,
+        "access_token": token,
+        "token_type": "bearer",
+        "channel": channel,
+        "user": {
+            "id": user.id,
+            "phone": user.phone,
+            "email": user.email,
+            "name": user.name,
+            "upi_id": user.upi_id,
+            "wallet_balance": float(user.wallet_balance or 0)
+        }
+    }
+
+
 @router.post("/reset-password")
 def reset_password_endpoint(
     payload: ResetPasswordIn,
@@ -324,5 +493,3 @@ def consume_device_code_endpoint(
     )
     issue_wallet_cookie(response, {"user_id": user.id, "channel": WALLET_LINK_CHANNEL})
     return response
-
-

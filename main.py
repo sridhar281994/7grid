@@ -105,6 +105,17 @@ def ensure_paypal_column():
     print(":white_check_mark: Ensured users.paypal_id column exists.")
 
 
+def ensure_wallet_tx_channel_column():
+    """Legacy DBs might miss the wallet_transactions.channel column used by new code."""
+    ddl = text(
+        "ALTER TABLE wallet_transactions "
+        "ADD COLUMN IF NOT EXISTS channel VARCHAR(32)"
+    )
+    with engine.begin() as conn:
+        conn.execute(ddl)
+    print(":white_check_mark: Ensured wallet_transactions.channel column exists.")
+
+
 def ensure_bots():
     """Insert bot users (-1000, -1001, -1002) into DB if missing."""
     db = SessionLocal()
@@ -150,6 +161,7 @@ async def on_startup():
 
     # Backfill paypal column for legacy databases
     ensure_paypal_column()
+    ensure_wallet_tx_channel_column()
 
     # Insert bot rows
     ensure_bots()

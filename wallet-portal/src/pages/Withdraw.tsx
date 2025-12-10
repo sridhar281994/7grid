@@ -3,12 +3,19 @@ import apiFetch from "../api";
 import usePortalProfile from "../hooks/usePortalProfile";
 
 type Method = "upi" | "paypal";
+type WithdrawResponse = {
+  withdrawal_id: number;
+  coins_deducted?: number;
+};
 
 export default function Withdraw() {
   const [amount, setAmount] = useState("");
   const [method, setMethod] = useState<Method>("upi");
   const [status, setStatus] = useState<string | null>(null);
   const { profile, loading, error, refresh } = usePortalProfile();
+
+  const coinsPerInr = profile?.conversion?.coins_per_inr ?? 1;
+  const coinsPerUsd = profile?.conversion?.coins_per_usd ?? 80;
 
   const availableMethods = useMemo<Method[]>(() => {
     if (!profile) return [];
@@ -41,6 +48,12 @@ export default function Withdraw() {
     method === "upi"
       ? `₹${minAmount.toFixed(2)}`
       : `${currencyLabel} ${minAmount.toFixed(2)}`;
+  const walletBalance = profile?.user.wallet_balance ?? 0;
+  const coinsPerUnit = method === "upi" ? coinsPerInr : coinsPerUsd;
+  const coinsRequired =
+    !Number.isNaN(numericAmount) && numericAmount > 0
+      ? numericAmount * coinsPerUnit
+      : null;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -61,11 +74,15 @@ export default function Withdraw() {
         method,
         account: accountValue,
       };
-      const res = await apiFetch("/wallet-portal/withdraw", {
+      const res = await apiFetch<WithdrawResponse>("/wallet-portal/withdraw", {
         method: "POST",
         body: JSON.stringify(payload),
       });
-      setStatus(`Request queued (ID ${res.withdrawal_id}). Admin will process soon.`);
+      const coinsText =
+        typeof res.coins_deducted === "number"
+          ? ` (${res.coins_deducted.toFixed(2)} coins deducted)`
+          : "";
+      setStatus(`Request queued (ID ${res.withdrawal_id})${coinsText}. Admin will process soon.`);
     } catch (err: any) {
       setStatus(err.message || "Withdrawal failed.");
     }
@@ -92,6 +109,36 @@ export default function Withdraw() {
       {!profile || availableMethods.length === 0 ? null : (
         <>
           <form onSubmit={submit}>
+            <div className="info-panel">
+              <p>
+                Wallet balance: <strong>{walletBalance.toFixed(2)} coins</strong>
+              </p>
+              <p>
+                Conversion: <strong>{coinsPerInr.toFixed(2)}</strong> coins per ₹1 ·{" "}
+                <strong>{coinsPerUsd.toFixed(2)}</strong> coins per $1
+              </p>
+            </div>
+            <p className="field-label">Payment method</p>
+            <div className="method-toggle" role="group" aria-label="Payment method">
+              {availableMethods.includes("upi") && (
+                <button
+                  type="button"
+                  className={method === "upi" ? "active" : ""}
+                  onClick={() => setMethod("upi")}
+                >
+                  UPI ({profile.user.upi_id || "update in app"})
+                </button>
+              )}
+              {availableMethods.includes("paypal") && (
+                <button
+                  type="button"
+                  className={method === "paypal" ? "active" : ""}
+                  onClick={() => setMethod("paypal")}
+                >
+                  PayPal ({profile.user.paypal_id || "update in app"})
+                </button>
+              )}
+            </div>
             <label>
               Amount ({currencyLabel})
               <input
@@ -107,21 +154,15 @@ export default function Withdraw() {
               Minimum withdrawal ({method === "upi" ? "UPI" : "PayPal"}): {formattedMinAmount}
             </p>
             <label>
-              Method
-              <select value={method} onChange={(e) => setMethod(e.target.value as Method)}>
-                {availableMethods.includes("upi") && (
-                  <option value="upi">UPI ({profile.user.upi_id})</option>
-                )}
-                {availableMethods.includes("paypal") && (
-                  <option value="paypal">PayPal ({profile.user.paypal_id})</option>
-                )}
-              </select>
-            </label>
-            <label>
               Account
               <input value={accountValue} readOnly disabled />
             </label>
             <p>Update payout details from the SR Tech app.</p>
+            {coinsRequired !== null && (
+              <p>
+                Estimated coins deducted: <strong>{coinsRequired.toFixed(2)} coins</strong>
+              </p>
+            )}
             <button type="submit" disabled={!meetsMin || !accountValue}>
               Request Withdrawal
             </button>

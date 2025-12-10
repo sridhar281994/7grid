@@ -92,12 +92,24 @@ async function apiFetch<T = any>(
     let message = bodyText;
     try {
       const parsed = JSON.parse(bodyText);
-      message =
-        parsed?.detail ||
-        parsed?.message ||
-        parsed?.error ||
-        parsed?.errors?.[0] ||
-        bodyText;
+      const detail = parsed?.detail;
+      if (Array.isArray(detail)) {
+        message =
+          detail
+            .map((item: any) => item?.msg || item?.detail || JSON.stringify(item))
+            .join(" • ") || bodyText;
+      } else {
+        const firstError =
+          Array.isArray(parsed?.errors) && parsed.errors.length > 0
+            ? parsed.errors[0]
+            : parsed?.errors;
+        message =
+          detail ||
+          parsed?.message ||
+          parsed?.error ||
+          firstError ||
+          bodyText;
+      }
     } catch {
       // Ignore JSON parse errors
     }

@@ -1,10 +1,12 @@
+import os
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional
 
 from database import get_db
-from models import User
+from models import User, WithdrawalMethod
 from utils.security import (
     get_current_user,
     require_channel,
@@ -15,9 +17,20 @@ from utils.security import (
     verify_wallet_cookie,
     WALLET_COOKIE_NAME,
 )
-from routers.wallet import wallet_history, recharge_create_link, withdraw_request
+from routers.wallet import (
+    wallet_history,
+    recharge_create_link,
+    withdraw_request,
+    WithdrawRequestIn,
+    MIN_RECHARGE_INR,
+    MIN_WITHDRAW_INR,
+    MIN_WITHDRAW_USD,
+    paypal_is_enabled,
+    PAYPAL_PAYOUT_CURRENCY,
+)
 
 router = APIRouter(prefix="/wallet-portal", tags=["wallet-portal"])
+ADMIN_UPI_ID = os.getenv("ADMIN_UPI_ID")
 
 
 @router.post("/sessions/bridge")
@@ -88,6 +101,35 @@ def refresh_session(
     return response
 
 
+@router.get("/profile")
+def portal_profile(
+    _: dict = Depends(require_channel("web")),
+    user: User = Depends(get_current_user),
+):
+    return {
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "upi_id": user.upi_id,
+            "paypal_id": user.paypal_id,
+            "wallet_balance": float(user.wallet_balance or 0),
+        },
+        "limits": {
+            "recharge_inr_min": float(MIN_RECHARGE_INR),
+            "withdraw_inr_min": float(MIN_WITHDRAW_INR),
+            "withdraw_usd_min": float(MIN_WITHDRAW_USD),
+        },
+        "payout": {
+            "admin_upi_id": ADMIN_UPI_ID,
+            "paypal_enabled": paypal_is_enabled(),
+            "paypal_currency": PAYPAL_PAYOUT_CURRENCY,
+            "has_upi_details": bool(user.upi_id),
+            "has_paypal_details": bool(user.paypal_id),
+        },
+    }
+
+
 @router.get("/ledger")
 def portal_ledger(
     skip: int = 0,
@@ -111,12 +153,29 @@ def portal_recharge(
 
 @router.post("/withdraw")
 def portal_withdraw(
-    payload,
-    request: Request,
+    payload: WithdrawRequestIn,
     _: dict = Depends(require_channel("web")),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    ctx = get_request_context(request)
-    # The withdraw_request endpoint already locks balance; we can extend it later to accept metadata.
-    return withdraw_request(payload=payload, db=db, user=user)
+    preferred_account = None
+    missing_label = None
+    if payload.method == WithdrawalMethod.UPI:
+        preferred_account = (user.upi_id or "").strip()
+        missing_label = "UPI ID"
+    elif payload.method == WithdrawalMethod.PAYPAL:
+        preferred_account = (user.paypal_id or "").strip()
+        missing_label = "PayPal email"
+
+    if not preferred_account:
+        raise HTTPException(
+            400,
+            f"Add your {missing_label or 'payout details'} inside the SR Tech app before withdrawing.",
+        )
+
+    sanitized_payload = WithdrawRequestIn(
+        amount=payload.amount,
+        method=payload.method,
+        account=preferred_account,
+    )
+    return withdraw_request(payload=sanitized_payload, db=db, user=user)

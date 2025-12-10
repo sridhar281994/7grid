@@ -32,6 +32,19 @@ class AmountIn(BaseModel):
     amount: condecimal(gt=0, max_digits=12, decimal_places=2)
 
 
+def _decimal_from_env(var_name: str, default: str) -> Decimal:
+    raw = os.getenv(var_name)
+    try:
+        return Decimal(raw) if raw is not None else Decimal(default)
+    except Exception:
+        return Decimal(default)
+
+
+MIN_RECHARGE_INR = _decimal_from_env("MIN_RECHARGE_INR", "5")
+MIN_WITHDRAW_INR = _decimal_from_env("MIN_WITHDRAW_INR", "5")
+MIN_WITHDRAW_USD = _decimal_from_env("MIN_WITHDRAW_USD", "0.9")
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -123,6 +136,10 @@ PAYPAL_PAYOUT_BATCH_PREFIX = os.getenv("PAYPAL_PAYOUT_BATCH_PREFIX", "DICEPAY")
 
 def _paypal_is_configured() -> bool:
     return bool(PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET)
+
+
+def paypal_is_enabled() -> bool:
+    return _paypal_is_configured()
 
 
 def _ensure_method_supported(method: WithdrawalMethod):
@@ -271,6 +288,11 @@ def recharge_create_link(
     amount = Decimal(payload.amount)
     if amount <= 0:
         raise HTTPException(400, "Invalid amount")
+    if amount < MIN_RECHARGE_INR:
+        raise HTTPException(
+            400,
+            f"Minimum recharge is ₹{MIN_RECHARGE_INR:.2f}",
+        )
 
     # 1) Create the PENDING tx
     tx = WalletTransaction(
@@ -404,6 +426,17 @@ def withdraw_request(
     method = payload.method
     account = payload.account.strip()
     _ensure_method_supported(method)
+
+    if method == WithdrawalMethod.UPI and amount < MIN_WITHDRAW_INR:
+        raise HTTPException(
+            400,
+            f"Minimum UPI withdrawal is ₹{MIN_WITHDRAW_INR:.2f}",
+        )
+    if method == WithdrawalMethod.PAYPAL and amount < MIN_WITHDRAW_USD:
+        raise HTTPException(
+            400,
+            f"Minimum PayPal withdrawal is ${MIN_WITHDRAW_USD:.2f}",
+        )
 
     u = _lock_user(db, user.id)
     if (u.wallet_balance or 0) < amount:

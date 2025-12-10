@@ -44,6 +44,21 @@ MIN_RECHARGE_INR = _decimal_from_env("MIN_RECHARGE_INR", "5")
 MIN_WITHDRAW_INR = _decimal_from_env("MIN_WITHDRAW_INR", "5")
 MIN_WITHDRAW_USD = _decimal_from_env("MIN_WITHDRAW_USD", "0.9")
 
+COINS_PER_INR = _decimal_from_env("COINS_PER_INR", "1")
+COINS_PER_USD = _decimal_from_env("COINS_PER_USD", "80")
+COIN_QUANT = Decimal("0.01")
+
+
+def _coins_from_currency(amount: Decimal, currency: str) -> Decimal:
+    currency = (currency or "INR").upper()
+    factor = COINS_PER_USD if currency == "USD" else COINS_PER_INR
+    return (Decimal(amount) * factor).quantize(COIN_QUANT, rounding=ROUND_DOWN)
+
+
+def _coins_from_withdrawal(amount: Decimal, method: WithdrawalMethod) -> Decimal:
+    currency = "USD" if method == WithdrawalMethod.PAYPAL else "INR"
+    return _coins_from_currency(amount, currency)
+
 
 # -----------------------------
 # Helpers
@@ -376,7 +391,11 @@ async def recharge_webhook(request: Request, db: Session = Depends(get_db)):
 
         if tx.status == TxStatus.PENDING:
             user = _lock_user(db, tx.user_id)
-            user.wallet_balance = (user.wallet_balance or 0) + tx.amount
+            coins_to_credit = _coins_from_currency(tx.amount, "INR")
+            user.wallet_balance = (user.wallet_balance or 0) + coins_to_credit
+            extra = dict(tx.extra_data or {})
+            extra["coins_delta"] = float(coins_to_credit)
+            tx.extra_data = extra
             tx.status = TxStatus.SUCCESS
             db.commit()
 
@@ -439,16 +458,21 @@ def withdraw_request(
         )
 
     u = _lock_user(db, user.id)
-    if (u.wallet_balance or 0) < amount:
-        raise HTTPException(400, "Insufficient balance")
+    coins_required = _coins_from_withdrawal(amount, method)
+    if coins_required <= 0:
+        raise HTTPException(400, "Invalid withdrawal amount")
+    if (u.wallet_balance or 0) < coins_required:
+        raise HTTPException(400, "Insufficient coin balance")
 
-    u.wallet_balance = (u.wallet_balance or 0) - amount
+    u.wallet_balance = (u.wallet_balance or 0) - coins_required
+    coins_required_float = float(coins_required)
     tx = WalletTransaction(
         user_id=u.id,
         amount=amount,
         tx_type=TxType.WITHDRAW,
         status=TxStatus.PENDING,
         provider_ref=f"{method.value}:{account}",
+        extra_data={"coins_delta": -coins_required_float},
     )
     db.add(tx)
     db.flush()
@@ -473,6 +497,7 @@ def withdraw_request(
         "method": method.value,
         "status": tx.status.value,
         "balance": float(u.wallet_balance or 0),
+        "coins_deducted": coins_required_float,
     }
 
 
@@ -518,11 +543,14 @@ def withdraw_mark_failed(
     if tx.status != TxStatus.PENDING:
         return {"ok": True, "already": tx.status.value}
 
+    withdrawal = _get_withdrawal_by_tx(db, tx.id)
     user = _lock_user(db, tx.user_id)
-    user.wallet_balance = (user.wallet_balance or 0) + tx.amount
+    coins_to_refund = tx.amount
+    if withdrawal:
+        coins_to_refund = _coins_from_withdrawal(withdrawal.amount, withdrawal.method)
+    user.wallet_balance = (user.wallet_balance or 0) + coins_to_refund
 
     tx.status = TxStatus.FAILED
-    withdrawal = _get_withdrawal_by_tx(db, tx.id)
     if withdrawal:
         withdrawal.status = WithdrawalStatus.REJECTED
         if reason:
@@ -584,7 +612,8 @@ def process_paypal_withdrawals(
             )
         except Exception as exc:
             user = _lock_user(db, req.user_id)
-            user.wallet_balance = (user.wallet_balance or 0) + req.amount
+            refund_coins = _coins_from_withdrawal(req.amount, req.method)
+            user.wallet_balance = (user.wallet_balance or 0) + refund_coins
             tx.status = TxStatus.FAILED
             req.status = WithdrawalStatus.REJECTED
             req.details = f"PayPal error: {exc}"[:255]

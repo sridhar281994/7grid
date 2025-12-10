@@ -9,6 +9,14 @@ export default function Recharge() {
   const minRecharge = useMemo(() => profile?.limits.recharge_inr_min ?? 5, [profile]);
   const numericAmount = Number(amount);
   const meetsMin = !Number.isNaN(numericAmount) && numericAmount >= minRecharge;
+  const coinsPerInr = profile?.conversion?.coins_per_inr ?? 1;
+  const coinsPreview =
+    !Number.isNaN(numericAmount) && numericAmount > 0
+      ? numericAmount * coinsPerInr
+      : null;
+  const walletBalance = profile?.user.wallet_balance ?? 0;
+  const userUpi = profile?.user.upi_id?.trim();
+  const userPaypal = profile?.user.paypal_id?.trim();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -40,8 +48,24 @@ export default function Recharge() {
       <h1>Recharge</h1>
       {loading && <p>Loading wallet settings…</p>}
       {error && <p>Wallet settings error: {error}</p>}
-      {profile?.payout.admin_upi_id && (
-        <p>Official UPI ID: {profile.payout.admin_upi_id}</p>
+      {profile && (
+        <div className="info-panel">
+          <p>
+            Coins per ₹1: <strong>{coinsPerInr.toFixed(2)}</strong>
+          </p>
+          <p>
+            Current balance: <strong>{walletBalance.toFixed(2)} coins</strong>
+          </p>
+          <p>
+            Your UPI ID on file:{" "}
+            <strong>{userUpi || "Add this inside the SR Tech app"}</strong>
+          </p>
+          {userPaypal && (
+            <p>
+              Your PayPal ID on file: <strong>{userPaypal}</strong>
+            </p>
+          )}
+        </div>
       )}
       <p>Minimum recharge: ₹{minRecharge.toFixed(2)}</p>
       <form onSubmit={submit}>
@@ -60,6 +84,9 @@ export default function Recharge() {
           Create Payment Link
         </button>
       </form>
+      {coinsPreview !== null && (
+        <p>Estimated coins added: {coinsPreview.toFixed(2)} coins.</p>
+      )}
       {status && <p>{status}</p>}
     </div>
   );

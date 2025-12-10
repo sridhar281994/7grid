@@ -1,5 +1,3 @@
-import os
-
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -18,6 +16,7 @@ from utils.security import (
     WALLET_COOKIE_NAME,
 )
 from routers.wallet import (
+    AmountIn,
     wallet_history,
     recharge_create_link,
     withdraw_request,
@@ -27,10 +26,11 @@ from routers.wallet import (
     MIN_WITHDRAW_USD,
     paypal_is_enabled,
     PAYPAL_PAYOUT_CURRENCY,
+    COINS_PER_INR,
+    COINS_PER_USD,
 )
 
 router = APIRouter(prefix="/wallet-portal", tags=["wallet-portal"])
-ADMIN_UPI_ID = os.getenv("ADMIN_UPI_ID")
 
 
 @router.post("/sessions/bridge")
@@ -121,11 +121,16 @@ def portal_profile(
             "withdraw_usd_min": float(MIN_WITHDRAW_USD),
         },
         "payout": {
-            "admin_upi_id": ADMIN_UPI_ID,
             "paypal_enabled": paypal_is_enabled(),
             "paypal_currency": PAYPAL_PAYOUT_CURRENCY,
             "has_upi_details": bool(user.upi_id),
             "has_paypal_details": bool(user.paypal_id),
+            "upi_id": user.upi_id,
+            "paypal_id": user.paypal_id,
+        },
+        "conversion": {
+            "coins_per_inr": float(COINS_PER_INR),
+            "coins_per_usd": float(COINS_PER_USD),
         },
     }
 
@@ -143,7 +148,7 @@ def portal_ledger(
 
 @router.post("/recharge")
 def portal_recharge(
-    payload,
+    payload: AmountIn,
     _: dict = Depends(require_channel("web")),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

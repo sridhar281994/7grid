@@ -16,11 +16,16 @@ export type PortalProfile = {
     withdraw_usd_min: number;
   };
   payout: {
-    admin_upi_id: string | null;
     paypal_enabled: boolean;
     paypal_currency: string;
     has_upi_details: boolean;
     has_paypal_details: boolean;
+    upi_id: string | null;
+    paypal_id: string | null;
+  };
+  conversion: {
+    coins_per_inr: number;
+    coins_per_usd: number;
   };
 };
 

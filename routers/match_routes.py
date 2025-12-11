@@ -31,6 +31,69 @@ log.setLevel(logging.DEBUG)
 
 BOT_FALLBACK_SECONDS = 10
 
+COINS_PER_PLAYER = 2
+FINAL_BOX_INDEX = 8
+DANGER_BOX_INDEX = 3
+
+
+def _empty_positions(num_players: int) -> list[list[int]]:
+    return [[-1 for _ in range(COINS_PER_PLAYER)] for _ in range(num_players)]
+
+
+def _clone_positions(positions: list[list[int]]) -> list[list[int]]:
+    return [list(player[:COINS_PER_PLAYER]) for player in positions]
+
+
+def _normalize_positions(raw_positions, num_players: int) -> list[list[int]]:
+    normalized = _empty_positions(num_players)
+    if not raw_positions:
+        return normalized
+
+    for player_idx in range(min(num_players, len(raw_positions))):
+        value = raw_positions[player_idx]
+        if isinstance(value, (list, tuple)):
+            for coin_idx in range(COINS_PER_PLAYER):
+                try:
+                    raw_val = value[coin_idx]
+                except IndexError:
+                    raw_val = None
+                normalized[player_idx][coin_idx] = (
+                    int(raw_val) if raw_val is not None else -1
+                )
+        else:
+            normalized[player_idx][0] = int(value) if value is not None else -1
+
+    return normalized
+
+
+def _compute_spawned(positions: list[list[int]]) -> list[list[bool]]:
+    spawned: list[list[bool]] = []
+    for coins in positions:
+        entry = []
+        for pos in coins[:COINS_PER_PLAYER]:
+            entry.append(pos >= 0)
+        while len(entry) < COINS_PER_PLAYER:
+            entry.append(False)
+        spawned.append(entry)
+    return spawned
+
+
+def _count_finished(positions: list[list[int]]) -> list[int]:
+    counts: list[int] = []
+    for coins in positions:
+        counts.append(sum(1 for pos in coins if pos == FINAL_BOX_INDEX))
+    return counts
+
+
+def _select_coin_for_auto(coins: list[int]) -> Optional[int]:
+    for idx, pos in enumerate(coins[:COINS_PER_PLAYER]):
+        if 0 <= pos < FINAL_BOX_INDEX:
+            return idx
+    for idx, pos in enumerate(coins[:COINS_PER_PLAYER]):
+        if pos < 0:
+            return idx
+    return None
+
 # --------- router ---------
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -49,6 +112,7 @@ class CreateIn(BaseModel):
     num_players: conint(ge=2, le=3) = Field(default=2, description="2 or 3 players")
 class RollIn(BaseModel):
     match_id: int
+    coin_index: Optional[int] = Field(default=None, ge=0, le=1)
 class ForfeitIn(BaseModel):
     match_id: int
 class FinishIn(BaseModel):
@@ -99,107 +163,108 @@ def _status_value(m: GameMatch) -> str:
 
 
 def _apply_roll(
-    positions: list[int],
+    positions: list[list[int]] | list[int],
     current_turn: int,
     roll: int,
-    num_players: int = 2,
-    turn_count: int = 1,
-    spawned: list[bool] | None = None,
+    *,
+    num_players: int,
+    coin_index: Optional[int] = None,
 ):
     """
-    Apply dice roll with strict one-turn-per-player:
-      - Spawn: only when rolling 1 (if not spawned yet).
-      - Box 3: danger → coin returns to box 0.
-      - Overshoot >7: stay where you are.
-      - Exact 7: win.
-      - Capture: if you land on opponent box, opponent is sent back to box 0.
-      - Turn order: ALWAYS p0 → p1 → p2 → p0 → ... (no extra turns).
-    Returns updated positions, next_turn, winner, and flags for frontend.
+    Apply the complete turn for the current player with explicit coin selection.
+    Rules enforced:
+      - Each player controls two coins (index 0/1).
+      - Coins enter box 0 only when rolling a 1 while off-board (-1).
+      - Landing on box 3 (danger) immediately sends the coin back to box 0.
+      - Overshooting the final box (8) keeps the coin in place.
+      - Capturing sends every opponent coin on the target tile back to box 0.
+      - A player wins after locking both coins at the final box.
     """
-    if spawned is None:
-        spawned = [False] * num_players
-
-    p = current_turn
-    old = positions[p]
-    new_pos = old + roll
-    winner = None
-    reverse = False
-    spawn_flag = False
-    BOARD_MAX = 7
-    DANGER_BOX = 3
-
-    # --- Rule 1: Spawn only when rolling 1 ---
-    if not spawned[p]:
-        if roll == 1:
-            spawned[p] = True
-            positions[p] = 0
-            spawn_flag = True
-        else:
-            # Stay unspawned at 0 (still not on board)
-            positions[p] = 0
-        return positions, (p + 1) % num_players, None, {
-            "reverse": False,
-            "spawn": spawn_flag,
-            "actor": p,
-            "last_roll": roll,
-            "spawned": spawned,
-        }
-
-    # --- Rule 2: Reverse (danger box) at 3 → back to 0 ---
-    if new_pos == DANGER_BOX:
-        positions[p] = 0
-        reverse = True
-        return positions, (p + 1) % num_players, None, {
-            "reverse": True,
-            "spawn": False,
-            "actor": p,
-            "last_roll": roll,
-            "spawned": spawned,
-        }
-
-    # --- Rule 3: Overshoot (>7) → stay on current box ---
-    if new_pos > BOARD_MAX:
-        positions[p] = old
-        return positions, (p + 1) % num_players, None, {
-            "reverse": False,
-            "spawn": False,
-            "actor": p,
-            "last_roll": roll,
-            "spawned": spawned,
-        }
-
-    # --- Rule 4: Exact win (==7) ---
-    if new_pos == BOARD_MAX:
-        positions[p] = new_pos
-        winner = p
-        return positions, p, winner, {
-            "reverse": False,
-            "spawn": False,
-            "actor": p,
-            "last_roll": roll,
-            "spawned": spawned,
-        }
-
-    # --- Rule 5: Normal move ---
-    positions[p] = new_pos
-
-    # --- Rule 6: Capture: if you land on opponent, send them back to 0 ---
-    # NOTE: we only capture opponents that are actually spawned on board.
-    for idx in range(num_players):
-        if idx == p:
-            continue
-        if spawned[idx] and positions[idx] == positions[p]:
-            # Opponent coin goes back to box 0; they stay "spawned"
-            positions[idx] = 0
-
-    # Turn ALWAYS goes to next player in order, no extra turns
-    return positions, (p + 1) % num_players, None, {
-        "reverse": False,
-        "spawn": False,
-        "actor": p,
+    num_players = max(2, num_players)
+    board = _normalize_positions(positions, num_players)
+    actor = current_turn % num_players
+    coins = board[actor]
+    turn_meta = {
+        "actor": actor,
+        "coin_index": coin_index,
         "last_roll": roll,
-        "spawned": spawned,
+        "spawn": False,
+        "reverse": False,
+        "kills": [],
     }
+    next_turn = (actor + 1) % num_players
+
+    movable = [
+        idx
+        for idx, pos in enumerate(coins[:COINS_PER_PLAYER])
+        if pos < FINAL_BOX_INDEX
+    ]
+    if not movable:
+        # Already finished – treat as win safeguard.
+        turn_meta["spawned"] = _compute_spawned(board)
+        turn_meta["finished_counts"] = _count_finished(board)
+        turn_meta["already_finished"] = True
+        return board, actor, actor, turn_meta
+
+    selected_idx = coin_index if coin_index is not None else movable[0]
+    turn_meta["auto_selected"] = coin_index is None
+    turn_meta["coin_index"] = selected_idx
+
+    if selected_idx not in range(COINS_PER_PLAYER):
+        raise ValueError("Invalid coin index")
+    if selected_idx not in movable:
+        raise ValueError("Selected coin cannot move")
+
+    current_pos = coins[selected_idx]
+
+    if current_pos == FINAL_BOX_INDEX:
+        raise ValueError("Coin already locked at final box")
+
+    # Off-board coin can spawn only on rolling 1.
+    if current_pos < 0:
+        if roll != 1:
+            turn_meta["skipped"] = True
+            turn_meta["spawned"] = _compute_spawned(board)
+            turn_meta["finished_counts"] = _count_finished(board)
+            return board, next_turn, None, turn_meta
+        coins[selected_idx] = 0
+        turn_meta["spawn"] = True
+    else:
+        target = current_pos + roll
+        if target == DANGER_BOX_INDEX:
+            coins[selected_idx] = 0
+            turn_meta["reverse"] = True
+        elif target > FINAL_BOX_INDEX:
+            coins[selected_idx] = current_pos
+            turn_meta["blocked"] = True
+            turn_meta["spawned"] = _compute_spawned(board)
+            turn_meta["finished_counts"] = _count_finished(board)
+            return board, next_turn, None, turn_meta
+        else:
+            coins[selected_idx] = target
+
+    final_pos = coins[selected_idx]
+
+    # Capture opponents that occupy the landing tile (except finished coins).
+    if final_pos >= 0 and final_pos != FINAL_BOX_INDEX:
+        for opp_idx, opp_coins in enumerate(board):
+            if opp_idx == actor:
+                continue
+            for opp_coin_idx, opp_pos in enumerate(opp_coins[:COINS_PER_PLAYER]):
+                if opp_pos == final_pos:
+                    board[opp_idx][opp_coin_idx] = 0
+                    turn_meta["kills"].append(
+                        {"player": opp_idx, "coin": opp_coin_idx}
+                    )
+
+    winner = None
+    if all(pos == FINAL_BOX_INDEX for pos in coins[:COINS_PER_PLAYER]):
+        winner = actor
+
+    turn_meta["spawned"] = _compute_spawned(board)
+    turn_meta["finished_counts"] = _count_finished(board)
+
+    return board, (actor if winner is not None else next_turn), winner, turn_meta
 
 
 # -------------------------
@@ -213,6 +278,12 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
       - persistent 'spawned' list for correct spawn tracking
     """
     num_players = 3 if m.p3_user_id else 2
+    positions = _normalize_positions(state.get("positions"), num_players)
+    spawned_state = state.get("spawned")
+    if spawned_state is None:
+        spawned_state = _compute_spawned(positions)
+    finished_counts = state.get("finished_counts") or _count_finished(positions)
+
     payload = {
         "ready": m.status == MatchStatus.ACTIVE
         and m.p1_user_id
@@ -222,7 +293,7 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "match_id": m.id,
         "status": _status_value(m),
         "stake": m.stake_amount,
-        "positions": state.get("positions", [0] * num_players),
+        "positions": positions,
         "current_turn": state.get("current_turn", 0),
         "turn": state.get("current_turn", 0),
         "last_roll": state.get("last_roll"),
@@ -231,7 +302,8 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "reverse": state.get("reverse", False),
         "spawn": state.get("spawn", False),
         "actor": state.get("actor"),
-        "spawned": state.get("spawned", [False] * num_players), # ✅ persistent spawn state
+        "spawned": spawned_state,
+        "finished_counts": finished_counts,
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
         "player_ids": _player_ids(m),
     }
@@ -254,10 +326,12 @@ async def _read_state(match_id: int) -> Optional[dict]:
         raw = await redis_client.get(f"match:{match_id}:state")
         if raw:
             data = json.loads(raw)
-            # ✅ ensure 'spawned' always present
+            num_players = len(data.get("positions") or []) or 2
+            data["positions"] = _normalize_positions(data.get("positions"), num_players)
             if "spawned" not in data:
-                num_players = len(data.get("positions", [])) or 2
-                data["spawned"] = [False] * num_players
+                data["spawned"] = _compute_spawned(data["positions"])
+            if "finished_counts" not in data:
+                data["finished_counts"] = _count_finished(data["positions"])
             return data
         return None
     except Exception:
@@ -279,11 +353,13 @@ async def _clear_state(match_id: int):
 async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs=10):
 
     num_players = 3 if m.p3_user_id else 2
+    empty_board = _empty_positions(num_players)
     st = await _read_state(m.id) or {
-        "positions": [0] * num_players,
+        "positions": empty_board,
         "current_turn": m.current_turn,
         "turn_count": 0,
-        "spawned": [False] * num_players,
+        "spawned": _compute_spawned(empty_board),
+        "finished_counts": _count_finished(empty_board),
         "last_turn_ts": _utcnow().isoformat()
     }
 
@@ -309,18 +385,34 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs=10):
     roll = random.randint(1, 6)
 
     positions = st["positions"]
-    spawned = st["spawned"]
     turn_count = st["turn_count"] + 1
 
-    positions, next_turn, winner, extra = _apply_roll(
-        positions, curr, roll, num_players, turn_count, spawned
+    auto_coin = _select_coin_for_auto(positions[curr])
+    if auto_coin is None:
+        return
+
+    board_after, next_turn, winner, extra = _apply_roll(
+        _clone_positions(positions),
+        curr,
+        roll,
+        num_players=num_players,
+        coin_index=auto_coin,
     )
 
     # Winner
     if winner is not None:
         m.status = MatchStatus.FINISHED
         await distribute_prize(db, m, winner)
-        await _write_state(m, {"winner": winner, "finished": True})
+        await _write_state(
+            m,
+            {
+                "winner": winner,
+                "finished": True,
+                "positions": board_after,
+                "spawned": extra.get("spawned"),
+                "finished_counts": extra.get("finished_counts"),
+            },
+        )
         await _clear_state(m.id)
         return
 
@@ -336,14 +428,15 @@ async def _auto_advance_if_needed(m: GameMatch, db: Session, timeout_secs=10):
     await _write_state(
         m,
         {
-            "positions": positions,
+            "positions": board_after,
             "current_turn": next_turn,
             "last_roll": roll,
             "turn_count": turn_count,
-            "spawned": extra["spawned"],
-            "reverse": extra["reverse"],
-            "spawn": extra["spawn"],
-            "actor": extra["actor"]
+            "spawned": extra.get("spawned"),
+            "reverse": extra.get("reverse", False),
+            "spawn": extra.get("spawn", False),
+            "actor": extra.get("actor"),
+            "finished_counts": extra.get("finished_counts"),
         },
     )
 
@@ -434,7 +527,7 @@ async def create_or_wait_match(
             db.refresh(waiting)
 
             # Initialize board state when match becomes ACTIVE
-            await _write_state(waiting, {"positions": [0] * num_players})
+            await _write_state(waiting, {"positions": _empty_positions(num_players)})
 
             return {
                 "ok": True,
@@ -481,7 +574,7 @@ async def create_or_wait_match(
         db.refresh(new_match)
 
         # Initial empty board for WAITING match
-        await _write_state(new_match, {"positions": [0] * num_players})
+        await _write_state(new_match, {"positions": _empty_positions(num_players)})
 
         log.debug(f"[CREATE] new WAITING match_id={new_match.id} by {current_user.id}")
 
@@ -530,19 +623,20 @@ async def check_match_ready(
     filled_slots = sum(1 for uid in slots if uid is not None)
 
     # ---------- Redis state ----------
+    base_positions = _empty_positions(expected_players)
     st = await _read_state(m.id) or {
-        "positions": [0] * expected_players,
+        "positions": base_positions,
         "turn_count": 0,
-    
-        "spawned": [False] * expected_players,
+        "spawned": _compute_spawned(base_positions),
         "reverse": False,
         "spawn": False,
         "actor": None,
+        "finished_counts": _count_finished(base_positions),
     }
 
     winner_idx = st.get("winner")
-    positions = st.get("positions", [0] * expected_players)
-    spawned = st.get("spawned", [False] * expected_players)
+    positions = _normalize_positions(st.get("positions"), expected_players)
+    spawned = st.get("spawned") or _compute_spawned(positions)
     last_roll = st.get("last_roll")
     turn = st.get("current_turn", m.current_turn or 0)
 
@@ -598,8 +692,8 @@ async def check_match_ready(
         db.refresh(m)
 
         st = await _read_state(m.id) or st
-        positions = st.get("positions", positions)
-        spawned = st.get("spawned", spawned)
+        positions = _normalize_positions(st.get("positions"), expected_players)
+        spawned = st.get("spawned") or _compute_spawned(positions)
         last_roll = st.get("last_roll")
         turn = st.get("current_turn", m.current_turn or 0)
 
@@ -667,8 +761,8 @@ async def check_match_ready(
             log.exception("[CHECK] auto-advance failed")
 
         st = await _read_state(m.id) or st
-        positions = st.get("positions", positions)
-        spawned = st.get("spawned", spawned)
+        positions = _normalize_positions(st.get("positions"), expected_players)
+        spawned = st.get("spawned") or _compute_spawned(positions)
         last_roll = st.get("last_roll", last_roll)
         turn = st.get("current_turn", m.current_turn or turn)
         winner_idx = st.get("winner", winner_idx)
@@ -800,24 +894,35 @@ async def roll_dice(
     # -------------------------
     roll = random.randint(1, 6)
 
+    selection_required = current_user.id > 0
+    coin_index = payload.coin_index
+    if selection_required and coin_index is None:
+        raise HTTPException(422, "Select a coin before rolling")
+
+    base_positions = _empty_positions(num_players)
     st = await _read_state(m.id) or {
-        "positions": [0] * num_players,
+        "positions": base_positions,
         "turn_count": 0,
-        "spawned": [False] * num_players,
+        "spawned": _compute_spawned(base_positions),
+        "finished_counts": _count_finished(base_positions),
     }
 
-    positions = [int(x) for x in st.get("positions")]
-    spawned = st.get("spawned", [False] * num_players)
+    positions = _normalize_positions(st.get("positions"), num_players)
+    spawned = st.get("spawned") or _compute_spawned(positions)
     turn_count = int(st.get("turn_count", 0)) + 1
 
-    positions, next_turn, winner, extra = _apply_roll(
-        copy.deepcopy(positions),
-        curr,
-        roll,
-        num_players,
-        turn_count,
-        spawned,
-    )
+    try:
+        board_after, next_turn, winner, extra = _apply_roll(
+            _clone_positions(positions),
+            curr,
+            roll,
+            num_players=num_players,
+            coin_index=coin_index,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    positions = board_after
 
     # -------------------------
     # Winner case
@@ -841,6 +946,9 @@ async def roll_dice(
             "actor": extra.get("actor"),
             "turn_count": turn_count,
             "spawned": extra.get("spawned", spawned),
+            "finished_counts": extra.get("finished_counts"),
+            "kills": extra.get("kills", []),
+            "coin_index": extra.get("coin_index"),
             "finished": True
         }
 
@@ -878,6 +986,9 @@ async def roll_dice(
         "actor": extra.get("actor"),
         "turn_count": turn_count,
         "spawned": extra.get("spawned", spawned),
+        "finished_counts": extra.get("finished_counts"),
+        "kills": extra.get("kills", []),
+        "coin_index": extra.get("coin_index"),
     }
 
     await _write_state(m, new_state)
@@ -915,15 +1026,17 @@ async def forfeit_match(
         raise HTTPException(403, "Not your match")
 
     loser_idx = slots.index(current_user.id)
+    base_positions = _empty_positions(expected_players)
     state = await _read_state(m.id) or {
-        "positions": [0] * expected_players,
+        "positions": base_positions,
         "current_turn": m.current_turn or 0,
         "last_roll": m.last_roll,
         "turn_count": 0,
-        "spawned": [False] * expected_players,
+        "spawned": _compute_spawned(base_positions),
+        "finished_counts": _count_finished(base_positions),
     }
-    positions = state.get("positions", [0] * expected_players)
-    spawned = state.get("spawned", [False] * expected_players)
+    positions = _normalize_positions(state.get("positions"), expected_players)
+    spawned = state.get("spawned") or _compute_spawned(positions)
     turn_count = state.get("turn_count", 0)
     last_roll = state.get("last_roll", m.last_roll)
 
@@ -967,6 +1080,7 @@ async def forfeit_match(
             "forfeit_ids": list(forfeited),
             "spawned": spawned,
             "turn_count": turn_count,
+            "finished_counts": _count_finished(positions),
         }
 
         await _write_state(m, final_state)
@@ -1017,6 +1131,7 @@ async def forfeit_match(
             "active_players": active_player_ids,
             "forfeit_ids": list(forfeited),
             "spawned": spawned,
+            "finished_counts": _count_finished(positions),
         },
     )
 
@@ -1123,12 +1238,15 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         break
 
                     expected_players = m.num_players or 2
+                    base_positions = _empty_positions(expected_players)
                     st = await _read_state(match_id) or {
-                        "positions": [0] * expected_players,
+                        "positions": base_positions,
                         "current_turn": m.current_turn or 0,
                         "last_roll": m.last_roll,
                         "winner": None,
                         "turn_count": 0,
+                        "spawned": _compute_spawned(base_positions),
+                        "finished_counts": _count_finished(base_positions),
                     }
 
                     snapshot = {
@@ -1142,7 +1260,7 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "p3": _name_for_id(db, m.p3_user_id) if expected_players == 3 else None,
                         "last_roll": st.get("last_roll"),
                         "turn": st.get("current_turn", m.current_turn or 0),
-                        "positions": st.get("positions", [0] * expected_players),
+                        "positions": _normalize_positions(st.get("positions"), expected_players),
                         "winner": st.get("winner"),
                         "turn_count": st.get("turn_count", 0),
                         "reverse": st.get("reverse", False),

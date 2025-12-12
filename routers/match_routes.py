@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db, SessionLocal
 from models import GameMatch, User, MatchStatus
-from utils.security import get_current_user, get_current_user_ws
+from utils.security import get_current_user, get_current_user_ws, FakeUser
 from routers.wallet_utils import distribute_prize, get_system_merchant_id
 from routers.game import get_stake_rule
 from redis_client import redis_client, _get_redis  # ✅ shared redis instance
@@ -958,7 +958,9 @@ async def roll_dice(
     # -------------------------
     roll = random.randint(1, 6)
 
-    selection_required = current_user.id > 0
+    # Humans must pick which coin to move; internal agent auto-roll uses FakeUser
+    # and can rely on server-side auto-selection (see _apply_roll()).
+    selection_required = (current_user.id > 0) and (not isinstance(current_user, FakeUser))
     coin_index = payload.coin_index
     if selection_required and coin_index is None:
         raise HTTPException(422, "Select a coin before rolling")

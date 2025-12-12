@@ -504,6 +504,8 @@ class CreateIn(BaseModel):
 
 class RollIn(BaseModel):
     match_id: int
+    # Optional for backward compatibility; when provided, must be 0 or 1 (two coins per player).
+    coin_index: Optional[int] = Field(default=None, ge=0, le=1)
 
 class ForfeitIn(BaseModel):  # ✅ FIXED missing model
     match_id: int

@@ -303,6 +303,11 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
     if len(chat_messages) > 30:
         chat_messages = chat_messages[-30:]
 
+    # IMPORTANT: default turn must follow DB if caller didn't provide it.
+    # Otherwise Redis may publish turn=0 and the UI will highlight player0 while
+    # /matches/roll enforces DB m.current_turn, causing persistent 409s.
+    effective_turn = state.get("current_turn", m.current_turn or 0)
+
     payload = {
         "ready": m.status == MatchStatus.ACTIVE
         and m.p1_user_id
@@ -313,8 +318,8 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "status": _status_value(m),
         "stake": m.stake_amount,
         "positions": positions,
-        "current_turn": state.get("current_turn", 0),
-        "turn": state.get("current_turn", 0),
+        "current_turn": effective_turn,
+        "turn": effective_turn,
         "last_roll": state.get("last_roll"),
         "winner": state.get("winner"),
         "turn_count": state.get("turn_count", 0),

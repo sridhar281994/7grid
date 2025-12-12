@@ -119,6 +119,11 @@ class FinishIn(BaseModel):
     match_id: int
     winner: Optional[int] = None
 
+class ChatIn(BaseModel):
+    match_id: int
+    text: str = Field(..., min_length=1, max_length=80)
+    client_msg_id: Optional[str] = None
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -284,6 +289,20 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         spawned_state = _compute_spawned(positions)
     finished_counts = state.get("finished_counts") or _count_finished(positions)
 
+    # Preserve chat history across state writes unless explicitly set.
+    chat_messages = state.get("chat_messages")
+    if chat_messages is None:
+        try:
+            prev = await _read_state(m.id) or {}
+            chat_messages = prev.get("chat_messages") or []
+        except Exception:
+            chat_messages = []
+    if not isinstance(chat_messages, list):
+        chat_messages = []
+    # prevent unbounded growth
+    if len(chat_messages) > 30:
+        chat_messages = chat_messages[-30:]
+
     payload = {
         "ready": m.status == MatchStatus.ACTIVE
         and m.p1_user_id
@@ -306,6 +325,7 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
         "finished_counts": finished_counts,
         "last_turn_ts": (override_ts or _utcnow()).isoformat(),
         "player_ids": _player_ids(m),
+        "chat_messages": chat_messages,
     }
     try:
         if redis_client:
@@ -313,6 +333,40 @@ async def _write_state(m: GameMatch, state: dict, *, override_ts: Optional[datet
             await redis_client.publish(f"match:{m.id}:events", json.dumps(payload))
     except Exception as e:
         print(f"[WARN] Redis write failed: {e}")
+
+
+def _sanitize_chat_text(text: str) -> str:
+    # keep emojis/unicode, just normalize whitespace + enforce length
+    t = (text or "").strip()
+    # collapse internal newlines/tabs for UI safety
+    t = " ".join(t.split())
+    return t[:80]
+
+
+async def _append_chat_to_state(match_id: int, message: dict):
+    """Persist chat in Redis under the match state for poll/snapshot clients."""
+    if not redis_client:
+        return
+    try:
+        st = await _read_state(match_id) or {}
+        msgs = st.get("chat_messages") or []
+        if not isinstance(msgs, list):
+            msgs = []
+        msgs.append(message)
+        st["chat_messages"] = msgs[-30:]
+        await redis_client.set(f"match:{match_id}:state", json.dumps(st), ex=24 * 60 * 60)
+    except Exception as e:
+        print(f"[CHAT][WARN] Failed persisting chat: {e}")
+
+
+async def _publish_chat(match_id: int, message: dict):
+    """Publish chat to match-scoped subscribers (WS via Redis pubsub)."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.publish(f"match:{match_id}:events", json.dumps(message))
+    except Exception as e:
+        print(f"[CHAT][WARN] Failed publishing chat: {e}")
 
 
 async def _read_state(match_id: int) -> Optional[dict]:
@@ -633,6 +687,11 @@ async def check_match_ready(
         "actor": None,
         "finished_counts": _count_finished(base_positions),
     }
+    chat_messages = st.get("chat_messages") or []
+    if not isinstance(chat_messages, list):
+        chat_messages = []
+    if len(chat_messages) > 30:
+        chat_messages = chat_messages[-30:]
 
     winner_idx = st.get("winner")
     positions = _normalize_positions(st.get("positions"), expected_players)
@@ -681,6 +740,7 @@ async def check_match_ready(
             "prompt_bot": False,
             "player_ids": slots,
             "player_index": player_index,
+            "chat_messages": chat_messages,
         }
 
     # ======================================================
@@ -723,6 +783,7 @@ async def check_match_ready(
             "prompt_bot": False,
             "player_ids": slots,
             "player_index": player_index,
+            "chat_messages": chat_messages,
         }
 
     # ======================================================
@@ -834,6 +895,7 @@ async def check_match_ready(
         "prompt_bot": False,
         "player_ids": slots,
         "player_index": player_index,
+        "chat_messages": chat_messages,
     }
 
 
@@ -998,6 +1060,43 @@ async def roll_dice(
         "player_ids": _player_ids(m),
         "player_index": me_idx,
     }
+
+
+# -------------------------
+# Chat (match-scoped)
+# -------------------------
+@router.post("/chat")
+async def send_match_chat(
+    payload: ChatIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict:
+    m = db.query(GameMatch).filter(GameMatch.id == payload.match_id).first()
+    if not m:
+        raise HTTPException(404, "Match not found")
+
+    slots = _player_ids(m)
+    if current_user.id not in slots:
+        raise HTTPException(403, "Not your match")
+
+    sender_index = slots.index(current_user.id)
+    text = _sanitize_chat_text(payload.text)
+    if not text:
+        raise HTTPException(400, "Empty message")
+
+    msg = {
+        "type": "chat",
+        "match_id": m.id,
+        "text": text,
+        "client_msg_id": payload.client_msg_id,
+        "sender_index": sender_index,
+        "ts": time.time(),
+    }
+
+    # Persist for polling clients + broadcast for WS clients.
+    await _append_chat_to_state(m.id, msg)
+    await _publish_chat(m.id, msg)
+    return {"ok": True}
 
 
 # -------------------------
@@ -1192,48 +1291,86 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
     await pubsub.subscribe(f"match:{match_id}:events")
     print(f"[WS] Subscribed to Redis channel match:{match_id}:events")
 
+    last_snapshot = 0.0
     try:
         while True:
+            # -------------------------
+            # 1) INCOMING messages from client (chat)
+            # -------------------------
             try:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+                incoming = await asyncio.wait_for(websocket.receive_text(), timeout=0.01)
+            except asyncio.TimeoutError:
+                incoming = None
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                incoming = None
+
+            if incoming:
+                try:
+                    data = json.loads(incoming)
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and (data.get("type") or "").lower() == "chat":
+                    # enforce match scope
+                    try:
+                        if int(data.get("match_id")) != int(match_id):
+                            data = None
+                    except Exception:
+                        data = None
+                if isinstance(data, dict) and (data.get("type") or "").lower() == "chat":
+                    # Validate sender belongs to match and compute sender_index from DB slots (authoritative)
+                    db = SessionLocal()
+                    try:
+                        m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
+                        if m:
+                            slots = _player_ids(m)
+                            if current_user.id in slots:
+                                sender_index = slots.index(current_user.id)
+                                text = _sanitize_chat_text(str(data.get("text") or ""))
+                                if text:
+                                    msg = {
+                                        "type": "chat",
+                                        "match_id": match_id,
+                                        "text": text,
+                                        "client_msg_id": data.get("client_msg_id"),
+                                        "sender_index": sender_index,
+                                        "ts": time.time(),
+                                    }
+                                    await _append_chat_to_state(match_id, msg)
+                                    await _publish_chat(match_id, msg)
+                    finally:
+                        db.close()
+
+            # -------------------------
+            # 2) Redis Event (broadcast)
+            # -------------------------
+            try:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.05)
             except Exception:
                 msg = None
 
-            # -------------------------
-            # Redis Event
-            # -------------------------
             if msg and msg.get("type") == "message":
                 try:
                     event = json.loads(msg["data"])
-                    print(f"[WS][EVENT] Redis → {event}")
-
                     # SAFE SEND
-                    try:
-                        await websocket.send_text(json.dumps(event))
-                    except Exception:
-                        print("[WS] Client disconnected during event send.")
-                        break
+                    await websocket.send_text(json.dumps(event))
+                except Exception:
+                    break
 
-                except Exception as e:
-                    print(f"[WS][WARN] Raw Redis msg: {msg['data']} ({e})")
-                    try:
-                        await websocket.send_text(msg["data"])
-                    except:
-                        print("[WS] Client disconnected during raw send.")
-                        break
-
-            else:
-                # -------------------------
-                # SNAPSHOT fallback
-                # -------------------------
+            # -------------------------
+            # 3) Snapshot fallback (throttled)
+            # -------------------------
+            now = time.monotonic()
+            if now - last_snapshot >= 1.5:
+                last_snapshot = now
                 db = SessionLocal()
                 try:
                     m = db.query(GameMatch).filter(GameMatch.id == match_id).first()
                     if not m:
-                        print(f"[WS][ERROR] Match not found: {match_id}")
                         try:
                             await websocket.send_text(json.dumps({"error": "Match not found"}))
-                        except:
+                        except Exception:
                             pass
                         break
 
@@ -1247,7 +1384,13 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "turn_count": 0,
                         "spawned": _compute_spawned(base_positions),
                         "finished_counts": _count_finished(base_positions),
+                        "chat_messages": [],
                     }
+                    chat_messages = st.get("chat_messages") or []
+                    if not isinstance(chat_messages, list):
+                        chat_messages = []
+                    if len(chat_messages) > 30:
+                        chat_messages = chat_messages[-30:]
 
                     snapshot = {
                         "ready": m.status == MatchStatus.ACTIVE,
@@ -1268,19 +1411,13 @@ async def match_ws(websocket: WebSocket, match_id: int, current_user: User = Dep
                         "actor": st.get("actor"),
                         "player_ids": _player_ids(m),
                         "player_index": _player_index_for_user(m, current_user.id),
+                        "chat_messages": chat_messages,
                     }
-                    print(f"[WS][SNAPSHOT] {snapshot}")
-
-                    try:
-                        await websocket.send_text(json.dumps(snapshot))
-                    except Exception:
-                        print("[WS] Client disconnected during snapshot.")
-                        break
-
+                    await websocket.send_text(json.dumps(snapshot))
                 finally:
                     db.close()
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:
         print(f"[WS] Closed for match {match_id} (user={current_user.id})")
